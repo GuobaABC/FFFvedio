@@ -1,0 +1,177 @@
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	_ "modernc.org/sqlite"
+)
+
+// openDatabase 打开（不存在则创建）本地 SQLite 数据库，并返回数据库路径。
+// 位置：<用户配置目录>/FFFVedioAgent/FFFVedioAgent.db
+// Windows 为 %AppData%\FFFVedioAgent，macOS 为 ~/Library/Application Support/FFFVedioAgent。
+func openDatabase() (*sql.DB, string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return nil, "", fmt.Errorf("定位用户配置目录失败: %w", err)
+	}
+
+	appDir := filepath.Join(configDir, appName)
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		return nil, "", fmt.Errorf("创建数据目录失败: %w", err)
+	}
+
+	dbPath := filepath.Join(appDir, appName+".db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, dbPath, fmt.Errorf("打开数据库失败: %w", err)
+	}
+
+	// 桌面端单进程单连接即可满足需求，避免并发写入时的锁竞争
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		db.Close()
+		return nil, dbPath, fmt.Errorf("设置 busy_timeout 失败: %w", err)
+	}
+	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
+		db.Close()
+		return nil, dbPath, fmt.Errorf("开启 WAL 失败: %w", err)
+	}
+
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, dbPath, err
+	}
+
+	return db, dbPath, nil
+}
+
+// migrate 建立当前版本需要的表结构（幂等）。
+func migrate(db *sql.DB) error {
+	const schema = `
+CREATE TABLE IF NOT EXISTS providers (
+	id         TEXT PRIMARY KEY,
+	category   TEXT NOT NULL,
+	name       TEXT NOT NULL,
+	base_url   TEXT NOT NULL,
+	api_key    TEXT NOT NULL,
+	model      TEXT NOT NULL,
+	dialect    TEXT NOT NULL DEFAULT 'auto',
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_providers_category ON providers (category, created_at);
+
+-- 视频生成任务：config_json 存输入契约，context_json 存 RunContext（状态机 + 产物寻址）
+-- template_id 记录任务引用的模板，用于模板使用次数与变体轮换
+CREATE TABLE IF NOT EXISTS video_tasks (
+	id           TEXT PRIMARY KEY,
+	title        TEXT NOT NULL,
+	stage        TEXT NOT NULL,
+	status       TEXT NOT NULL,
+	error        TEXT NOT NULL DEFAULT '',
+	config_json  TEXT NOT NULL,
+	context_json TEXT NOT NULL,
+	created_at   TEXT NOT NULL,
+	updated_at   TEXT NOT NULL,
+	template_id  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_video_tasks_created ON video_tasks (created_at);
+
+-- 视频模板：payload_json 存完整模板，name/scope/tags 供模板库检索
+CREATE TABLE IF NOT EXISTS video_templates (
+	id           TEXT PRIMARY KEY,
+	name         TEXT NOT NULL,
+	version      TEXT NOT NULL,
+	scope        TEXT NOT NULL,
+	tags_json    TEXT NOT NULL DEFAULT '[]',
+	payload_json TEXT NOT NULL,
+	created_at   TEXT NOT NULL,
+	updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_video_templates_scope ON video_templates (scope, updated_at);
+
+-- 热点爬取任务：config_json 存输入契约，context_json 存 URL 结果/条目/统计
+CREATE TABLE IF NOT EXISTS crawl_tasks (
+	id           TEXT PRIMARY KEY,
+	title        TEXT NOT NULL,
+	stage        TEXT NOT NULL,
+	status       TEXT NOT NULL,
+	error        TEXT NOT NULL DEFAULT '',
+	config_json  TEXT NOT NULL,
+	context_json TEXT NOT NULL,
+	created_at   TEXT NOT NULL,
+	updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_crawl_tasks_created ON crawl_tasks (created_at);
+
+-- video_item 条目库：主键 = sha1(canonical_url) 前缀，天然幂等
+CREATE TABLE IF NOT EXISTS crawl_items (
+	id            TEXT PRIMARY KEY,
+	site_key      TEXT NOT NULL,
+	canonical_url TEXT NOT NULL,
+	original_url  TEXT NOT NULL,
+	title         TEXT NOT NULL DEFAULT '',
+	description   TEXT NOT NULL DEFAULT '',
+	thumbnail_url TEXT NOT NULL DEFAULT '',
+	payload_json  TEXT NOT NULL,
+	created_at    TEXT NOT NULL,
+	updated_at    TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_crawl_items_canonical ON crawl_items (canonical_url);
+CREATE INDEX IF NOT EXISTS idx_crawl_items_updated ON crawl_items (updated_at);
+
+-- site_profile 站点画像：抽取规则沉淀，加站点只加配置
+CREATE TABLE IF NOT EXISTS site_profiles (
+	site_key         TEXT PRIMARY KEY,
+	host_pattern     TEXT NOT NULL DEFAULT '',
+	requires_render  INTEGER NOT NULL DEFAULT 0,
+	selectors_json   TEXT NOT NULL DEFAULT '{}',
+	cleaners_json    TEXT NOT NULL DEFAULT '[]',
+	hit_success      INTEGER NOT NULL DEFAULT 0,
+	hit_fail         INTEGER NOT NULL DEFAULT 0,
+	last_verified_at TEXT NOT NULL DEFAULT '',
+	enabled          INTEGER NOT NULL DEFAULT 1,
+	auto_generated   INTEGER NOT NULL DEFAULT 0,
+	review_status    TEXT NOT NULL DEFAULT 'auto-approved',
+	updated_at       TEXT NOT NULL
+);
+
+-- audit_log：每一步落审计，便于回归与排查
+CREATE TABLE IF NOT EXISTS crawl_audit (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	task_id    TEXT NOT NULL,
+	item_id    TEXT NOT NULL DEFAULT '',
+	url        TEXT NOT NULL,
+	step       TEXT NOT NULL,
+	tier       TEXT NOT NULL DEFAULT '',
+	latency_ms INTEGER NOT NULL DEFAULT 0,
+	status     TEXT NOT NULL DEFAULT '',
+	err_code   TEXT NOT NULL DEFAULT '',
+	note       TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_crawl_audit_task ON crawl_audit (task_id, id);
+`
+	if _, err := db.Exec(schema); err != nil {
+		return fmt.Errorf("初始化数据表失败: %w", err)
+	}
+
+	// 老库升级：video_tasks 追加 template_id（已存在时忽略重复列错误）
+	if _, err := db.Exec(`ALTER TABLE video_tasks ADD COLUMN template_id TEXT NOT NULL DEFAULT ''`); err != nil &&
+		!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return fmt.Errorf("升级 video_tasks 表失败: %w", err)
+	}
+
+	// 老库升级：providers 追加 dialect（请求方言，默认 auto 按域名推断）
+	if _, err := db.Exec(`ALTER TABLE providers ADD COLUMN dialect TEXT NOT NULL DEFAULT 'auto'`); err != nil &&
+		!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return fmt.Errorf("升级 providers 表失败: %w", err)
+	}
+
+	return seedBuiltinVideoTemplates(db)
+}

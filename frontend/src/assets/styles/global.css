@@ -1,0 +1,274 @@
+/* FFFVedioAgent 全局基础样式（深色主题） */
+
+:root {
+  color-scheme: dark;
+
+  /* 颜色 */
+  --color-bg: #0b0b0e;
+  --color-surface: #16161c;
+  --color-border: rgba(255, 255, 255, 0.09);
+  --color-text: #f2f3f5;
+  --color-text-muted: #8b8f9a;
+  --color-accent: #ffb43a;
+  --color-accent-strong: #ff8a3d;
+
+  /* 圆角 */
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 22px;
+
+  /* 字体：仅使用系统字体，不加载远程字体 */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'Cascadia Code', 'SF Mono', Menlo, Consolas, 'Courier New', monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+#app {
+  isolation: isolate;
+}
+
+/* ------------------------------------------------------------------
+   通用控件（视频生成模块复用，避免各组件重复定义）
+   ------------------------------------------------------------------ */
+.ui-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--color-text);
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 160ms ease, background-color 160ms ease, color 160ms ease;
+}
+
+.ui-btn:hover:not(:disabled) {
+  border-color: rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.ui-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.ui-btn--primary {
+  border-color: rgba(255, 180, 58, 0.45);
+  background: rgba(255, 180, 58, 0.14);
+  color: var(--color-accent);
+}
+
+.ui-btn--primary:hover:not(:disabled) {
+  border-color: rgba(255, 180, 58, 0.7);
+  background: rgba(255, 180, 58, 0.22);
+}
+
+.ui-btn--danger {
+  border-color: rgba(255, 107, 107, 0.45);
+  background: rgba(255, 107, 107, 0.12);
+  color: #ff9b9b;
+}
+
+.ui-btn--ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--color-text-muted);
+}
+
+.ui-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ui-label {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.ui-input,
+.ui-textarea,
+.ui-select {
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.28);
+  color: var(--color-text);
+  font: inherit;
+  font-size: 13px;
+  transition: border-color 160ms ease;
+}
+
+.ui-textarea {
+  min-height: 64px;
+  line-height: 1.6;
+  resize: vertical;
+}
+
+/* 下拉选择：自绘箭头 + 主题色悬停，避开系统默认灰白控件观感 */
+.ui-select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 30px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none'%3E%3Cpath d='M1 1.5L6 6.5L11 1.5' stroke='%23ffb43a' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 12px 8px;
+  cursor: pointer;
+  text-overflow: ellipsis;
+}
+
+.ui-select:hover:not(:disabled) {
+  border-color: rgba(255, 180, 58, 0.35);
+  background-color: rgba(0, 0, 0, 0.36);
+}
+
+.ui-select:focus-visible {
+  box-shadow: 0 0 0 2px rgba(255, 180, 58, 0.16);
+}
+
+.ui-select:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* 展开后的选项面板（Chromium / WebView2 支持） */
+.ui-select option,
+.ui-select optgroup {
+  background-color: #16161c;
+  color: var(--color-text);
+}
+
+/* 复选框 / 单选 / 进度条跟随主题强调色 */
+input[type='checkbox'],
+input[type='radio'],
+input[type='range'],
+progress {
+  accent-color: var(--color-accent);
+}
+
+.ui-input::placeholder,
+.ui-textarea::placeholder {
+  color: rgba(255, 255, 255, 0.28);
+}
+
+.ui-input:focus,
+.ui-textarea:focus,
+.ui-select:focus {
+  border-color: rgba(255, 180, 58, 0.5);
+  outline: none;
+}
+
+.ui-card {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.ui-notice {
+  padding: 8px 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.ui-notice--ok {
+  border-color: rgba(88, 214, 141, 0.3);
+  background: rgba(88, 214, 141, 0.08);
+  color: #7ee2a8;
+}
+
+.ui-notice--error {
+  border-color: rgba(255, 107, 107, 0.3);
+  background: rgba(255, 107, 107, 0.08);
+  color: #ff9b9b;
+}
+
+.ui-notice--warn {
+  border-color: rgba(255, 180, 58, 0.3);
+  background: rgba(255, 180, 58, 0.08);
+  color: #ffca7a;
+}
+
+.ui-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--color-text-muted);
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.ui-chip--ok {
+  border-color: rgba(88, 214, 141, 0.35);
+  background: rgba(88, 214, 141, 0.1);
+  color: #7ee2a8;
+}
+
+.ui-chip--warn {
+  border-color: rgba(255, 180, 58, 0.35);
+  background: rgba(255, 180, 58, 0.1);
+  color: var(--color-accent);
+}
+
+.ui-chip--error {
+  border-color: rgba(255, 107, 107, 0.35);
+  background: rgba(255, 107, 107, 0.1);
+  color: #ff9b9b;
+}
+
+.ui-chip--running {
+  border-color: rgba(96, 165, 250, 0.4);
+  background: rgba(96, 165, 250, 0.12);
+  color: #93c5fd;
+}
+
+.ui-h3 {
+  font-size: 13px;
+  font-weight: 600;
+}

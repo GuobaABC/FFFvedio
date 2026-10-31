@@ -1,0 +1,1258 @@
+<script setup lang="ts">
+import { computed, onMounted, reactive, ref } from 'vue'
+
+import { consumeCrawlDraft, type CrawlVideoDraft } from '../composables/crawlNav'
+import { consumePendingTemplate } from '../composables/templateNav'
+import { backend, errorText } from '../services/backend'
+import type { Provider } from '../types/provider'
+import {
+  TEMPLATE_FIELD_LABELS,
+  TEMPLATE_SCOPE_LABELS,
+  TEMPLATE_SOURCE_LABELS,
+  templateScopeClass,
+  templateSourceClass,
+  type VideoTemplate,
+  type VideoTemplatePreview,
+  type VideoTemplateRef,
+} from '../types/template'
+import {
+  CONTINUATION_LABELS,
+  REGION_OPTIONS,
+  SUBTITLE_ALIGNMENTS,
+  VERTICAL_OPTIONS,
+  VIDEO_PLATFORMS,
+  createEmptyVideoConfig,
+  type VideoEnvironment,
+  type VideoRunConfig,
+} from '../types/video'
+
+const emit = defineEmits<{ (event: 'created', taskId: string): void }>()
+
+const form = reactive<VideoRunConfig>(createEmptyVideoConfig())
+const title = ref('')
+const submitting = ref(false)
+const submitError = ref('')
+const loadError = ref('')
+const providers = ref<Provider[]>([])
+const environment = ref<VideoEnvironment | null>(null)
+
+/** 从「热点爬取 → 爬取结果」带入的素材草稿（只消费一次） */
+const sourceDraft = ref<CrawlVideoDraft | null>(null)
+
+/** 角色参考图以「; 分隔的路径文本」编辑，提交时再转成 images 数组 */
+const characterImagesText = ref<string[]>([])
+
+/* ---------------- 模板：只预填默认值，不绕过三道确认门 ---------------- */
+
+/** 模板可覆盖的字段白名单与展示顺序（与 Go 侧 templateField* 常量一致） */
+const TEMPLATE_FIELDS = [
+  'durationS',
+  'fps',
+  'aspectRatio',
+  'continuationMode',
+  'language',
+  'speechRate',
+  'videoParams.style',
+  'videoParams.camera',
+  'videoParams.mood',
+  'subtitleStyle.fontName',
+  'subtitleStyle.fontSizePct',
+  'subtitleStyle.primaryColor',
+  'subtitleStyle.outlineColor',
+  'subtitleStyle.outlineWidth',
+  'subtitleStyle.alignment',
+  'subtitleStyle.marginVpct',
+  'subtitleStyle.bold',
+  'platforms',
+  'region',
+  'vertical',
+  'characterRefs',
+]
+
+/** 风格 token 的输出顺序（与 Go 侧 templateTokenOrder 一致） */
+const STYLE_TOKEN_ORDER = ['lighting', 'grade', 'lens', 'camera', 'texture', 'mood']
+
+const templates = ref<VideoTemplate[]>([])
+const selectedTemplateId = ref('')
+const templatePreview = ref<VideoTemplatePreview | null>(null)
+const templateError = ref('')
+const templateLoading = ref(false)
+/** 模板实际带入的字段基线：当前值等于基线即「模板」，不等于则「本次改动」 */
+const templateBaseline = ref<Record<string, string>>({})
+const openingVars = ref<Record<string, string>>({})
+
+const selectedTemplate = computed(
+  () => templates.value.find((item) => item.id === selectedTemplateId.value) ?? null,
+)
+
+/** 读取表单字段的字符串快照，仅用于来源比对与 overrides 上报 */
+function readPath(path: string): string {
+  // 角色是对象数组，直接 String() 会变成 [object Object]
+  if (path === 'characterRefs') {
+    return form.characterRefs.map((ref) => ref.name || ref.roleId).join('、')
+  }
+  const [head, tail] = path.split('.')
+  const record = form as unknown as Record<string, unknown>
+  const value = tail ? (record[head] as Record<string, unknown> | undefined)?.[tail] : record[head]
+  return Array.isArray(value) ? value.join(',') : String(value ?? '')
+}
+
+const sourceRows = computed(() => {
+  if (!selectedTemplate.value) {
+    return []
+  }
+  return TEMPLATE_FIELDS.map((key) => {
+    const base = templateBaseline.value[key]
+    const current = readPath(key)
+    const source = base === undefined ? 'default' : current === base ? 'template' : 'override'
+    return {
+      key,
+      label: TEMPLATE_FIELD_LABELS[key] ?? key,
+      value: current,
+      display: displayValue(key, current),
+      source,
+    }
+  })
+})
+
+/** 枚举 / 布尔字段展示为中文，避免在来源表里出现 last_frame、true 这类原始值 */
+function displayValue(key: string, value: string): string {
+  if (!value) {
+    return '—'
+  }
+  switch (key) {
+    case 'continuationMode':
+      return CONTINUATION_LABELS[value] ?? value
+    case 'subtitleStyle.alignment':
+      return SUBTITLE_ALIGNMENTS.find((item) => String(item.value) === value)?.label ?? value
+    case 'subtitleStyle.bold':
+      return value === 'true' ? '是' : '否'
+    case 'platforms':
+      return value
+        .split(',')
+        .map((id) => VIDEO_PLATFORMS.find((item) => item.id === id)?.label ?? id)
+        .join('、')
+    default:
+      return value
+  }
+}
+
+const overriddenRows = computed(() => sourceRows.value.filter((row) => row.source === 'override'))
+
+function styleSummary(template: VideoTemplate): string {
+  const tokens = template.style?.tokens ?? {}
+  const parts: string[] = []
+  const used = new Set<string>()
+  for (const key of STYLE_TOKEN_ORDER) {
+    used.add(key)
+    const value = String(tokens[key] ?? '').trim()
+    if (value) {
+      parts.push(value)
+    }
+  }
+  for (const key of Object.keys(tokens).sort()) {
+    if (used.has(key)) {
+      continue
+    }
+    const value = String(tokens[key] ?? '').trim()
+    if (value) {
+      parts.push(value)
+    }
+  }
+  return parts.join('；')
+}
+
+/** 把模板默认值填进表单，并记下「哪些字段真的来自模板」用于来源标注 */
+function applyTemplate(template: VideoTemplate) {
+  const baseline: Record<string, string> = {}
+  const mark = (key: string) => {
+    baseline[key] = readPath(key)
+  }
+
+  const defaults = template.defaults
+  if (defaults.aspectRatio) {
+    form.aspectRatio = defaults.aspectRatio
+    mark('aspectRatio')
+  }
+  if (defaults.durationS > 0) {
+    form.durationS = defaults.durationS
+    mark('durationS')
+  }
+  if (defaults.fps > 0) {
+    form.fps = defaults.fps
+    mark('fps')
+  }
+  if (defaults.language) {
+    form.language = defaults.language
+    mark('language')
+  }
+  if (defaults.continuationMode) {
+    form.continuationMode = defaults.continuationMode as VideoRunConfig['continuationMode']
+    mark('continuationMode')
+  }
+  // 开场白建议语速优先于流水线默认语速（与 Go 侧 templateSpeechRate 一致）
+  const rate = template.opening.speechRate > 0 ? template.opening.speechRate : (defaults.speechRate ?? 0)
+  if (rate > 0) {
+    form.speechRate = rate
+    mark('speechRate')
+  }
+
+  const summary = styleSummary(template)
+  if (summary) {
+    form.videoParams.style = summary
+    mark('videoParams.style')
+  }
+  const camera = String(template.style?.tokens?.camera ?? '').trim()
+  if (camera) {
+    form.videoParams.camera = camera
+    mark('videoParams.camera')
+  }
+  const mood = String(template.style?.tokens?.mood ?? '').trim()
+  if (mood) {
+    form.videoParams.mood = mood
+    mark('videoParams.mood')
+  }
+
+  const subtitle = template.subtitleStyle
+  if (subtitle.fontName) {
+    form.subtitleStyle.fontName = subtitle.fontName
+    mark('subtitleStyle.fontName')
+  }
+  if (subtitle.fontSizePct !== null && subtitle.fontSizePct !== undefined) {
+    form.subtitleStyle.fontSizePct = subtitle.fontSizePct
+    mark('subtitleStyle.fontSizePct')
+  }
+  if (subtitle.primaryColor) {
+    form.subtitleStyle.primaryColor = subtitle.primaryColor
+    mark('subtitleStyle.primaryColor')
+  }
+  if (subtitle.outlineColor) {
+    form.subtitleStyle.outlineColor = subtitle.outlineColor
+    mark('subtitleStyle.outlineColor')
+  }
+  if (subtitle.outlineWidth !== null && subtitle.outlineWidth !== undefined) {
+    form.subtitleStyle.outlineWidth = subtitle.outlineWidth
+    mark('subtitleStyle.outlineWidth')
+  }
+  if (subtitle.alignment >= 1 && subtitle.alignment <= 9) {
+    form.subtitleStyle.alignment = subtitle.alignment
+    mark('subtitleStyle.alignment')
+  }
+  if (subtitle.marginVpct !== null && subtitle.marginVpct !== undefined) {
+    form.subtitleStyle.marginVpct = subtitle.marginVpct
+    mark('subtitleStyle.marginVpct')
+  }
+  if (subtitle.bold !== null && subtitle.bold !== undefined) {
+    form.subtitleStyle.bold = subtitle.bold
+    mark('subtitleStyle.bold')
+  }
+
+  const publish = template.publishDefaults
+  if ((publish.platforms ?? []).length > 0) {
+    form.platforms = [...publish.platforms]
+    mark('platforms')
+  }
+  if (publish.region) {
+    form.region = publish.region
+    mark('region')
+  }
+  if (publish.vertical) {
+    form.vertical = publish.vertical
+    mark('vertical')
+  }
+
+  if ((template.characters ?? []).length > 0) {
+    form.characterRefs = template.characters.map((character, index) => ({
+      roleId: character.roleId || `char_${index + 1}`,
+      name: character.name,
+      images: [...(character.images ?? [])],
+      voiceHint: character.voiceHint,
+    }))
+    characterImagesText.value = form.characterRefs.map((ref) => ref.images.join(';'))
+    mark('characterRefs')
+  }
+
+  const nextVars: Record<string, string> = {}
+  for (const name of template.opening.vars ?? []) {
+    nextVars[name] = openingVars.value[name] ?? ''
+  }
+  openingVars.value = nextVars
+  templateBaseline.value = baseline
+}
+
+async function refreshTemplatePreview() {
+  const template = selectedTemplate.value
+  if (!template) {
+    templatePreview.value = null
+    return
+  }
+  try {
+    templatePreview.value = await backend.previewVideoTemplate(template.id, form.topic.trim(), {
+      ...openingVars.value,
+    })
+  } catch (error) {
+    templatePreview.value = null
+    templateError.value = errorText(error)
+  }
+}
+
+async function selectTemplate(templateId: string) {
+  selectedTemplateId.value = templateId
+  templateError.value = ''
+  const template = templates.value.find((item) => item.id === templateId)
+  if (!template) {
+    templateBaseline.value = {}
+    openingVars.value = {}
+    templatePreview.value = null
+    return
+  }
+  templateLoading.value = true
+  try {
+    applyTemplate(template)
+    await refreshTemplatePreview()
+  } finally {
+    templateLoading.value = false
+  }
+}
+
+function clearTemplate() {
+  selectedTemplateId.value = ''
+  templateBaseline.value = {}
+  openingVars.value = {}
+  templatePreview.value = null
+  templateError.value = ''
+}
+
+async function loadTemplates(preferredId = '') {
+  try {
+    const list = await backend.listVideoTemplates()
+    templates.value = list ?? []
+    if (preferredId && templates.value.some((item) => item.id === preferredId)) {
+      await selectTemplate(preferredId)
+    }
+  } catch (error) {
+    templateError.value = errorText(error)
+  }
+}
+
+/** 提交时上报「本次改过」的字段，后端据此把来源标成 override 而不是 template */
+function buildTemplateRef(): VideoTemplateRef | null {
+  const template = selectedTemplate.value
+  if (!template) {
+    return null
+  }
+  const overrides: Record<string, string> = {}
+  for (const row of overriddenRows.value) {
+    if (row.value.trim()) {
+      overrides[row.key] = row.value
+    }
+  }
+  return {
+    id: template.id,
+    version: template.version,
+    overrides,
+    openingVars: { ...openingVars.value },
+  }
+}
+
+const genProviders = computed(() => providers.value.filter((item) => item.category === 'multimodal_gen'))
+const textProviders = computed(() =>
+  providers.value.filter((item) => item.category === 'text' || item.category === 'multimodal'),
+)
+
+const adapterOptions = computed(() => [
+  { id: 'auto', label: '自动（按提供商推断）' },
+  ...(environment.value?.adapters ?? []).map((item) => ({ id: item.id, label: item.label })),
+])
+
+const selectedAdapter = computed(() =>
+  (environment.value?.adapters ?? []).find((item) => item.id === form.adapter),
+)
+
+const derivedFrames = computed(() => {
+  const duration = Number(form.durationS) || 0
+  const fps = Number(form.fps) || 0
+  return Math.max(0, Math.round(duration * fps))
+})
+
+const unitLabel = computed(() => (form.language.startsWith('en') ? '词' : '字'))
+
+const platformHint = computed(() => {
+  const primary = VIDEO_PLATFORMS.find((item) => item.id === form.platforms[0])
+  if (!primary) {
+    return '未选择：按通用默认档（标题 ≤40 字、话题 ≤5 个、晚间高峰）'
+  }
+  const overflow = form.platforms.length > 4 ? ' · 仅前 4 个平台生效' : ''
+  return `${primary.label}：标题 ≤${primary.titleMaxLen} 字、话题 ≤${primary.hashtagMax} 个${overflow}`
+})
+
+// 连续整数档位折叠成区间，避免方舟这类「支持任意整数秒」的模型刷屏
+function formatDurations(durations: number[]): string {
+  if (durations.length === 0) {
+    return '—'
+  }
+  const sorted = [...durations].sort((left, right) => left - right)
+  const contiguous = sorted.every((value, index) => index === 0 || value === sorted[index - 1] + 1)
+  if (contiguous && sorted.length > 4) {
+    return `${sorted[0]}–${sorted[sorted.length - 1]} 秒（整数）`
+  }
+  return `${sorted.join(' / ')} 秒`
+}
+
+const adapterHint = computed(() => {
+  const caps = selectedAdapter.value?.capabilities
+  if (!caps) {
+    return '适配器将根据已登记提供商的 Base URL / 模型名自动推断；也可显式选择「本地联调占位」跑通流水线。'
+  }
+  return `时长档位 ${formatDurations(caps.allowedDurations)}，单段上限 ${caps.maxClipS}s；` +
+    `画幅 ${caps.allowedAspectRatios.join(' / ')}；尾帧条件 ${caps.lastFrame ? '支持' : '不支持'}；` +
+    `原生音频 ${caps.nativeAudio ? '支持（台词写入提示词）' : '不支持（字幕按语速估算）'}。`
+})
+
+const providerHint = computed(() => {
+  if (genProviders.value.length === 0) {
+    return '还没有「多模态生成模型」提供商：真实生成会失败，可先用「本地联调占位」验证整条流水线。'
+  }
+  return '首帧/参考图是本地文件时，火山方舟 Seedance 会自动转成 base64 内联；DashScope / Runway 仍要求公网 URL。'
+})
+
+// 画幅与字幕的对齐策略：服务商不总按请求出片，合成阶段会兜底
+const aspectHint = '画幅以任务选择为准：火山方舟 Seedance 的首帧/首尾帧任务锁定输出比例跟随首帧图（ratio 只能为 adaptive），'
+  + '素材比例不符时合成阶段会用模糊填充统一画幅。开启字幕时，时间轴按各片段实测时长重排，一句一条，跟对白对齐。'
+
+onMounted(async () => {
+  // 热点爬取带入的素材：先落到表单，再拉提供商能力
+  const draft = consumeCrawlDraft()
+  if (draft) {
+    sourceDraft.value = draft
+    form.topic = draft.topic
+  }
+  // 来自模板库的「用此模板新建任务」（只消费一次）
+  void loadTemplates(consumePendingTemplate())
+  try {
+    const [providerList, env] = await Promise.all([
+      backend.listProviders().catch((error) => {
+        loadError.value = errorText(error)
+        return [] as Provider[]
+      }),
+      backend.getVideoEnvironment().catch((error) => {
+        loadError.value = errorText(error)
+        return null
+      }),
+    ])
+    providers.value = providerList
+    environment.value = env
+  } catch (error) {
+    loadError.value = errorText(error)
+  }
+})
+
+function addCharacter() {
+  form.characterRefs.push({
+    roleId: `char_${form.characterRefs.length + 1}`,
+    name: '',
+    images: [],
+    voiceHint: '',
+  })
+  characterImagesText.value.push('')
+}
+
+function removeCharacter(index: number) {
+  form.characterRefs.splice(index, 1)
+  characterImagesText.value.splice(index, 1)
+}
+
+async function pickFirstFrame() {
+  try {
+    const path = await backend.pickImageFile()
+    if (path) {
+      form.firstFrame = path
+    }
+  } catch (error) {
+    submitError.value = errorText(error)
+  }
+}
+
+async function pickCharacterImages(index: number) {
+  try {
+    const files = await backend.pickImageFiles()
+    if (files.length > 0) {
+      characterImagesText.value[index] = files.join(';')
+    }
+  } catch (error) {
+    submitError.value = errorText(error)
+  }
+}
+
+function splitImages(value: string): string[] {
+  return value
+    .split(/[;\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+/** 把爬取条目的封面填进首帧（远程 URL 需模型侧能公网访问） */
+function useCrawlThumbnail() {
+  if (sourceDraft.value?.thumbnail) {
+    form.firstFrame = sourceDraft.value.thumbnail
+  }
+}
+
+function dismissCrawlDraft() {
+  sourceDraft.value = null
+}
+
+function togglePlatform(id: string) {
+  const index = form.platforms.indexOf(id)
+  if (index >= 0) {
+    form.platforms.splice(index, 1)
+    return
+  }
+  form.platforms.push(id)
+}
+
+async function submit() {
+  submitError.value = ''
+  if (!form.topic.trim()) {
+    submitError.value = '请先填写视频主题'
+    return
+  }
+
+  const config: VideoRunConfig = {
+    ...form,
+    topic: form.topic.trim(),
+    templateRef: buildTemplateRef(),
+    characterRefs: form.characterRefs
+      .map((ref, index) => ({
+        ...ref,
+        name: ref.name.trim(),
+        roleId: ref.roleId.trim() || `char_${index + 1}`,
+        images: splitImages(characterImagesText.value[index] ?? ''),
+      }))
+      .filter((ref) => ref.name || ref.images.length > 0),
+  }
+
+  submitting.value = true
+  try {
+    const task = await backend.createVideoTask({ title: title.value.trim(), config })
+    emit('created', task.id)
+  } catch (error) {
+    submitError.value = errorText(error)
+  } finally {
+    submitting.value = false
+  }
+}
+</script>
+
+<template>
+  <section class="create">
+    <header class="create__head">
+      <div>
+        <h2 class="create__title">新建视频任务</h2>
+        <p class="create__subtitle">
+          主题 + 首帧 → 分镜 → 提示词/字幕 → 逐段生成 → 合成成片 → 发布元数据；
+          三道确认关卡（分镜 / 提示词 / 发布）分别挡在付费生成与发布之前
+        </p>
+      </div>
+      <span class="ui-chip">总帧数 {{ derivedFrames }}（时长 × 帧率）</span>
+    </header>
+
+    <p v-if="loadError" class="ui-notice ui-notice--error">{{ loadError }}</p>
+    <p v-if="submitError" class="ui-notice ui-notice--error">{{ submitError }}</p>
+    <p v-if="environment && !environment.ffmpegAvailable" class="ui-notice ui-notice--warn">
+      未检测到 ffmpeg：合成时会保留分段视频，跳过拼接与字幕烧录。安装 ffmpeg 并加入 PATH 后可重试。
+    </p>
+
+    <div v-if="sourceDraft" class="source">
+      <div class="source__body">
+        <span class="ui-chip ui-chip--ok">已带入爬取素材</span>
+        <span class="source__topic">{{ sourceDraft.note }}</span>
+      </div>
+      <div class="source__actions">
+        <button v-if="sourceDraft.thumbnail" class="ui-btn" type="button" @click="useCrawlThumbnail">
+          用封面作首帧
+        </button>
+        <button class="ui-btn ui-btn--ghost" type="button" @click="dismissCrawlDraft">仅保留主题</button>
+      </div>
+    </div>
+
+    <form class="create__form" @submit.prevent="submit">
+      <section class="ui-card block">
+        <div class="block__head">
+          <h3 class="ui-h3">0. 模板（可选，只提供默认值）</h3>
+          <div class="row">
+            <span v-if="selectedTemplate" class="ui-chip" :class="templateScopeClass(selectedTemplate.scope)">
+              {{ TEMPLATE_SCOPE_LABELS[selectedTemplate.scope] }} · v{{ selectedTemplate.version }}
+            </span>
+            <span v-if="templateLoading" class="ui-chip ui-chip--running">预览中…</span>
+            <button v-if="selectedTemplate" class="ui-btn ui-btn--ghost" type="button" @click="clearTemplate">
+              清除模板
+            </button>
+          </div>
+        </div>
+        <div class="grid grid--2">
+          <label class="ui-field">
+            <span class="ui-label">选择模板</span>
+            <select
+              class="ui-select"
+              :value="selectedTemplateId"
+              @change="selectTemplate(($event.target as HTMLSelectElement).value)"
+            >
+              <option value="">不使用模板（全部手填）</option>
+              <option v-for="item in templates" :key="item.id" :value="item.id">
+                {{ item.name }} · v{{ item.version }} · {{ TEMPLATE_SCOPE_LABELS[item.scope] }}
+              </option>
+            </select>
+          </label>
+          <label v-for="(_, name) in openingVars" :key="name" class="ui-field">
+            <span class="ui-label">开场白变量 {{ '{' + name + '}' }}</span>
+            <input v-model="openingVars[name]" class="ui-input" type="text" @change="refreshTemplatePreview" />
+          </label>
+        </div>
+        <p v-if="templates.length === 0" class="hint">
+          还没有模板：到「视频生成 → 模板库」新建，或直接按默认值手填。
+        </p>
+        <p v-if="templateError" class="ui-notice ui-notice--error">{{ templateError }}</p>
+
+        <template v-if="selectedTemplate">
+          <p class="hint">
+            模板只预填默认值：标「模板」的字段来自 {{ selectedTemplate.name }} v{{ selectedTemplate.version }}，改动后会变成「本次改动」；
+            分镜 / 提示词 / 发布三道确认门照常生效。
+          </p>
+          <div v-if="templatePreview" class="preview">
+            <p class="preview__line">
+              <span class="preview__tag">开场白</span>
+              {{ templatePreview.opening || '（模板未定义开场白）' }}
+            </p>
+            <p v-if="templatePreview.styleSummary" class="preview__line">
+              <span class="preview__tag">风格</span>{{ templatePreview.styleSummary }}
+            </p>
+            <p v-if="templatePreview.styleSnippet" class="preview__line">
+              <span class="preview__tag">片段</span>{{ templatePreview.styleSnippet }}
+            </p>
+            <p v-for="(item, index) in templatePreview.characters ?? []" :key="`ch${index}`" class="preview__line">
+              <span class="preview__tag">人物</span>{{ item }}
+            </p>
+            <p v-if="templatePreview.subtitle" class="preview__line">
+              <span class="preview__tag">字幕</span>{{ templatePreview.subtitle }}
+            </p>
+            <p v-if="templatePreview.publish" class="preview__line">
+              <span class="preview__tag">发布</span>{{ templatePreview.publish }}
+            </p>
+            <p v-if="templatePreview.defaults" class="preview__line">
+              <span class="preview__tag">默认值</span>{{ templatePreview.defaults }}
+            </p>
+            <p v-for="(item, index) in templatePreview.assets ?? []" :key="`as${index}`" class="preview__line">
+              <span class="preview__tag">资产</span>{{ item }}
+            </p>
+          </div>
+          <p v-for="(item, index) in templatePreview?.compliance ?? []" :key="`tc${index}`" class="ui-notice ui-notice--error">
+            {{ item }}（命中违禁词会阻止创建任务）
+          </p>
+          <p v-for="(item, index) in templatePreview?.warnings ?? []" :key="`tw${index}`" class="ui-notice ui-notice--warn">
+            {{ item }}
+          </p>
+
+          <details class="sources" open>
+            <summary class="sources__summary">
+              字段来源：{{ overriddenRows.length }} 项本次改动，其余为模板或默认
+            </summary>
+            <div class="sources__grid">
+              <div v-for="row in sourceRows" :key="row.key" class="sources__row">
+                <span class="sources__label">{{ row.label }}</span>
+                <span class="sources__value">{{ row.display }}</span>
+                <span class="src" :class="templateSourceClass(row.source)">
+                  {{ TEMPLATE_SOURCE_LABELS[row.source] }}
+                </span>
+              </div>
+            </div>
+          </details>
+        </template>
+      </section>
+
+      <section class="ui-card block">
+        <h3 class="ui-h3">1. 主题与首帧</h3>
+        <label class="ui-field">
+          <span class="ui-label">视频主题 / 诉求 *</span>
+          <textarea
+            v-model="form.topic"
+            class="ui-textarea"
+            rows="3"
+            placeholder="例：清晨咖啡馆里，一杯手冲咖啡唤醒整座城市（温暖、写实电影感）"
+            required
+          ></textarea>
+        </label>
+        <div class="grid grid--2">
+          <label class="ui-field">
+            <span class="ui-label">任务标题（可选）</span>
+            <input v-model="title" class="ui-input" type="text" placeholder="留空则用主题自动生成" />
+          </label>
+          <div class="ui-field">
+            <span class="ui-label">首帧图片（本地路径或 URL）</span>
+            <span class="row">
+              <input
+                v-model="form.firstFrame"
+                class="ui-input"
+                type="text"
+                spellcheck="false"
+                placeholder="C:\images\first.png 或 https://..."
+              />
+              <button class="ui-btn" type="button" @click="pickFirstFrame">选择…</button>
+            </span>
+          </div>
+        </div>
+        <p class="hint">
+          首帧驱动叙事：Agent1 会把画面基调、主体、光线与首帧对齐；i2v 提示词只描述「从首帧开始发生的变化」。
+        </p>
+      </section>
+
+      <section class="ui-card block">
+        <div class="block__head">
+          <h3 class="ui-h3">2. 角色参考图（可选）</h3>
+          <button class="ui-btn" type="button" @click="addCharacter">+ 添加角色</button>
+        </div>
+        <p v-if="form.characterRefs.length === 0" class="hint">
+          角色图用于跨段保持人物外观一致；不支持主体参考的模型会把统一外观描述写进每段提示词。
+        </p>
+        <div v-for="(ref, index) in form.characterRefs" :key="index" class="character">
+          <input v-model="ref.name" class="ui-input" type="text" placeholder="角色名称，如 女主" />
+          <input
+            v-model="characterImagesText[index]"
+            class="ui-input"
+            type="text"
+            spellcheck="false"
+            placeholder="参考图路径，多个用 ; 分隔"
+          />
+          <button class="ui-btn" type="button" @click="pickCharacterImages(index)">选择…</button>
+          <button class="ui-btn ui-btn--ghost" type="button" @click="removeCharacter(index)">移除</button>
+        </div>
+      </section>
+
+      <section class="ui-card block">
+        <h3 class="ui-h3">3. 时长、画幅与衔接</h3>
+        <div class="grid grid--3">
+          <label class="ui-field">
+            <span class="ui-label">目标时长（秒）</span>
+            <input v-model.number="form.durationS" class="ui-input" type="number" min="2" max="600" />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">帧率 fps</span>
+            <input v-model.number="form.fps" class="ui-input" type="number" min="12" max="60" />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">画幅</span>
+            <select v-model="form.aspectRatio" class="ui-select">
+              <option value="16:9">16:9</option>
+              <option value="9:16">9:16</option>
+              <option value="1:1">1:1</option>
+            </select>
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">多段衔接方式</span>
+            <select v-model="form.continuationMode" class="ui-select">
+              <option value="last_frame">尾帧延续（画面最连续，串行较慢）</option>
+              <option value="overlap">重叠帧（当前按硬切合成）</option>
+              <option value="none">硬切（适合分镜切换）</option>
+            </select>
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">语速（{{ unitLabel }}/秒）</span>
+            <input v-model.number="form.speechRate" class="ui-input" type="number" min="1" max="10" step="0.1" />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">语言</span>
+            <select v-model="form.language" class="ui-select">
+              <option value="zh-CN">中文（默认 4 字/秒）</option>
+              <option value="en-US">English（默认 2.6 词/秒）</option>
+            </select>
+          </label>
+        </div>
+        <p class="hint">{{ adapterHint }}</p>
+        <p class="hint">{{ aspectHint }}</p>
+      </section>
+
+      <section class="ui-card block">
+        <h3 class="ui-h3">4. 模型与提供商</h3>
+        <div class="grid grid--3">
+          <label class="ui-field">
+            <span class="ui-label">视频适配器</span>
+            <select v-model="form.adapter" class="ui-select">
+              <option v-for="option in adapterOptions" :key="option.id" :value="option.id">
+                {{ option.label }}
+              </option>
+            </select>
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">视频提供商（多模态生成）</span>
+            <select v-model="form.providerId" class="ui-select">
+              <option value="">自动选择第一个</option>
+              <option v-for="provider in genProviders" :key="provider.id" :value="provider.id">
+                {{ provider.name }} · {{ provider.model }}
+              </option>
+            </select>
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">文本提供商（Agent1 / Agent2）</span>
+            <select v-model="form.textProviderId" class="ui-select">
+              <option value="">自动选择文本模型</option>
+              <option v-for="provider in textProviders" :key="provider.id" :value="provider.id">
+                {{ provider.name }} · {{ provider.model }}
+              </option>
+            </select>
+          </label>
+        </div>
+        <p v-if="selectedAdapter" class="hint">{{ selectedAdapter.description }}</p>
+        <p class="hint">{{ providerHint }}</p>
+        <label class="check">
+          <input v-model="form.localFallback" type="checkbox" />
+          未配置文本模型时用本地规则生成剧本与提示词（不产生文本模型费用）
+        </label>
+      </section>
+
+      <section class="ui-card block">
+        <h3 class="ui-h3">5. 画面参数</h3>
+        <div class="grid grid--3">
+          <label class="ui-field">
+            <span class="ui-label">风格</span>
+            <input v-model="form.videoParams.style" class="ui-input" type="text" placeholder="写实电影感" />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">运镜偏好</span>
+            <input v-model="form.videoParams.camera" class="ui-input" type="text" placeholder="缓慢推近 / 环绕主体" />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">情绪</span>
+            <input v-model="form.videoParams.mood" class="ui-input" type="text" placeholder="温暖 / 期待" />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">额外提示</span>
+            <input v-model="form.videoParams.extraPrompt" class="ui-input" type="text" placeholder="补充可控的光线/材质要求" />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">负向提示</span>
+            <input v-model="form.videoParams.negativePrompt" class="ui-input" type="text" placeholder="避免出现：文字水印、畸形手指" />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">随机种子（0 = 随机）</span>
+            <input v-model.number="form.videoParams.seed" class="ui-input" type="number" min="0" step="1" />
+          </label>
+        </div>
+      </section>
+
+      <section class="ui-card block">
+        <div class="block__head">
+          <h3 class="ui-h3">6. 字幕（默认不生成）</h3>
+          <label class="check check--inline">
+            <input v-model="form.subtitles" type="checkbox" />
+            生成字幕并烧录
+          </label>
+        </div>
+        <p class="hint">
+          默认不生成字幕：成片不带字幕，也不产出 SRT / ASS 文件；画面提示词始终要求模型不把文字画进画面。
+          需要字幕时勾选左侧开关，按下面的样式烧录。
+        </p>
+        <div class="grid grid--3" :class="{ 'subs--off': !form.subtitles }">
+          <label class="ui-field">
+            <span class="ui-label">字体（需系统中存在的中文字体）</span>
+            <input v-model="form.subtitleStyle.fontName" class="ui-input" type="text" placeholder="思源黑体" />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">字号（画面高度 %）</span>
+            <input
+              v-model.number="form.subtitleStyle.fontSizePct"
+              class="ui-input"
+              type="number"
+              min="1.2"
+              max="12"
+              step="0.2"
+            />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">位置</span>
+            <select v-model.number="form.subtitleStyle.alignment" class="ui-select">
+              <option v-for="item in SUBTITLE_ALIGNMENTS" :key="item.value" :value="item.value">
+                {{ item.label }}
+              </option>
+            </select>
+          </label>
+          <div class="ui-field">
+            <span class="ui-label">主色</span>
+            <span class="row">
+              <input v-model="form.subtitleStyle.primaryColor" class="ui-input" type="text" />
+              <input v-model="form.subtitleStyle.primaryColor" class="color" type="color" />
+            </span>
+          </div>
+          <div class="ui-field">
+            <span class="ui-label">描边色</span>
+            <span class="row">
+              <input v-model="form.subtitleStyle.outlineColor" class="ui-input" type="text" />
+              <input v-model="form.subtitleStyle.outlineColor" class="color" type="color" />
+            </span>
+          </div>
+          <label class="ui-field">
+            <span class="ui-label">描边宽度</span>
+            <input
+              v-model.number="form.subtitleStyle.outlineWidth"
+              class="ui-input"
+              type="number"
+              min="0"
+              max="8"
+              step="0.5"
+            />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">底部边距（画面高度 %）</span>
+            <input
+              v-model.number="form.subtitleStyle.marginVpct"
+              class="ui-input"
+              type="number"
+              min="0"
+              max="30"
+              step="0.5"
+            />
+          </label>
+          <label class="check check--inline">
+            <input v-model="form.subtitleStyle.bold" type="checkbox" />
+            字幕加粗
+          </label>
+        </div>
+        <p class="hint">
+          字号按画面高度百分比换算；ASS PlayRes 与视频分辨率一致，跨 720P / 1080P 观感一致。
+        </p>
+      </section>
+
+      <section class="ui-card block">
+        <div class="block__head">
+          <h3 class="ui-h3">7. 发布平台（Agent4 发布元数据）</h3>
+          <span class="ui-chip">{{ form.platforms.length }} 个平台</span>
+        </div>
+        <div class="platforms">
+          <button
+            v-for="item in VIDEO_PLATFORMS"
+            :key="item.id"
+            class="platform"
+            :class="{ 'platform--active': form.platforms.includes(item.id) }"
+            type="button"
+            @click="togglePlatform(item.id)"
+          >
+            {{ item.label }}
+          </button>
+        </div>
+        <div class="grid grid--3">
+          <label class="ui-field">
+            <span class="ui-label">受众时区</span>
+            <select v-model="form.region" class="ui-select">
+              <option v-for="item in REGION_OPTIONS" :key="item.id" :value="item.id">
+                {{ item.label }}
+              </option>
+            </select>
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">垂类（影响发布时段偏移）</span>
+            <select v-model="form.vertical" class="ui-select">
+              <option value="">不指定（通用）</option>
+              <option v-for="item in VERTICAL_OPTIONS" :key="item" :value="item">{{ item }}</option>
+            </select>
+          </label>
+          <div class="ui-field">
+            <span class="ui-label">主平台约束</span>
+            <span class="ui-chip">{{ platformHint }}</span>
+          </div>
+        </div>
+        <p class="hint">
+          Agent4 只依赖已确认的提示词与剧本，确认门②通过后与渲染同时准备：关键词前置的标题 + 钩子、
+          话题/搜索关键词、受众本地时间的 Top-N 发布时段与封面帧建议；确认门③只改文案，不重跑视频。
+        </p>
+      </section>
+
+      <div class="create__actions">
+        <button class="ui-btn ui-btn--primary" type="submit" :disabled="submitting">
+          {{ submitting ? '创建中…' : '创建任务' }}
+        </button>
+        <span class="hint">创建后跳到「视频生成结果」，点击「执行任务」开始 Agent1 剧本分镜。</span>
+      </div>
+    </form>
+  </section>
+</template>
+
+<style scoped>
+.create {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  flex: 1;
+  min-height: 0;
+  padding-right: 4px;
+  overflow: auto;
+}
+
+.create__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.create__title {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.create__subtitle {
+  max-width: 620px;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.create__form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-bottom: 8px;
+}
+
+.block {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+.block__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.grid {
+  display: grid;
+  gap: 12px;
+}
+
+.grid--2 {
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.grid--3 {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.character {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.6fr) minmax(220px, 2fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.platforms {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.platform {
+  padding: 5px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--color-text-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 160ms ease, background-color 160ms ease, color 160ms ease;
+}
+
+.platform:hover {
+  border-color: rgba(255, 255, 255, 0.22);
+  color: var(--color-text);
+}
+
+.platform--active {
+  border-color: rgba(255, 180, 58, 0.6);
+  background: rgba(255, 180, 58, 0.12);
+  color: var(--color-accent);
+}
+
+.color {
+  flex: none;
+  width: 38px;
+  height: 34px;
+  padding: 2px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.28);
+  cursor: pointer;
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+
+.check--inline {
+  align-self: end;
+  padding-bottom: 8px;
+}
+
+.hint {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--color-text-muted);
+}
+
+/* 字幕关闭时样式区域降透明度提示“暂不生效”，但仍可提前调好 */
+.subs--off {
+  opacity: 0.55;
+}
+
+.create__actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 4px 2px 12px;
+}
+
+.source {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border: 1px solid rgba(88, 214, 141, 0.28);
+  border-radius: var(--radius-sm);
+  background: rgba(88, 214, 141, 0.06);
+}
+
+.source__body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.source__topic {
+  font-size: 11.5px;
+  color: var(--color-text-muted);
+  word-break: break-all;
+}
+
+.source__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.preview {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.preview__line {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--color-text-muted);
+  word-break: break-word;
+}
+
+.preview__tag {
+  flex: none;
+  min-width: 48px;
+  padding: 1px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  font-size: 11px;
+  text-align: center;
+  color: var(--color-text);
+}
+
+.sources {
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+}
+
+.sources__summary {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+
+.sources__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 4px 14px;
+  margin-top: 8px;
+}
+
+.sources__row {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 11.5px;
+}
+
+.sources__label {
+  color: var(--color-text-muted);
+}
+
+.sources__value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.src {
+  padding: 1px 7px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--color-text-muted);
+}
+
+.src--template {
+  border-color: rgba(88, 214, 141, 0.45);
+  color: #58d68d;
+}
+
+.src--override {
+  border-color: rgba(255, 180, 58, 0.55);
+  color: var(--color-accent);
+}
+
+.src--default {
+  opacity: 0.75;
+}
+
+@media (max-width: 900px) {
+  .character {
+    grid-template-columns: 1fr;
+  }
+}
+</style>

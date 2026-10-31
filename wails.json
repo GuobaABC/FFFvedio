@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "FFFVedioAgent",
+  "outputfilename": "FFFVedioAgent",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "info": {
+    "companyName": "FFFVedioAgent",
+    "productName": "FFFVedioAgent",
+    "productVersion": "0.0.1",
+    "copyright": "Copyright © 2026 FFFVedioAgent",
+    "comments": "Fast Fast Fast"
+  },
+  "author": {
+    "name": "FFFVedioAgent",
+    "email": ""
+  }
+}
