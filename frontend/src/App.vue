@@ -26,7 +26,7 @@ interface MainTab {
 }
 
 const projectName = 'FFFVedioAgent'
-const version = 'v0.0.2'
+const version = 'v0.0.3'
 
 /** 主选项卡：热点爬取（新建任务 → 执行 → 结果）+ 视频生成 + 系统设置 */
 const mainTabs: MainTab[] = [

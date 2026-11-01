@@ -163,6 +163,9 @@ function timingSourceLabel(source: string): string {
   if (source === 'tts') {
     return 'TTS 实测对齐'
   }
+  if (source === 'aligned') {
+    return '按音频活动对齐（提取音频→说话区间→台词对齐）'
+  }
   if (source === 'measured') {
     return '片段实测对齐（与对白同步）'
   }
@@ -939,6 +942,9 @@ function revealOutput() {
       </p>
       <p v-else-if="plan" class="hint">
         本次未生成字幕（默认关闭）：成片不含字幕；需要时在新建任务勾选「生成字幕并烧录」。
+      </p>
+      <p v-if="run?.subtitles?.timingTablePath" class="hint">
+        字幕/时间对应表：{{ run.subtitles.timingTablePath }}
       </p>
       <div v-if="subtitleCues.length > 0" class="cues">
         <div v-for="cue in subtitleCues" :key="cue.index" class="cue">

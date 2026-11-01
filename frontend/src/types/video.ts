@@ -143,6 +143,10 @@ export interface VideoSubtitles {
   assPath: string
   srtUrl: string
   assUrl: string
+  /** 字幕/时间对应表（JSON）：含对齐依据与逐条 cue */
+  timingTablePath: string
+  timingTableUrl: string
+  /** estimate | measured | tts | aligned（按音频活动对齐） */
   timingSource: string
   cues: VideoSubtitleCue[]
 }

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -460,6 +461,277 @@ func measuredSubtitleSpans(ctx context.Context, plan *VideoPlan, renders []Video
 	return spans, nil
 }
 
+// ---------- 字幕声学对齐：成片画布 → 提取音频 → 说话区间检测 → 台词铺进说话时钟 ----------
+
+const (
+	silenceNoiseDB    = "-35dB" // silencedetect 噪声门：低于它算静音
+	silenceMinDurS    = 0.2     // 短于此不算停顿（换气 / 句间微停）
+	speechWindowMinS  = 0.15    // 太短的活动窗口多半是杂音，不算说话
+	speechCoverageMin = 0.20    // 台词段覆盖率低于此：检测不可信（全程 BGM 等），退回测时
+	alignedLeadS      = 0.1     // 段首留白（说话时钟上）：起音瞬间不上字幕
+	alignedGapS       = 0.08    // 句间空隙，与估算路径一致
+)
+
+// speechWindow 一段「有声音活动」的绝对时间区间。
+type speechWindow struct {
+	Start float64
+	End   float64
+}
+
+var (
+	silenceStartPattern = regexp.MustCompile(`silence_start:\s*([0-9]+(?:\.[0-9]+)?)`)
+	silenceEndPattern   = regexp.MustCompile(`silence_end:\s*([0-9]+(?:\.[0-9]+)?)`)
+)
+
+// parseSilenceEvents 把 silencedetect 回显取反成说话窗口：静音区间的补集就是「有人在说话」。
+// 开头直接说话（0 到第一个 silence_start）与结尾非静音（最后一个 silence_end 到 total）都算说话。
+func parseSilenceEvents(text string, total float64) []speechWindow {
+	if total <= 0 {
+		return nil
+	}
+	type silenceEvent struct {
+		at      float64
+		isStart bool
+	}
+	events := make([]silenceEvent, 0, 16)
+	for _, match := range silenceStartPattern.FindAllStringSubmatch(text, -1) {
+		if value, err := strconv.ParseFloat(match[1], 64); err == nil {
+			events = append(events, silenceEvent{at: value, isStart: true})
+		}
+	}
+	for _, match := range silenceEndPattern.FindAllStringSubmatch(text, -1) {
+		if value, err := strconv.ParseFloat(match[1], 64); err == nil {
+			events = append(events, silenceEvent{at: value, isStart: false})
+		}
+	}
+	sort.SliceStable(events, func(i, j int) bool {
+		if events[i].at == events[j].at {
+			return !events[i].isStart // 同一时刻先处理结束再处理开始，避免凭空造出静音段
+		}
+		return events[i].at < events[j].at
+	})
+
+	windows := make([]speechWindow, 0, len(events)/2+1)
+	appendWindow := func(start, end float64) {
+		if start < 0 {
+			start = 0
+		}
+		if end > total {
+			end = total
+		}
+		if end-start >= speechWindowMinS {
+			windows = append(windows, speechWindow{Start: round2(start), End: round2(end)})
+		}
+	}
+	cursor := 0.0
+	inSilence := false
+	for _, event := range events {
+		if event.isStart {
+			if inSilence {
+				continue // 连续两个 silence_start（异常回显），后一个作废
+			}
+			inSilence = true
+			appendWindow(cursor, event.at)
+			cursor = event.at
+		} else {
+			if !inSilence {
+				continue // 孤立的 silence_end，忽略
+			}
+			inSilence = false
+			cursor = event.at
+		}
+	}
+	if !inSilence {
+		appendWindow(cursor, total) // 结尾非静音：说话一直铺到成片末尾
+	}
+	return windows
+}
+
+// extractSpeechWav 从源媒体提取单声道 16k wav：声学分析只要人声频段，降采样还更快。
+func extractSpeechWav(ctx context.Context, ffmpeg, source, wavPath string) error {
+	return runCommand(ctx, ffmpeg, "-y", "-i", source, "-vn", "-ac", "1", "-ar", "16000", wavPath)
+}
+
+// detectSpeechWindows 对 wav 跑一遍 silencedetect，把 stderr 回显取反成说话窗口。
+// 全程无事件时窗口就是一整段（全程有声），由上层覆盖率护栏判断是否采信。
+func detectSpeechWindows(ctx context.Context, ffmpeg, wavPath string, total float64) ([]speechWindow, error) {
+	cmd := exec.CommandContext(ctx, ffmpeg, "-hide_banner", "-i", wavPath,
+		"-af", fmt.Sprintf("silencedetect=noise=%s:d=%g", silenceNoiseDB, silenceMinDurS),
+		"-f", "null", "-")
+	configureHiddenProcess(cmd)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("音频活动分析失败: %w", err)
+	}
+	return parseSilenceEvents(stderr.String(), total), nil
+}
+
+// speechWindowsIn 把窗口裁剪到 [start, end) 并平移成相对 start 的局部坐标。
+func speechWindowsIn(windows []speechWindow, start, end float64) []speechWindow {
+	local := make([]speechWindow, 0, len(windows))
+	for _, window := range windows {
+		left, right := math.Max(window.Start, start), math.Min(window.End, end)
+		if right-left > 0.05 {
+			local = append(local, speechWindow{Start: left - start, End: right - start})
+		}
+	}
+	return local
+}
+
+// speechClockMapper 返回把「说话时钟」位置映回段局部时间的函数：
+// 窗口首尾相接排成一条只有说话的轴，句子只消耗真实说话时长，永远不会挂进静音区。
+func speechClockMapper(windows []speechWindow) func(float64) float64 {
+	if len(windows) == 0 {
+		return func(float64) float64 { return 0 }
+	}
+	total := 0.0
+	for _, window := range windows {
+		total += window.End - window.Start
+	}
+	return func(t float64) float64 {
+		if t <= 0 {
+			return 0
+		}
+		if t >= total {
+			return windows[len(windows)-1].End
+		}
+		acc := 0.0
+		for _, window := range windows {
+			duration := window.End - window.Start
+			if t <= acc+duration {
+				return window.Start + (t - acc)
+			}
+			acc += duration
+		}
+		return windows[len(windows)-1].End
+	}
+}
+
+// alignSubtitleCues 把台词按字数权重铺进说话窗口（说话时钟）；
+// 没检出声音活动的段退回字速估算，保证时间轴仍单调、不重叠、不越界。
+func alignSubtitleCues(cfg VideoRunConfig, spans []SubtitleSpan, windows []speechWindow) []VideoSubtitleCue {
+	cues := make([]VideoSubtitleCue, 0, len(spans))
+	for _, span := range spans {
+		text := strings.TrimSpace(span.Text)
+		if text == "" || span.Duration <= 0 {
+			continue
+		}
+		local := speechWindowsIn(windows, span.Start, span.Start+span.Duration)
+		if len(local) == 0 {
+			cues = appendEstimatedCues(cues, cfg, span)
+			continue
+		}
+		parts := splitDialogueSentences(text)
+		if len(parts) == 0 {
+			continue
+		}
+		weights := make([]float64, len(parts))
+		weightSum, speechTotal := 0.0, 0.0
+		for index, part := range parts {
+			weights[index] = math.Max(1, float64(len([]rune(part))))
+			weightSum += weights[index]
+		}
+		for _, window := range local {
+			speechTotal += window.End - window.Start
+		}
+		// 与估算路径同一策略：每条至少停留 0.9s，再等比缩回总说话时长内
+		slots := make([]float64, len(parts))
+		slotSum := 0.0
+		for index := range parts {
+			slots[index] = math.Max(0.9, speechTotal*weights[index]/weightSum)
+			slotSum += slots[index]
+		}
+		if scale := speechTotal / slotSum; scale < 1 {
+			for index := range slots {
+				slots[index] *= scale
+			}
+		}
+
+		mapClock := speechClockMapper(local)
+		cursor := alignedLeadS
+		for index, part := range parts {
+			startLocal := math.Min(mapClock(cursor), span.Duration)
+			endLocal := math.Min(mapClock(cursor+slots[index]), span.Duration)
+			display := endLocal - alignedGapS
+			if index == len(parts)-1 {
+				display = endLocal // 末句吃掉取整误差，避免字幕提前消失
+			}
+			if display > startLocal {
+				cues = append(cues, VideoSubtitleCue{
+					Index: len(cues) + 1,
+					Start: round2(span.Start + startLocal),
+					End:   round2(span.Start + display),
+					Text:  wrapSubtitleText(part, cfg.Language),
+				})
+			}
+			cursor += slots[index]
+		}
+	}
+	return cues
+}
+
+// alignCuesToSpeechActivity 声学对齐整条流水线：探音轨 → 提取音频 → 检测说话区间 → 对齐。
+// 任何一步不可信都返回 ok=false，由调用方退回片段测时轴；message 说明原因或对齐概况。
+func alignCuesToSpeechActivity(ctx context.Context, ffmpeg, workDir, canvas string, cfg VideoRunConfig, spans []SubtitleSpan) ([]VideoSubtitleCue, bool, string) {
+	dialogueTotal := 0.0
+	fallbackTotal := 0.0
+	for _, span := range spans {
+		if span.Duration > 0 {
+			fallbackTotal += span.Duration
+		}
+		if strings.TrimSpace(span.Text) != "" {
+			dialogueTotal += span.Duration
+		}
+	}
+	if dialogueTotal <= 0 {
+		return nil, false, "没有台词段可供对齐"
+	}
+	info, err := mediaProbe(ctx, canvas)
+	if err != nil {
+		return nil, false, "读取成片音轨失败: " + err.Error()
+	}
+	if !info.HasAudio {
+		return nil, false, "成片没有音轨，字幕仍按片段测时轴"
+	}
+	total := info.Duration
+	if total <= 0 {
+		total = fallbackTotal
+	}
+	wavPath := filepath.Join(workDir, "output", "speech.wav")
+	analysisCtx, cancelAnalysis := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancelAnalysis()
+	if err := extractSpeechWav(analysisCtx, ffmpeg, canvas, wavPath); err != nil {
+		return nil, false, "提取音频失败: " + err.Error()
+	}
+	windows, err := detectSpeechWindows(analysisCtx, ffmpeg, wavPath, total)
+	if err != nil {
+		return nil, false, "音频活动分析失败: " + err.Error()
+	}
+	covered := 0.0
+	for _, span := range spans {
+		if strings.TrimSpace(span.Text) == "" || span.Duration <= 0 {
+			continue
+		}
+		for _, window := range speechWindowsIn(windows, span.Start, span.Start+span.Duration) {
+			covered += window.End - window.Start
+		}
+	}
+	coverage := covered / dialogueTotal
+	if coverage < speechCoverageMin {
+		return nil, false, fmt.Sprintf("说话活动仅覆盖台词段的 %.0f%%，检测不可信", coverage*100)
+	}
+	cues := alignSubtitleCues(cfg, spans, windows)
+	if len(cues) == 0 {
+		return nil, false, "声学对齐没有产出字幕行"
+	}
+	if cues[len(cues)-1].End > total+0.5 {
+		return nil, false, "对齐后的时间轴超出成片时长"
+	}
+	return cues, true, fmt.Sprintf("检出 %d 个说话窗口，覆盖台词段 %.0f%%", len(windows), coverage*100)
+}
+
 // normalizeAspectCanvas 把成片统一到任务选定的画幅。
 // 服务商并不总按请求执行：方舟首帧/首尾帧任务的输出宽高比强制跟随首帧图（ratio 只能为 adaptive），
 // 选了 9:16 也可能拿回 16:9 的素材，所以在合成阶段兜底。
@@ -616,20 +888,30 @@ func prepareSubtitleFiles(workDir, taskID string, cfg VideoRunConfig, plan *Vide
 		return nil, errors.New("缺少渲染计划，无法生成字幕时间轴")
 	}
 	width, height := aspectResolution(cfg.AspectRatio)
-	return writeSubtitleFiles(workDir, taskID, cfg, plannedSubtitleSpans(*plan), "estimate", width, height)
+	return writeSubtitleFiles(workDir, taskID, cfg, buildSubtitleCues(*plan, cfg), "estimate", "", width, height)
 }
 
-// writeSubtitleFiles 按给定时间窗落盘 SRT/ASS。合成阶段会用片段实测时长重写一次，
-// 保证烧进成片的字幕与真实画面、对白同步。
-func writeSubtitleFiles(workDir, taskID string, cfg VideoRunConfig, spans []SubtitleSpan, timingSource string, width, height int) (*VideoSubtitles, error) {
+// subtitleTimingTable 字幕/时间对应表：cue 与对齐依据留档，供下载、复查与重渲染。
+type subtitleTimingTable struct {
+	TimingSource  string             `json:"timingSource"`
+	GeneratedAt   string             `json:"generatedAt"`
+	AudioSource   string             `json:"audioSource,omitempty"`
+	SilenceDetect string             `json:"silenceDetect,omitempty"`
+	Cues          []VideoSubtitleCue `json:"cues"`
+}
+
+// writeSubtitleFiles 脚本合成：按给定的 cue 时间轴生成 SRT/ASS 与字幕/时间对应表。
+// cue 由调用方决定来源（estimate/measured/aligned），合成阶段对齐后保证烧进成片的字幕与真实画面、对白同步。
+// audioSource 是被分析的媒体文件（声学对齐路径下非空），写进时间表供追溯。
+func writeSubtitleFiles(workDir, taskID string, cfg VideoRunConfig, cues []VideoSubtitleCue, timingSource, audioSource string, width, height int) (*VideoSubtitles, error) {
 	outputDir := filepath.Join(workDir, "output")
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("创建输出目录失败: %w", err)
 	}
 
-	cues := buildSubtitleCuesFromSpans(cfg, spans)
 	srtPath := filepath.Join(outputDir, "subtitles.srt")
 	assPath := filepath.Join(outputDir, "subtitles.ass")
+	timingPath := filepath.Join(outputDir, "subtitle-timing.json")
 
 	if err := os.WriteFile(srtPath, []byte(renderSRT(cues)), 0o644); err != nil {
 		return nil, fmt.Errorf("写入 SRT 字幕失败: %w", err)
@@ -637,14 +919,35 @@ func writeSubtitleFiles(workDir, taskID string, cfg VideoRunConfig, spans []Subt
 	if err := os.WriteFile(assPath, []byte(renderASS(cues, cfg, width, height)), 0o644); err != nil {
 		return nil, fmt.Errorf("写入 ASS 字幕失败: %w", err)
 	}
+	table := subtitleTimingTable{
+		TimingSource: timingSource,
+		GeneratedAt:  time.Now().Format(time.RFC3339),
+		AudioSource:  audioSource,
+		Cues:         cues,
+	}
+	if table.Cues == nil {
+		table.Cues = []VideoSubtitleCue{}
+	}
+	if audioSource != "" {
+		table.SilenceDetect = fmt.Sprintf("noise=%s:d=%g", silenceNoiseDB, silenceMinDurS)
+	}
+	data, err := json.MarshalIndent(table, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("序列化字幕时间对应表失败: %w", err)
+	}
+	if err := os.WriteFile(timingPath, data, 0o644); err != nil {
+		return nil, fmt.Errorf("写入字幕时间对应表失败: %w", err)
+	}
 
 	return &VideoSubtitles{
-		SRTPath:      srtPath,
-		ASSPath:      assPath,
-		SRTUrl:       videoMediaURL(taskID, "output/subtitles.srt"),
-		ASSUrl:       videoMediaURL(taskID, "output/subtitles.ass"),
-		TimingSource: timingSource,
-		Cues:         cues,
+		SRTPath:         srtPath,
+		ASSPath:         assPath,
+		SRTUrl:          videoMediaURL(taskID, "output/subtitles.srt"),
+		ASSUrl:          videoMediaURL(taskID, "output/subtitles.ass"),
+		TimingTablePath: timingPath,
+		TimingTableURL:  videoMediaURL(taskID, "output/subtitle-timing.json"),
+		TimingSource:    timingSource,
+		Cues:            cues,
 	}, nil
 }
 
@@ -838,22 +1141,34 @@ func composeVideo(ctx context.Context, workDir, taskID string, cfg VideoRunConfi
 	if cfg.Subtitles {
 		spans, spanErr := measuredSubtitleSpans(ctx, run.Plan, run.Renders, composedBySegment)
 		timingSource := "measured"
+		var cues []VideoSubtitleCue
+		audioSource := ""
 		if spanErr != nil {
 			if run.Plan == nil {
 				warnings = append(warnings, "生成字幕文件失败: "+spanErr.Error())
-				spans = nil
 			} else {
-				spans = plannedSubtitleSpans(*run.Plan)
+				cues = buildSubtitleCuesFromSpans(cfg, plannedSubtitleSpans(*run.Plan))
 				timingSource = "estimate"
 				warnings = append(warnings, "无法按片段实测时长对齐字幕，已沿用预算时间轴: "+spanErr.Error())
 			}
+		} else {
+			cues = buildSubtitleCuesFromSpans(cfg, spans)
+			// 声学对齐：成片画布提取音频 → 说话区间检测 → 台词只铺在真有声音的地方
+			if aligned, ok, message := alignCuesToSpeechActivity(ctx, ffmpeg, workDir, canvas, cfg, spans); ok {
+				cues = aligned
+				timingSource = "aligned"
+				audioSource = canvas
+				warnings = append(warnings, fmt.Sprintf("字幕已按音频活动对齐：%s，共 %d 条", message, len(cues)))
+			} else {
+				warnings = append(warnings, "字幕声学对齐未生效，按片段测时轴: "+message)
+			}
 		}
-		if spans != nil {
+		if len(cues) > 0 {
 			subtitleWidth, subtitleHeight := canvasWidth, canvasHeight
 			if subtitleWidth <= 0 || subtitleHeight <= 0 {
 				subtitleWidth, subtitleHeight = aspectResolution(cfg.AspectRatio)
 			}
-			subtitles, err := writeSubtitleFiles(workDir, taskID, cfg, spans, timingSource, subtitleWidth, subtitleHeight)
+			subtitles, err := writeSubtitleFiles(workDir, taskID, cfg, cues, timingSource, audioSource, subtitleWidth, subtitleHeight)
 			if err != nil {
 				warnings = append(warnings, "生成字幕文件失败: "+err.Error())
 			} else {

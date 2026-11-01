@@ -177,12 +177,14 @@ type VideoSubtitleCue struct {
 
 // VideoSubtitles 字幕产物（SRT + ASS）。
 type VideoSubtitles struct {
-	SRTPath      string             `json:"srtPath"`
-	ASSPath      string             `json:"assPath"`
-	SRTUrl       string             `json:"srtUrl"`
-	ASSUrl       string             `json:"assUrl"`
-	TimingSource string             `json:"timingSource"` // estimate|measured|tts
-	Cues         []VideoSubtitleCue `json:"cues"`
+	SRTPath         string             `json:"srtPath"`
+	ASSPath         string             `json:"assPath"`
+	SRTUrl          string             `json:"srtUrl"`
+	ASSUrl          string             `json:"assUrl"`
+	TimingTablePath string             `json:"timingTablePath"`
+	TimingTableURL  string             `json:"timingTableUrl"`
+	TimingSource    string             `json:"timingSource"` // estimate|measured|tts|aligned
+	Cues            []VideoSubtitleCue `json:"cues"`
 }
 
 // VideoRender 单段渲染记录（可断点续跑）。
@@ -765,74 +767,80 @@ func buildSubtitleCues(plan VideoPlan, cfg VideoRunConfig) []VideoSubtitleCue {
 // 让字幕切换节奏跟得上对白节奏，而不是一整块台词挂满整段。
 func buildSubtitleCuesFromSpans(cfg VideoRunConfig, spans []SubtitleSpan) []VideoSubtitleCue {
 	cues := make([]VideoSubtitleCue, 0, len(spans))
-	const lead = 0.2 // 段首留白：起音瞬间不上字幕
 	for _, span := range spans {
-		text := strings.TrimSpace(span.Text)
-		if text == "" || span.Duration <= 0 {
-			continue
-		}
-		window := span.Duration - lead - 0.15 // 段尾留白：避免字幕压住切镜瞬间
-		if window < 0.3 {
-			window = math.Max(0.15, span.Duration-lead)
-		}
-		if window <= 0 {
-			continue
-		}
-		estimate := estimateSpeechSeconds(text, cfg.Language, cfg.SpeechRate)
-		// 台词比窗口短就按自然语速收尾（别在静音处挂着字幕），比窗口长就铺满整段
-		spoken := math.Min(math.Max(estimate, 0.6), window)
-		if span.FillWindow {
-			spoken = window
-		}
+		cues = appendEstimatedCues(cues, cfg, span)
+	}
+	return cues
+}
 
-		parts := splitDialogueSentences(text)
-		if len(parts) == 0 {
-			continue
-		}
-		weights := make([]float64, len(parts))
-		total := 0.0
-		for index, part := range parts {
-			weights[index] = math.Max(1, float64(len([]rune(part))))
-			total += weights[index]
-		}
-		// 每条至少停留 0.9s，再等比缩回窗口内，总和仍等于 spoken
-		slots := make([]float64, len(parts))
-		sum := 0.0
-		for index, weight := range weights {
-			slots[index] = math.Max(0.9, spoken*weight/total)
-			sum += slots[index]
-		}
-		if scale := spoken / sum; scale < 1 {
-			for index := range slots {
-				slots[index] *= scale
-			}
-		}
+// appendEstimatedCues 按字速估算把一段台词铺进它的时间窗（声学对齐无活动区间时也退回这里）。
+func appendEstimatedCues(cues []VideoSubtitleCue, cfg VideoRunConfig, span SubtitleSpan) []VideoSubtitleCue {
+	text := strings.TrimSpace(span.Text)
+	if text == "" || span.Duration <= 0 {
+		return cues
+	}
+	window := span.Duration - 0.2 - 0.15 // 段尾留白：避免字幕压住切镜瞬间
+	if window < 0.3 {
+		window = math.Max(0.15, span.Duration-0.2)
+	}
+	if window <= 0 {
+		return cues
+	}
+	estimate := estimateSpeechSeconds(text, cfg.Language, cfg.SpeechRate)
+	// 台词比窗口短就按自然语速收尾（别在静音处挂着字幕），比窗口长就铺满整段
+	spoken := math.Min(math.Max(estimate, 0.6), window)
+	if span.FillWindow {
+		spoken = window
+	}
 
-		cursor := span.Start + lead
-		limit := span.Start + lead + spoken
-		for index, part := range parts {
-			bound := cursor + slots[index]
-			if bound > limit {
-				bound = limit
-			}
-			if index == len(parts)-1 {
-				bound = limit // 末句吃掉取整误差，避免字幕提前消失
-			}
-			// 句间留 0.08s 空隙，读起来才有“换句”的感觉
-			display := bound - 0.08
-			if index == len(parts)-1 {
-				display = bound
-			}
-			if display > cursor {
-				cues = append(cues, VideoSubtitleCue{
-					Index: len(cues) + 1,
-					Start: round2(cursor),
-					End:   round2(display),
-					Text:  wrapSubtitleText(part, cfg.Language),
-				})
-			}
-			cursor = bound
+	parts := splitDialogueSentences(text)
+	if len(parts) == 0 {
+		return cues
+	}
+	weights := make([]float64, len(parts))
+	total := 0.0
+	for index, part := range parts {
+		weights[index] = math.Max(1, float64(len([]rune(part))))
+		total += weights[index]
+	}
+	// 每条至少停留 0.9s，再等比缩回窗口内，总和仍等于 spoken
+	slots := make([]float64, len(parts))
+	sum := 0.0
+	for index, weight := range weights {
+		slots[index] = math.Max(0.9, spoken*weight/total)
+		sum += slots[index]
+	}
+	if scale := spoken / sum; scale < 1 {
+		for index := range slots {
+			slots[index] *= scale
 		}
+	}
+
+	const lead = 0.2 // 段首留白：起音瞬间不上字幕
+	cursor := span.Start + lead
+	limit := span.Start + lead + spoken
+	for index, part := range parts {
+		bound := cursor + slots[index]
+		if bound > limit {
+			bound = limit
+		}
+		if index == len(parts)-1 {
+			bound = limit // 末句吃掉取整误差，避免字幕提前消失
+		}
+		// 句间留 0.08s 空隙，读起来才有“换句”的感觉
+		display := bound - 0.08
+		if index == len(parts)-1 {
+			display = bound
+		}
+		if display > cursor {
+			cues = append(cues, VideoSubtitleCue{
+				Index: len(cues) + 1,
+				Start: round2(cursor),
+				End:   round2(display),
+				Text:  wrapSubtitleText(part, cfg.Language),
+			})
+		}
+		cursor = bound
 	}
 	return cues
 }
