@@ -177,6 +177,30 @@ CREATE TABLE IF NOT EXISTS video_projects (
 	updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_video_projects_created ON video_projects (created_at);
+
+-- 用量流水：文本调用记 token，视频渲染记片段与秒数，供首页大屏聚合
+-- reported = 0 表示服务商没返回 usage 字段（只计次，不计量）
+CREATE TABLE IF NOT EXISTS usage_events (
+	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	created_at     TEXT NOT NULL,
+	kind           TEXT NOT NULL,
+	purpose        TEXT NOT NULL DEFAULT '',
+	provider_name  TEXT NOT NULL DEFAULT '',
+	model          TEXT NOT NULL DEFAULT '',
+	dialect        TEXT NOT NULL DEFAULT '',
+	prompt_tokens  INTEGER NOT NULL DEFAULT 0,
+	output_tokens  INTEGER NOT NULL DEFAULT 0,
+	total_tokens   INTEGER NOT NULL DEFAULT 0,
+	clips          INTEGER NOT NULL DEFAULT 0,
+	seconds        REAL NOT NULL DEFAULT 0,
+	latency_ms     INTEGER NOT NULL DEFAULT 0,
+	failed         INTEGER NOT NULL DEFAULT 0,
+	reported       INTEGER NOT NULL DEFAULT 0,
+	task_id        TEXT NOT NULL DEFAULT '',
+	reference_text TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events (created_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_purpose ON usage_events (purpose, created_at);
 `
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("初始化数据表失败: %w", err)

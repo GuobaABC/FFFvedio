@@ -27,6 +27,49 @@ func TestVideoTemplateBuiltinsSeeded(t *testing.T) {
 	}
 }
 
+// 内置模板升版（真人角色 → 动物角色）时，存量库的 builtin 行要刷新，个人模板不受牵连。
+func TestBuiltinTemplateSeedRefreshesLegacyAnchors(t *testing.T) {
+	app := newTestApp(t)
+
+	const legacyPayload = `{"id":"tpl_builtin_brand_warm","name":"品牌口播·暖调","version":"1.2","scope":"builtin","characters":[{"roleId":"host","name":"主理人","appearanceBlock":"35 岁女性，齐肩黑发别在耳后"}]}`
+	if _, err := app.db.Exec(`UPDATE video_templates SET version = '1.2', payload_json = ? WHERE id = 'tpl_builtin_brand_warm'`, legacyPayload); err != nil {
+		t.Fatalf("构造老库模板失败: %v", err)
+	}
+	if _, err := app.db.Exec(`INSERT INTO video_templates (`+videoTemplateColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"tpl_mine", "我的模板", "1.2", TemplateScopePersonal, "[]", legacyPayload, "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("写入个人模板失败: %v", err)
+	}
+
+	if err := seedBuiltinVideoTemplates(app.db); err != nil {
+		t.Fatalf("刷新内置模板失败: %v", err)
+	}
+
+	var wantVersion string
+	for _, item := range builtinVideoTemplates() {
+		if item.ID == "tpl_builtin_brand_warm" {
+			wantVersion = item.Version
+		}
+	}
+	template, err := app.videoTemplateByID("tpl_builtin_brand_warm")
+	if err != nil {
+		t.Fatalf("读取内置模板失败: %v", err)
+	}
+	if template.Version != wantVersion {
+		t.Fatalf("内置模板版本未刷新: %s / 期望 %s", template.Version, wantVersion)
+	}
+	if len(template.Characters) == 0 || !strings.Contains(template.Characters[0].AppearanceBlock, "猫") {
+		t.Fatalf("内置模板角色应刷新为动物主体: %+v", template.Characters)
+	}
+
+	var personalPayload string
+	if err := app.db.QueryRow(`SELECT payload_json FROM video_templates WHERE id = 'tpl_mine'`).Scan(&personalPayload); err != nil {
+		t.Fatalf("读取个人模板失败: %v", err)
+	}
+	if !strings.Contains(personalPayload, "35 岁女性") {
+		t.Fatalf("个人模板不应被内置刷新波及: %s", personalPayload)
+	}
+}
+
 func TestVideoTemplateLayeredOverrideAndSources(t *testing.T) {
 	app := newTestApp(t)
 
@@ -67,16 +110,69 @@ func TestVideoTemplateLayeredOverrideAndSources(t *testing.T) {
 	}
 }
 
+// 用户上传的角色图优先于模板里的生成图：同一角色只吃一份来源，
+// 模板图只补到用户没给图的角色上（旧做法是整个字段二选一，用户选好的图会被模板盖掉）。
+func TestApplyVideoTemplatePrefersUserUploadedCharacterImages(t *testing.T) {
+	tpl := &VideoTemplate{Characters: []VideoTemplateCharacter{
+		{RoleID: "host", Name: "橘座（猫）", Images: []string{"tpl-host.png"}, AppearanceBlock: "成年橘猫"},
+		{RoleID: "guest", Name: "边牧", Images: []string{"tpl-guest.png"}, AppearanceBlock: "黑白毛边牧"},
+	}}
+	cfg := VideoRunConfig{CharacterRefs: []VideoCharacterRef{
+		// 只写了角色名（没写 role_id）也要能对上模板里那个角色
+		{RoleID: "host", Name: "橘座", Images: []string{"C:\\Users\\me\\host.png"}},
+	}}
+
+	merged, sources, warnings := applyVideoTemplate(tpl, cfg, nil)
+	if sources[templateFieldCharacters] != TemplateSourceOverride {
+		t.Fatalf("用了上传图时字段来源应为 override，实际 %q", sources[templateFieldCharacters])
+	}
+	if len(merged.CharacterRefs) != 2 {
+		t.Fatalf("应只留两个角色条目: %+v", merged.CharacterRefs)
+	}
+	host := merged.CharacterRefs[0]
+	if host.RoleID != "host" || host.ImageSource != CharacterImageSourceUser || len(host.Images) != 1 || host.Images[0] != "C:\\Users\\me\\host.png" {
+		t.Fatalf("上传图应踢掉同角色的模板生成图: %+v", host)
+	}
+	guest := merged.CharacterRefs[1]
+	if guest.RoleID != "guest" || guest.ImageSource != CharacterImageSourceTemplate || len(guest.Images) != 1 {
+		t.Fatalf("用户没给图的角色应继续用模板定妆图: %+v", guest)
+	}
+	if len(warnings) == 0 || !strings.Contains(warnings[len(warnings)-1], "用户上传") {
+		t.Fatalf("模板图被替换要告知用户: %v", warnings)
+	}
+
+	// 用户一张图也没给：完全回退模板，来源标 template，不报替换警告
+	noUpload, noSources, noWarnings := applyVideoTemplate(tpl, VideoRunConfig{CharacterRefs: []VideoCharacterRef{
+		{RoleID: "host", Name: "橘座"},
+	}}, nil)
+	if noSources[templateFieldCharacters] != TemplateSourceTemplate {
+		t.Fatalf("没上传图时来源应为 template，实际 %q", noSources[templateFieldCharacters])
+	}
+	if len(noUpload.CharacterRefs) != 3 || noUpload.CharacterRefs[1].ImageSource != CharacterImageSourceTemplate {
+		t.Fatalf("模板定妆图应全部带入: %+v", noUpload.CharacterRefs)
+	}
+	for _, warning := range noWarnings {
+		if strings.Contains(warning, "用户上传") {
+			t.Fatalf("没有上传图时不该报替换警告: %v", noWarnings)
+		}
+	}
+}
+
 func TestCreateVideoTaskWithTemplate(t *testing.T) {
 	withTempVideoRoot(t)
 	app := newTestApp(t)
+
+	builtin, err := app.videoTemplateByID("tpl_builtin_brand_warm")
+	if err != nil {
+		t.Fatalf("读取内置模板失败: %v", err)
+	}
 
 	task, err := app.CreateVideoTask(VideoTaskInput{
 		Config: VideoRunConfig{
 			Topic: "清晨手冲咖啡",
 			TemplateRef: &VideoTemplateRef{
 				ID:          "tpl_builtin_brand_warm",
-				Version:     "1.2",
+				Version:     "1.0", // 老任务锁定的历史版本
 				Overrides:   map[string]string{"durationS": "30"},
 				OpeningVars: map[string]string{"brand": "晨光", "product": "手冲咖啡"},
 			},
@@ -92,8 +188,8 @@ func TestCreateVideoTaskWithTemplate(t *testing.T) {
 	if task.Run.Template == nil {
 		t.Fatal("任务缺少模板快照")
 	}
-	if task.Run.Template.Version != "1.2" {
-		t.Fatalf("模板版本未锁定: %q", task.Run.Template.Version)
+	if task.Run.Template.Version != builtin.Version {
+		t.Fatalf("模板快照应按最新版本固化: %q / 期望 %q", task.Run.Template.Version, builtin.Version)
 	}
 	if task.Run.ConfigSources[templateFieldAspect] != TemplateSourceTemplate {
 		t.Fatalf("字段来源未落库: %+v", task.Run.ConfigSources)

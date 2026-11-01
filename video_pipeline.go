@@ -450,7 +450,7 @@ func applyPromptEdits(prompts []VideoPromptItem, edits []VideoPromptEdit, cfg Vi
 		if !ok {
 			continue
 		}
-		prompts[i].VisualPrompt = strings.TrimSpace(edit.VisualPrompt)
+		prompts[i].VisualPrompt = appendCastDirective(strings.TrimSpace(edit.VisualPrompt))
 		prompts[i].Dialogue = strings.TrimSpace(edit.Dialogue)
 		prompts[i].CharCount = speechUnitCount(prompts[i].Dialogue, cfg.Language)
 		prompts[i].EstSpeechS = estimateSpeechSeconds(prompts[i].Dialogue, cfg.Language, cfg.SpeechRate)
@@ -492,6 +492,11 @@ func (r *videoRunner) warn(format string, args ...any) {
 	r.logf("警告: %s", message)
 }
 
+// usageCtx 给本阶段的模型调用标上用途与任务身份，首页大屏才能把消耗拆到「分镜/提示词/渲染」上。
+func (r *videoRunner) usageCtx(purpose string) context.Context {
+	return withUsage(r.ctx, purpose, r.task.ID)
+}
+
 func (r *videoRunner) save() error {
 	r.task.UpdatedAt = time.Now().Format(time.RFC3339)
 	if err := r.app.updateVideoTaskRecord(*r.task); err != nil {
@@ -527,7 +532,7 @@ func (a *App) runVideoPipeline(id, from, feedback string) {
 		task.Run.Gates[VideoGatePrompt] = videoGateApproved
 	}
 
-	runner := &videoRunner{app: a, task: &task, ctx: context.Background()}
+	runner := &videoRunner{app: a, task: &task, ctx: withUsageTask(context.Background(), id)}
 	runner.logf("开始执行阶段 %s", from)
 	_ = runner.save()
 
@@ -619,7 +624,7 @@ func (r *videoRunner) runScriptStage() error {
 	if tpl := r.task.Run.Template; tpl != nil {
 		r.logf("按模板「%s」v%s 执行：%d 个字段来自模板，%d 个字段本次改过", tpl.Name, tpl.Version, len(tpl.Sources), len(tpl.Overrides))
 	}
-	script, warnings := r.app.generateScript(r.ctx, r.task.Config, r.task.Run.Template)
+	script, warnings := r.app.generateScript(r.usageCtx(UsagePurposeScript), r.task.Config, r.task.Run.Template)
 	for _, warning := range warnings {
 		r.warn("%s", warning)
 	}
@@ -658,7 +663,7 @@ func (r *videoRunner) runPromptStage() error {
 	caps := adapterCapabilities(adapter, provider.Model)
 	r.task.Run.Adapter = adapterID
 
-	prompts, promptWarnings := r.app.generatePrompts(r.ctx, r.task.Config, *r.task.Run.Script, caps, r.task.Run.Template)
+	prompts, promptWarnings := r.app.generatePrompts(r.usageCtx(UsagePurposePrompt), r.task.Config, *r.task.Run.Script, caps, r.task.Run.Template)
 	for _, warning := range promptWarnings {
 		r.warn("%s", warning)
 	}
@@ -720,6 +725,19 @@ func (r *videoRunner) runRenderStage() (bool, error) {
 	r.task.Run.Adapter = adapterID
 	r.logf("渲染通道：%s｜模型 %s｜Base %s", adapterID,
 		firstNonEmpty(provider.Model, "未填写"), firstNonEmpty(provider.BaseURL, "未填写"))
+	if cfg.strictFirstFrameEnabled() {
+		r.logf("首帧约束：严格 —— 带首帧的片段一律按「图生视频-首帧」提交，画面必须从这张图开始（与角色参考图互斥时首帧优先）")
+	} else {
+		r.logf("首帧约束：宽松 —— 首帧图与角色参考图一起走全模态参考，锁帧靠提示词里的「图片1」约定")
+	}
+	// 用户给了首帧/尾帧就要真锁帧：通道做不到时当场停下，不能让它静默失效后白烧额度
+	if strings.TrimSpace(cfg.FirstFrame) != "" && !caps.I2VFirstFrame {
+		if adapterID == "mock" {
+			r.warn("本地联调占位通道不消费首帧图：你给的首帧/尾帧不会成为新视频的第一帧画面，只用于走通流程")
+		} else {
+			return false, fmt.Errorf("通道 %s 不支持以首帧图起片，无法保证新视频从你提供的首帧/尾帧开始：请换支持图生视频首帧的通道（如火山方舟 Seedance），或清空首帧后重生", adapterID)
+		}
+	}
 
 	if r.task.Run.Plan == nil || len(r.task.Run.Plan.Segments) == 0 {
 		if len(r.task.Run.Prompts) == 0 {
@@ -786,21 +804,54 @@ func (r *videoRunner) runRenderStage() (bool, error) {
 		_ = r.save()
 		r.logf("开始生成第 %d/%d 段：%ds（%s）", segment.Index+1, len(segments), segment.DurationS, adapterID)
 
-		outputPath := filepath.Join(workDir, "clips", fmt.Sprintf("%02d-%s.mp4", segment.Index+1, segment.ID))
-		request := VideoGenRequest{
-			Prompt:          composeRenderPrompt(segment, caps),
-			FirstFrame:      firstFrame,
-			CharacterImages: characterImagesForSegment(cfg, r.task.Run.Script, segment),
-			DurationS:       segment.DurationS,
-			AspectRatio:     cfg.AspectRatio,
-			Fps:             cfg.Fps,
-			Seed:            cfg.VideoParams.Seed,
-			OutputPath:      outputPath,
+		charImages, charWarning := characterImagesForSegment(cfg, r.task.Run.Script, segment)
+		if charWarning != "" && !adapterNotes[charWarning] {
+			adapterNotes[charWarning] = true
+			r.warn("%s", charWarning)
+		}
+		if len(charImages) > 0 {
+			// 把“本段到底带了哪几张角色图”写进日志：首帧延续与角色一致性必须同时生效，不能只靠返工发现
+			names := make([]string, 0, len(charImages))
+			for _, image := range charImages {
+				label := firstNonEmpty(image.Name, image.RoleID)
+				if image.Source == CharacterImageSourceUser {
+					label += "（用户上传）"
+				}
+				names = append(names, label)
+			}
+			suffix := ""
+			if firstFrame != "" {
+				if cfg.strictFirstFrameEnabled() {
+					suffix = "；严格首帧优先，任务类型互斥的通道（如火山方舟）本段不提交角色图，形象由首帧画面与外观锚点保持"
+				} else {
+					suffix = "，与首帧图一起按全模态参考提交"
+				}
+			}
+			r.logf("第 %d 段附带角色参考图 %d 张（%s）%s", segment.Index+1, len(charImages), strings.Join(names, "、"), suffix)
 		}
 
-		clipCtx, cancel := context.WithTimeout(r.ctx, 30*time.Minute)
+		outputPath := filepath.Join(workDir, "clips", fmt.Sprintf("%02d-%s.mp4", segment.Index+1, segment.ID))
+		request := VideoGenRequest{
+			Prompt:           composeRenderPrompt(segment, caps),
+			FirstFrame:       firstFrame,
+			CharacterImages:  charImages,
+			StrictFirstFrame: cfg.strictFirstFrameEnabled(),
+			DurationS:        segment.DurationS,
+			AspectRatio:      cfg.AspectRatio,
+			Fps:              cfg.Fps,
+			Seed:             cfg.VideoParams.Seed,
+			OutputPath:       outputPath,
+		}
+
+		usageCtx := r.usageCtx(UsagePurposeVideoRender)
+		clipCtx, cancel := context.WithTimeout(usageCtx, 30*time.Minute)
+		renderStart := time.Now()
 		result, genErr := adapter.Generate(clipCtx, genCtx, request)
 		cancel()
+		// 本地联调占位不调用任何厂商接口，不记账：混进来会把「真实消耗」稀释成假数字
+		if adapterID != "mock" {
+			r.app.recordVideoUsage(usageCtx, provider, adapterID, result.ModelVer, result.DurationS, time.Since(renderStart), genErr)
+		}
 
 		if genErr != nil {
 			render.Status = "failed"
@@ -871,7 +922,7 @@ func (r *videoRunner) runMetaStage() error {
 		return errors.New("缺少分镜，无法生成发布元数据")
 	}
 
-	meta, warnings := r.app.generatePublishMeta(r.ctx, r.task.Config, r.task.Run.Script, r.task.Run.Prompts)
+	meta, warnings := r.app.generatePublishMeta(r.usageCtx(UsagePurposePublishMeta), r.task.Config, r.task.Run.Script, r.task.Run.Prompts)
 	for _, warning := range warnings {
 		r.warn("%s", warning)
 	}
@@ -914,28 +965,122 @@ func relativeUnderWorkDir(workDir, path string) string {
 }
 
 // characterImagesForSegment 只把该段出场角色的参考图交给适配器。
-func characterImagesForSegment(cfg VideoRunConfig, script *VideoScript, segment VideoSegment) []string {
-	if script == nil || len(cfg.CharacterRefs) == 0 {
-		return nil
+// 分镜没标角色、或标的 role_id 与角色表对不上时，退化为附上全部角色参考图：
+// 宁多给几张图，也不要让角色一致性静默失效（静默丢图正是“参考图没被参考”的常见成因）。
+func characterImagesForSegment(cfg VideoRunConfig, script *VideoScript, segment VideoSegment) ([]VideoCharacterImage, string) {
+	if len(cfg.CharacterRefs) == 0 {
+		return nil, ""
 	}
 	roles := map[string]bool{}
-	for _, shot := range script.Shots {
-		if shot.ID != segment.ShotID {
-			continue
-		}
-		for _, role := range shot.Roles {
-			roles[role] = true
+	if script != nil {
+		for _, shot := range script.Shots {
+			if shot.ID != segment.ShotID {
+				continue
+			}
+			for _, role := range shot.Roles {
+				if key := normalizeRoleKey(role); key != "" {
+					roles[key] = true
+				}
+			}
 		}
 	}
-	if len(roles) == 0 {
-		return nil
-	}
-	images := make([]string, 0, 4)
+
+	matched := make([]VideoCharacterImage, 0, 4)
 	for _, ref := range cfg.CharacterRefs {
-		if !roles[ref.RoleID] {
+		if !roleMatches(roles, ref) {
 			continue
 		}
-		images = append(images, ref.Images...)
+		matched = append(matched, characterImagesOf(ref)...)
+	}
+	if len(matched) > 0 {
+		return orderCharacterImages(matched), ""
+	}
+
+	all := make([]VideoCharacterImage, 0, 4)
+	for _, ref := range cfg.CharacterRefs {
+		all = append(all, characterImagesOf(ref)...)
+	}
+	if len(all) == 0 {
+		return nil, ""
+	}
+	return orderCharacterImages(all), fmt.Sprintf(
+		"第 %d 段没有匹配到出场角色（分镜 roles 为空或与角色表不一致），已附带全部 %d 张角色参考图",
+		segment.Index+1, len(all),
+	)
+}
+
+// normalizeRoleKey role 标识大小写 / 空格不敏感，便于容忍模型返回的写法差异。
+func normalizeRoleKey(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+// roleMatches 先按 role_id / 角色名精确比，再放宽到包含关系（模型常把「主理人（橘猫）」写成「主理人」）。
+func roleMatches(roles map[string]bool, ref VideoCharacterRef) bool {
+	if len(roles) == 0 {
+		return false
+	}
+	for _, candidate := range []string{normalizeRoleKey(ref.RoleID), normalizeRoleKey(ref.Name)} {
+		if candidate == "" {
+			continue
+		}
+		if roles[candidate] {
+			return true
+		}
+		for got := range roles {
+			if strings.Contains(got, candidate) || strings.Contains(candidate, got) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// characterImagesOf 把一个角色的定妆图展开成带身份的图片条目。
+func characterImagesOf(ref VideoCharacterRef) []VideoCharacterImage {
+	images := make([]VideoCharacterImage, 0, len(ref.Images))
+	for _, image := range ref.Images {
+		if strings.TrimSpace(image) == "" {
+			continue
+		}
+		images = append(images, VideoCharacterImage{
+			RoleID: ref.RoleID, Name: ref.Name, URL: image, Source: ref.ImageSource,
+		})
 	}
 	return images
+}
+
+// orderCharacterImages 把用户上传的定妆图排到前面：方舟的全模态参考有张数上限（Seedance 2.0 系列 9 张），
+// 超限截断时先丢模板生成图；同时序号靠前的图在提示词里天然是更强的锚点。
+func orderCharacterImages(in []VideoCharacterImage) []VideoCharacterImage {
+	out := make([]VideoCharacterImage, 0, len(in))
+	for _, item := range in {
+		if item.Source == CharacterImageSourceUser {
+			out = append(out, item)
+		}
+	}
+	for _, item := range in {
+		if item.Source != CharacterImageSourceUser {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// roleUsesUserImages 判断某个出镜角色吃的是用户上传的定妆图（而不是模板里的生成图）。
+// 两者的权威程度不同：上传图是用户亲自认定的形象，提示词里的文字描述只能兜底。
+func roleUsesUserImages(cfg VideoRunConfig, role string) bool {
+	key := normalizeRoleKey(role)
+	if key == "" {
+		return false
+	}
+	roles := map[string]bool{key: true}
+	for _, ref := range cfg.CharacterRefs {
+		if ref.ImageSource != CharacterImageSourceUser || len(ref.Images) == 0 {
+			continue
+		}
+		if roleMatches(roles, ref) {
+			return true
+		}
+	}
+	return false
 }

@@ -47,12 +47,21 @@ const (
 	videoGateApproved = "approved"
 )
 
+// 角色参考图来源：用户上传的定妆图优先于模板里的生成图。
+// 同一角色只吃一份来源，两边的图混着提交会被模型平均出第三个形象。
+const (
+	CharacterImageSourceUser     = "user"     // 用户在新建任务里选的图
+	CharacterImageSourceTemplate = "template" // 模板自带的定妆图（多为生成图）
+)
+
 // VideoCharacterRef 多角色参考图：每个角色一张或多张定妆图，用于跨段保持外观一致。
 type VideoCharacterRef struct {
-	RoleID    string   `json:"roleId"`
-	Name      string   `json:"name"`
-	Images    []string `json:"images"`
-	VoiceHint string   `json:"voiceHint"`
+	RoleID string   `json:"roleId"`
+	Name   string   `json:"name"`
+	Images []string `json:"images"`
+	// ImageSource 标记 Images 的来源，决定提交顺序与提示词里的措辞权重
+	ImageSource string `json:"imageSource"`
+	VoiceHint   string `json:"voiceHint"`
 }
 
 // VideoSubtitleStyle 字幕样式，全部来自用户输入（§6）。
@@ -90,23 +99,33 @@ type VideoRunConfig struct {
 	Language         string              `json:"language"`
 	Subtitles        bool                `json:"subtitles"` // 是否生成并烧录字幕（默认关闭）
 	SegmentReview    *bool               `json:"segmentReview"`
-	KeepLastFrame    bool                `json:"keepLastFrame"` // 最后一段尾帧存入资产库
-	VideoParams      VideoParams         `json:"videoParams"`
-	SubtitleStyle    VideoSubtitleStyle  `json:"subtitleStyle"`
-	Adapter          string              `json:"adapter"`        // auto|mock|dashscope|runway|veo|generic
-	ProviderID       string              `json:"providerId"`     // multimodal_gen 提供商
-	TextProviderID   string              `json:"textProviderId"` // Agent1/Agent2 使用的文本模型
-	LocalFallback    *bool               `json:"localFallback"`  // 无文本模型时用本地规则（默认 true）
-	Platforms        []string            `json:"platforms"`      // Agent4 发布平台（可多选，首个为主平台）
-	Region           string              `json:"region"`         // 受众时区，默认 Asia/Shanghai
-	Vertical         string              `json:"vertical"`       // 垂类：美食/游戏/母婴/知识…
-	TemplateRef      *VideoTemplateRef   `json:"templateRef"`    // 选中的模板（只预填默认值，不绕过 gate）
+	// StrictFirstFrame 严格首帧：本段有首帧（多为用户输入或从尾帧资产带入的那张图）时，
+	// 必须以「图生视频-首帧」任务提交、画面从这张图开始，不为角色参考图让位（nil 默认开启）。
+	StrictFirstFrame *bool              `json:"strictFirstFrame"`
+	KeepLastFrame    bool               `json:"keepLastFrame"` // 最后一段尾帧存入资产库
+	VideoParams      VideoParams        `json:"videoParams"`
+	SubtitleStyle    VideoSubtitleStyle `json:"subtitleStyle"`
+	Adapter          string             `json:"adapter"`        // auto|mock|dashscope|runway|veo|generic
+	ProviderID       string             `json:"providerId"`     // multimodal_gen 提供商
+	TextProviderID   string             `json:"textProviderId"` // Agent1/Agent2 使用的文本模型
+	LocalFallback    *bool              `json:"localFallback"`  // 无文本模型时用本地规则（默认 true）
+	Platforms        []string           `json:"platforms"`      // Agent4 发布平台（可多选，首个为主平台）
+	Region           string             `json:"region"`         // 受众时区，默认 Asia/Shanghai
+	Vertical         string             `json:"vertical"`       // 垂类：美食/游戏/母婴/知识…
+	TemplateRef      *VideoTemplateRef  `json:"templateRef"`    // 选中的模板（只预填默认值，不绕过 gate）
 }
 
 // segmentReviewEnabled 逐段确认默认开启（与 LocalFallback 同样的 *bool 缺省语义），
 // 取消勾选后恢复“一次串行渲染全部片段”的全自动模式。
 func (cfg VideoRunConfig) segmentReviewEnabled() bool {
 	return cfg.SegmentReview == nil || *cfg.SegmentReview
+}
+
+// strictFirstFrameEnabled 严格首帧默认开启：用户既然给了首帧/尾帧，新视频就得从这张画面起。
+// 关掉它才会让首帧图与角色参考图一起走方舟「全模态参考」（官方两类任务互斥，
+// 参考模式下锁帧只能靠提示词里的「图片1 是本段首帧画面」这种软约定）。
+func (cfg VideoRunConfig) strictFirstFrameEnabled() bool {
+	return cfg.StrictFirstFrame == nil || *cfg.StrictFirstFrame
 }
 
 // VideoShot Agent1 的分镜数组元素。
@@ -299,11 +318,16 @@ type VideoGateEdits struct {
 }
 
 // VideoAdapterInfo 适配器能力声明，供前端展示档位/上限/成本。
+// Maturity 说明适配成熟度：目前只有字节跳动火山方舟 Seedance 是主力适配，
+// 其余通道只保证了基础生视频链路，不要把「能跑」当成「每个能力都验收过」。
 type VideoAdapterInfo struct {
-	ID           string            `json:"id"`
-	Label        string            `json:"label"`
-	Description  string            `json:"description"`
-	Capabilities VideoCapabilities `json:"capabilities"`
+	ID            string            `json:"id"`
+	Label         string            `json:"label"`
+	Description   string            `json:"description"`
+	Maturity      string            `json:"maturity"`
+	MaturityLabel string            `json:"maturityLabel"`
+	MaturityNote  string            `json:"maturityNote"`
+	Capabilities  VideoCapabilities `json:"capabilities"`
 }
 
 // VideoEnvironment 运行环境（ffmpeg 可用性、可选适配器、工作目录）。
@@ -530,6 +554,10 @@ func normalizeVideoConfig(cfg VideoRunConfig) (VideoRunConfig, []string, error) 
 		enabled := true
 		cfg.SegmentReview = &enabled
 	}
+	if cfg.StrictFirstFrame == nil {
+		enabled := true
+		cfg.StrictFirstFrame = &enabled
+	}
 	if cfg.LocalFallback == nil {
 		enabled := true
 		cfg.LocalFallback = &enabled
@@ -552,6 +580,7 @@ func normalizeVideoConfig(cfg VideoRunConfig) (VideoRunConfig, []string, error) 
 		ref.RoleID = strings.TrimSpace(ref.RoleID)
 		ref.Name = strings.TrimSpace(ref.Name)
 		ref.VoiceHint = strings.TrimSpace(ref.VoiceHint)
+		ref.ImageSource = strings.ToLower(strings.TrimSpace(ref.ImageSource))
 		if ref.Name == "" && ref.RoleID == "" && len(ref.Images) == 0 {
 			continue
 		}
@@ -576,6 +605,14 @@ func normalizeVideoConfig(cfg VideoRunConfig) (VideoRunConfig, []string, error) 
 			images = append(images, image)
 		}
 		ref.Images = images
+		// 没标来源的（手填 / 老任务）都是用户自己给的图，按用户上传处理并享受优先权；
+		// 图全被剔掉时清掉标记，免得留着一个没有图的“优先”身份。
+		if ref.ImageSource == "" {
+			ref.ImageSource = CharacterImageSourceUser
+		}
+		if len(images) == 0 {
+			ref.ImageSource = ""
+		}
 		refs = append(refs, ref)
 	}
 	cfg.CharacterRefs = refs

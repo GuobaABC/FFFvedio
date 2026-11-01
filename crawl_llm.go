@@ -35,7 +35,8 @@ func (a *App) llmExtractVideoItem(ctx context.Context, provider Provider, page c
 		return crawlCandidate{}, errors.New("没有可用的文本模型")
 	}
 	user := buildCrawlExtractPrompt(page, doc)
-	raw, err := a.chatCompletion(ctx, provider, crawlExtractSystemPrompt, user)
+	// L3 自己才是「热点抽取」，用途标签就地打上（任务 ID 由 processURL 注入在上游 ctx）
+	raw, err := a.chatCompletion(withUsagePurpose(ctx, UsagePurposeHotExtract), provider, crawlExtractSystemPrompt, user)
 	if err != nil {
 		return crawlCandidate{}, err
 	}
@@ -155,7 +156,7 @@ func (a *App) llmProposeSiteSelectors(ctx context.Context, provider Provider, pa
 	builder.WriteString(truncateRunes(compactHTML(page.Body), 12000))
 	builder.WriteString("\n\n请输出选择器 JSON。")
 
-	raw, err := a.chatCompletion(ctx, provider, crawlSelectorSystemPrompt, builder.String())
+	raw, err := a.chatCompletion(withUsagePurpose(ctx, UsagePurposeSiteSelect), provider, crawlSelectorSystemPrompt, builder.String())
 	if err != nil {
 		return nil, err
 	}

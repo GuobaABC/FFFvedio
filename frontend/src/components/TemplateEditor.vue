@@ -264,11 +264,12 @@ function cancel() {
 
       <section class="ui-card block">
         <div class="block__head">
-          <h4 class="ui-h3">3. 人物插图（图文成对）</h4>
+          <h4 class="ui-h3">3. 角色插图（图文成对）</h4>
           <button class="ui-btn" type="button" @click="addCharacter">+ 添加角色</button>
         </div>
         <p v-if="draft.characters.length === 0" class="hint">
-          不定义角色也可以：模板允许部分定义，人物由主题决定。添加后请同时给「定妆图 + 外观描述块」，不支持的模型会自动降级用文字。
+          不定义角色也可以：模板允许部分定义，主体由主题决定。添加后请同时给「定妆图 + 外观描述块」，不支持的模型会自动降级用文字。
+          外观描述请写成猫 / 狗 / 猪 / 鸡等动物主体（可拟人化穿衣、站立），避免真人特征描述。
         </p>
         <div v-for="(character, index) in draft.characters" :key="index" class="character">
           <div class="grid grid--3">
@@ -278,7 +279,7 @@ function cancel() {
             </label>
             <label class="ui-field">
               <span class="ui-label">名称</span>
-              <input v-model="character.name" class="ui-input" type="text" placeholder="主理人" />
+              <input v-model="character.name" class="ui-input" type="text" placeholder="主理人（橘猫）" />
             </label>
             <label class="ui-field">
               <span class="ui-label">声音提示</span>
@@ -291,7 +292,7 @@ function cancel() {
               v-model="character.appearanceBlock"
               class="ui-textarea"
               rows="2"
-              placeholder="35 岁女性，齐肩黑发别在耳后，米白针织上衣，亚麻围裙系在腰侧"
+              placeholder="成年橘色短毛猫，圆脸、耳尖一撮白毛，脖子系米白针织围巾，亚麻小围裙挂在胸前"
             ></textarea>
           </label>
           <div class="grid grid--2">

@@ -63,7 +63,7 @@ type VideoTemplateStyle struct {
 	PromptSnippets map[string]string `json:"promptSnippets"`
 }
 
-// VideoTemplateCharacter 人物插图：定妆图 + 外观描述块 + 声音提示，图文成对（§3）。
+// VideoTemplateCharacter 角色插图：定妆图 + 外观描述块 + 声音提示，图文成对（§3）。
 type VideoTemplateCharacter struct {
 	RoleID          string   `json:"roleId"`
 	Name            string   `json:"name"`
@@ -548,10 +548,7 @@ func applyVideoTemplate(tpl *VideoTemplate, cfg VideoRunConfig, overrides map[st
 		apply(templateFieldVertical, func() { cfg.Vertical = value })
 	}
 
-	if len(tpl.Characters) > 0 {
-		value := templateCharacterRefs(tpl)
-		apply(templateFieldCharacters, func() { cfg.CharacterRefs = value })
-	}
+	warnings = append(warnings, mergeCharacterRefs(tpl, &cfg, sources)...)
 
 	// 用户改过但模板没定义的字段同样标 override，避免被误读成默认值
 	for key, value := range overrides {
@@ -571,13 +568,99 @@ func templateCharacterRefs(tpl *VideoTemplate) []VideoCharacterRef {
 	refs := make([]VideoCharacterRef, 0, len(tpl.Characters))
 	for _, character := range tpl.Characters {
 		refs = append(refs, VideoCharacterRef{
-			RoleID:    character.RoleID,
-			Name:      character.Name,
-			Images:    append([]string{}, character.Images...),
-			VoiceHint: character.VoiceHint,
+			RoleID:      character.RoleID,
+			Name:        character.Name,
+			Images:      append([]string{}, character.Images...),
+			ImageSource: CharacterImageSourceTemplate,
+			VoiceHint:   character.VoiceHint,
 		})
 	}
 	return refs
+}
+
+// mergeCharacterRefs 角色参考图按角色逐个合并，用户上传的图优先：
+// 旧做法是整个字段二选一（用户改过就丢掉模板所有角色，没改过就把用户选好的图盖掉），
+// 现在逐角色判：用户给了图的角色只用用户那张图，模板生成图只补到用户没给图的角色上。
+// 同一角色不混交两份来源：两张不同的图丢给模型，只会平均出第三个形象。
+func mergeCharacterRefs(tpl *VideoTemplate, cfg *VideoRunConfig, sources map[string]string) []string {
+	if len(tpl.Characters) == 0 {
+		return nil
+	}
+	templateRefs := templateCharacterRefs(tpl)
+	userRefs := cfg.CharacterRefs
+
+	merged := make([]VideoCharacterRef, 0, len(userRefs)+len(templateRefs))
+	claimed := make(map[string]bool, len(userRefs))
+	userBacked := make([]string, 0, len(userRefs))
+	pushed := make([]string, 0, len(templateRefs))
+	for _, ref := range userRefs {
+		if len(ref.Images) > 0 {
+			// 前端会把模板那一行原样送回来（已标 template）：只认身份，不给它上传图的优先权
+			if ref.ImageSource != CharacterImageSourceTemplate {
+				ref.ImageSource = CharacterImageSourceUser
+				userBacked = append(userBacked, firstNonEmpty(ref.Name, ref.RoleID))
+			}
+			for _, key := range characterRefKeys(ref) {
+				claimed[key] = true
+			}
+		}
+		merged = append(merged, ref)
+	}
+
+	for _, ref := range templateRefs {
+		name := strings.TrimSpace(firstNonEmpty(ref.Name, ref.RoleID))
+		if roleKeysClaimed(characterRefKeys(ref), claimed) {
+			if name != "" {
+				pushed = append(pushed, name)
+			}
+			continue
+		}
+		merged = append(merged, ref)
+	}
+	cfg.CharacterRefs = merged
+
+	if len(userBacked) == 0 {
+		sources[templateFieldCharacters] = TemplateSourceTemplate
+		return nil
+	}
+	sources[templateFieldCharacters] = TemplateSourceOverride
+	if len(pushed) == 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"角色「%s」已改用用户上传的定妆图，模板里的生成图不再提交（同一角色只用一份来源，免得两张图被模型平均出第三个形象）",
+		strings.Join(pushed, "、"),
+	)}
+}
+
+// characterRefKeys 一个角色条目的可比对标识：role_id 与角色名都算，供跨来源对齐。
+func characterRefKeys(ref VideoCharacterRef) []string {
+	keys := make([]string, 0, 2)
+	for _, candidate := range []string{normalizeRoleKey(ref.RoleID), normalizeRoleKey(ref.Name)} {
+		if candidate != "" {
+			keys = append(keys, candidate)
+		}
+	}
+	return keys
+}
+
+// roleKeysClaimed 判断模板角色是否已被用户那边的同一条认领：
+// 先比精确标识，再放宽到包含关系（模板叫「橘座（猫）」、用户只写了「橘座」时不能当成两个角色）。
+func roleKeysClaimed(keys []string, claimed map[string]bool) bool {
+	if len(claimed) == 0 {
+		return false
+	}
+	for _, key := range keys {
+		if claimed[key] {
+			return true
+		}
+		for got := range claimed {
+			if strings.Contains(got, key) || strings.Contains(key, got) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // interpolateTemplateText 用本次变量插值占位符，并回收缺失的变量名。

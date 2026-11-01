@@ -532,3 +532,143 @@ func TestSubtitlesDefaultOff(t *testing.T) {
 		t.Fatal("显式开启后应保留字幕开关")
 	}
 }
+
+// 出镜主体统一约束：三段 Agent 提示词、落到视频模型的提示词、以及用户改写后的提示词都要带上动物主体要求。
+func TestAnimalCastDirectiveAppliedEverywhere(t *testing.T) {
+	for name, prompt := range map[string]string{
+		"分镜":   scriptSystemPrompt,
+		"提示词":  promptSystemPrompt,
+		"单段重写": segmentPromptSuggestSystemPrompt,
+	} {
+		if !strings.Contains(prompt, animalCastDirective) {
+			t.Fatalf("%s 的 system 提示词缺少动物主体约束", name)
+		}
+	}
+
+	cfg, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "橘猫开咖啡馆", DurationS: 12})
+	if err != nil {
+		t.Fatalf("归一化失败: %v", err)
+	}
+	script := normalizeScript(localVideoScript(cfg), cfg)
+	prompts, _ := (&App{}).generatePrompts(t.Context(), cfg, script, defaultVideoCapabilities())
+	if len(prompts) == 0 {
+		t.Fatal("提示词不应为空")
+	}
+	for _, prompt := range prompts {
+		if !strings.Contains(prompt.VisualPrompt, animalCastDirective) {
+			t.Fatalf("本地兜底提示词缺少动物主体约束: %q", prompt.VisualPrompt)
+		}
+	}
+
+	// 用户在确认关卡改写提示词后仍要补齐，且重复提交不叠加
+	edited := []VideoPromptItem{{
+		ShotID:       prompts[0].ShotID,
+		VisualPrompt: "固定机位，柴犬推开店门",
+		Start:        prompts[0].Start,
+		End:          prompts[0].End,
+	}}
+	submission := []VideoPromptEdit{{ShotID: edited[0].ShotID, VisualPrompt: "固定机位，柴犬推开店门"}}
+	applyPromptEdits(edited, submission, cfg)
+	applyPromptEdits(edited, []VideoPromptEdit{{ShotID: edited[0].ShotID, VisualPrompt: edited[0].VisualPrompt}}, cfg)
+	if count := strings.Count(edited[0].VisualPrompt, animalCastDirective); count != 1 {
+		t.Fatalf("动物主体约束应只出现一次，实际 %d 次: %q", count, edited[0].VisualPrompt)
+	}
+}
+
+// 角色参考图不能在分镜没标角色时静默消失：那是“角色图没被视频模型参考”的头号成因。
+func TestCharacterImagesForSegmentNeverSilentlyEmpty(t *testing.T) {
+	cfg := VideoRunConfig{CharacterRefs: []VideoCharacterRef{
+		{RoleID: "host", Name: "主理人（橘猫）", Images: []string{"host.png", ""}},
+		{RoleID: "guest", Name: "嘉宾（边牧）", Images: []string{"guest.png"}},
+	}}
+	script := &VideoScript{Shots: []VideoShot{
+		{ID: "s1", Roles: nil},
+		{ID: "s2", Roles: []string{"主理人"}},
+		{ID: "s3", Roles: []string{"unknown_role"}},
+	}}
+
+	// 分镜没写 roles → 全部带上 + 可读警告
+	images, warning := characterImagesForSegment(cfg, script, VideoSegment{ShotID: "s1", Index: 0})
+	if len(images) != 2 || warning == "" {
+		t.Fatalf("无 roles 时应附全部参考图并告警: %d 张 / %q", len(images), warning)
+	}
+	if images[0].RoleID != "host" || images[0].Name != "主理人（橘猫）" || images[0].URL != "host.png" {
+		t.Fatalf("参考图必须带角色身份，否则无法按「图片N」绑定: %+v", images[0])
+	}
+
+	// 模型只写了角色名（不是 role_id）→ 仍要匹配上且不告警
+	if images, warning = characterImagesForSegment(cfg, script, VideoSegment{ShotID: "s2", Index: 1}); len(images) != 1 || warning != "" {
+		t.Fatalf("按角色名应匹配到单一角色: %d 张 / %q", len(images), warning)
+	}
+
+	// role_id 完全对不上 → 退化带上全部，不让一致性静默失效
+	if images, warning = characterImagesForSegment(cfg, script, VideoSegment{ShotID: "s3", Index: 2}); len(images) != 2 || warning == "" {
+		t.Fatalf("角色表对不上时应兜底: %d 张 / %q", len(images), warning)
+	}
+
+	// 没配角色参考时依旧为空（不能凭空编造图）
+	if images, warning := characterImagesForSegment(VideoRunConfig{}, script, VideoSegment{ShotID: "s1"}); images != nil || warning != "" {
+		t.Fatalf("无参考图配置时应返回空: %+v / %q", images, warning)
+	}
+}
+
+// 用户上传的定妆图排在模板生成图前面：方舟参考图有张数上限，靠后的会被截掉，
+// 用户亲自认定的形象不能死于顺序。
+func TestCharacterImagesForSegmentPutsUserUploadsFirst(t *testing.T) {
+	cfg := VideoRunConfig{CharacterRefs: []VideoCharacterRef{
+		{RoleID: "guest", Name: "嘉宾（边牧）", Images: []string{"tpl-guest.png"}, ImageSource: CharacterImageSourceTemplate},
+		{RoleID: "host", Name: "主理人（橘猫）", Images: []string{"user-host.png"}, ImageSource: CharacterImageSourceUser},
+	}}
+	script := &VideoScript{Shots: []VideoShot{
+		{ID: "s1", Roles: []string{"guest", "host"}},
+		{ID: "s2", Roles: nil},
+	}}
+
+	images, warning := characterImagesForSegment(cfg, script, VideoSegment{ShotID: "s1", Index: 0})
+	if warning != "" || len(images) != 2 {
+		t.Fatalf("两个角色都应匹配上: %d 张 / %q", len(images), warning)
+	}
+	if images[0].Source != CharacterImageSourceUser || images[0].URL != "user-host.png" {
+		t.Fatalf("用户上传的图应排在最前: %+v", images)
+	}
+
+	// 分镜没标角色的兜底路径同样要按优先级排序
+	if images, _ = characterImagesForSegment(cfg, script, VideoSegment{ShotID: "s2", Index: 1}); len(images) != 2 || images[0].Source != CharacterImageSourceUser {
+		t.Fatalf("兜底附全部时也要优先上传图: %+v", images)
+	}
+}
+
+// 文字外观锚点要让位给上传图：模板写“成年橘猫”而用户传的是黑猫时，必须以图为准。
+func TestRoleUsesUserImages(t *testing.T) {
+	cfg := VideoRunConfig{CharacterRefs: []VideoCharacterRef{
+		{RoleID: "host", Name: "主理人（橘猫）", Images: []string{"user-host.png"}, ImageSource: CharacterImageSourceUser},
+		{RoleID: "guest", Name: "嘉宾（边牧）", Images: []string{"tpl-guest.png"}, ImageSource: CharacterImageSourceTemplate},
+		{RoleID: "empty", Name: "没图的角色", ImageSource: CharacterImageSourceUser},
+	}}
+	if !roleUsesUserImages(cfg, "主理人") || !roleUsesUserImages(cfg, "host") {
+		t.Fatal("用户上传了图的角色应识别为上传图优先")
+	}
+	if roleUsesUserImages(cfg, "guest") || roleUsesUserImages(cfg, "empty") || roleUsesUserImages(cfg, "unknown") {
+		t.Fatal("模板图 / 没图 / 不存在的角色不应识别为上传图")
+	}
+}
+
+// 没标来源的历史配置（手填、老任务）一律按用户上传处理；已标 template 的要保留，否则优先权会被误给。
+func TestNormalizeVideoConfigKeepsCharacterImageSource(t *testing.T) {
+	cfg, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "周末手冲", CharacterRefs: []VideoCharacterRef{
+		{RoleID: "host", Name: "主理人", Images: []string{"https://example.com/host.png"}},
+		{RoleID: "guest", Name: "嘉宾", Images: []string{"https://example.com/guest.png"}, ImageSource: "TEMPLATE"},
+	}})
+	if err != nil {
+		t.Fatalf("归一化失败: %v", err)
+	}
+	if len(cfg.CharacterRefs) != 2 {
+		t.Fatalf("应有两个角色: %+v", cfg.CharacterRefs)
+	}
+	if cfg.CharacterRefs[0].ImageSource != CharacterImageSourceUser {
+		t.Fatalf("未标来源应视为用户上传: %+v", cfg.CharacterRefs[0])
+	}
+	if cfg.CharacterRefs[1].ImageSource != CharacterImageSourceTemplate {
+		t.Fatalf("模板来源应原样保留: %+v", cfg.CharacterRefs[1])
+	}
+}

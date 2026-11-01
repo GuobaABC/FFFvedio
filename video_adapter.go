@@ -30,17 +30,29 @@ type VideoCapabilities struct {
 	CreditsPerClip      float64  `json:"creditsPerClip"`
 }
 
+// VideoCharacterImage 一张角色参考图：带角色身份，适配器才能在提示词里按厂商要求的序号把它绑定到角色。
+// Source 区分用户上传与模板生成图：前者优先，超上限时先丢后者。
+type VideoCharacterImage struct {
+	RoleID string
+	Name   string
+	URL    string
+	Source string
+}
+
 // VideoGenRequest 单段生成请求（模型无关）。
 type VideoGenRequest struct {
 	Prompt          string
 	FirstFrame      string
 	LastFrame       string
-	CharacterImages []string
-	DurationS       int
-	AspectRatio     string
-	Fps             int
-	Seed            int64
-	OutputPath      string
+	CharacterImages []VideoCharacterImage
+	// StrictFirstFrame 本段有首帧时必须以 first_frame 角色提交（画面硬从这张图开始），
+	// 不与角色参考图混提。方舟一类“任务类型互斥”的通道靠它做取舍。
+	StrictFirstFrame bool
+	DurationS        int
+	AspectRatio      string
+	Fps              int
+	Seed             int64
+	OutputPath       string
 }
 
 // VideoGenResult 单段生成结果。
@@ -101,60 +113,120 @@ func looksLikeArkVideoModel(model string) bool {
 	return false
 }
 
+// 适配成熟度：目前只有字节跳动火山方舟 Seedance 按官方文档逐能力核对过（全链路适配），
+// 其余通道只打通了基础的生视频任务，参考图 / 音画同步等能力尚未逐项验收。
+const (
+	AdapterMaturityPrimary = "primary" // 主力适配
+	AdapterMaturityPartial = "partial" // 基础可用，未完整适配
+	AdapterMaturityLocal   = "local"   // 本地联调，不计费
+)
+
 func adapterInfos() []VideoAdapterInfo {
 	entries := []struct {
 		id          string
 		label       string
 		description string
+		maturity    string
+		matNote     string
 		adapter     videoAdapter
 	}{
 		{
 			id:          "dashscope",
 			label:       "DashScope 视频（万相 / 可灵）",
 			description: "阿里云百炼异步任务接口，支持首帧/尾帧条件；首帧需公网 URL",
+			maturity:    AdapterMaturityPartial,
+			matNote:     "首帧 / 尾帧主链路可用；角色参考图与音画同步未适配验收（已有参考图生视频接口，但未逐项对齐官方参数）",
 			adapter:     dashscopeAdapter{},
 		},
 		{
 			id:          "ark",
 			label:       "火山方舟 Seedance（豆包视频）",
 			description: "方舟独立视频端点 /contents/generations/tasks，支持首帧/尾帧/参考图；Seedance 2.x 可音画同步",
+			maturity:    AdapterMaturityPrimary,
+			matNote:     "主力适配：任务类型互斥、图片N引用、参考图上限、画幅锁定、能力按模型代际都已按官方文档实现并测试",
 			adapter:     arkAdapter{},
 		},
 		{
 			id:          "runway",
 			label:       "Runway Gen-4",
 			description: "Runway image_to_video + 任务轮询；首帧需公网 URL",
+			maturity:    AdapterMaturityPartial,
+			matNote:     "基础生视频可用；没有角色参考图能力，跨段一致性只靠提示词里的外观描述",
 			adapter:     runwayAdapter{},
 		},
 		{
 			id:          "veo",
 			label:       "Google Veo（Gemini API）",
 			description: "Veo 长任务接口，原生音频路线，台词可直接写入提示词",
+			maturity:    AdapterMaturityPartial,
+			matNote:     "任务提交 / 轮询可用；参考图与画幅行为未逐参数核对",
 			adapter:     veoAdapter{},
 		},
 		{
 			id:          "generic",
 			label:       "通用 HTTP 适配器",
 			description: "按通用 REST 约定提交/轮询视频任务，适配自建网关",
+			maturity:    AdapterMaturityPartial,
+			matNote:     "网关实参结构各家不一致，未针对具体厂商适配，能力声明按通用约定从宽处理",
 			adapter:     genericAdapter{},
 		},
 		{
 			id:          "mock",
 			label:       "本地联调占位（ffmpeg）",
 			description: "用 ffmpeg 合成测试画面，仅用于验证流水线，不调用任何模型",
+			maturity:    AdapterMaturityLocal,
+			matNote:     "不计费、不计入消耗统计，只用来跑通流水线",
 			adapter:     mockAdapter{},
 		},
 	}
 	infos := make([]VideoAdapterInfo, 0, len(entries))
 	for _, entry := range entries {
 		infos = append(infos, VideoAdapterInfo{
-			ID:           entry.id,
-			Label:        entry.label,
-			Description:  entry.description,
-			Capabilities: entry.adapter.Capabilities(),
+			ID:            entry.id,
+			Label:         entry.label,
+			Description:   entry.description,
+			Maturity:      entry.maturity,
+			MaturityLabel: adapterMaturityLabel(entry.maturity),
+			MaturityNote:  entry.matNote,
+			Capabilities:  entry.adapter.Capabilities(),
 		})
 	}
 	return infos
+}
+
+func adapterMaturityLabel(maturity string) string {
+	switch maturity {
+	case AdapterMaturityPrimary:
+		return "主力适配"
+	case AdapterMaturityLocal:
+		return "本地联调（不计费）"
+	default:
+		return "基础可用 · 未完整适配"
+	}
+}
+
+// adapterMaturityRows 大屏的适配声明：把“哪些通道真验收过、哪些只是能跑”直接告诉用户。
+func adapterMaturityRows() []adapterMaturityRow {
+	infos := adapterInfos()
+	rows := make([]adapterMaturityRow, 0, len(infos))
+	// 主力适配排最前，声明的结论一眼就能看到
+	for _, pass := range []string{AdapterMaturityPrimary, AdapterMaturityPartial, AdapterMaturityLocal} {
+		for _, info := range infos {
+			if info.Maturity != pass {
+				continue
+			}
+			rows = append(rows, adapterMaturityRow{
+				ID:            info.ID,
+				Label:         info.Label,
+				Description:   info.Description,
+				Maturity:      info.Maturity,
+				MaturityLabel: info.MaturityLabel,
+				Primary:       info.Maturity == AdapterMaturityPrimary,
+				Note:          info.MaturityNote,
+			})
+		}
+	}
+	return rows
 }
 
 func findVideoAdapter(id string) (videoAdapter, VideoAdapterInfo, bool) {
@@ -203,7 +275,7 @@ func inferAdapterFromProvider(provider Provider) string {
 	return "none"
 }
 
-// adapterCapabilities 取适配器能力；部分适配器会按模型 ID 微调（如火山方舟仅 Seedance 2.x 有原生音频）。
+// adapterCapabilities 取适配器能力；部分适配器会按模型 ID 微调（如火山方舟仅 Seedance 2.x 有原生音频与角色参考图）。
 func adapterCapabilities(adapter videoAdapter, model string) VideoCapabilities {
 	if adapter == nil {
 		return defaultVideoCapabilities()
@@ -289,10 +361,10 @@ func (a *App) GetVideoEnvironment() VideoEnvironment {
 func composeRenderPrompt(segment VideoSegment, caps VideoCapabilities) string {
 	prompt := strings.TrimSpace(segment.Prompt)
 	if caps.NativeAudio && strings.TrimSpace(segment.Dialogue) != "" {
-		prompt += fmt.Sprintf("\n口播台词（只允许一人说话，保持口型在画面内）：“%s”", strings.TrimSpace(segment.Dialogue))
+		prompt += fmt.Sprintf("\n口播台词（只允许一个主体说话，保持口型在画面内）：“%s”", strings.TrimSpace(segment.Dialogue))
 	}
 	if caps.PromptStyle == "veo" {
-		prompt += "\n限制：单镜头、不切镜，动作连续，保持人物与产品外观一致。"
+		prompt += "\n限制：单镜头、不切镜，动作连续，保持主体与产品外观一致。"
 	}
 	return prompt
 }
@@ -429,7 +501,8 @@ func (dashscopeAdapter) Generate(ctx context.Context, gc videoGenContext, req Vi
 	if err != nil {
 		return VideoGenResult{}, err
 	}
-	if err := downloadVideoFile(ctx, videoURL, req.OutputPath, nil); err != nil {
+	attempts, err := downloadVideoFile(ctx, videoURL, req.OutputPath, nil)
+	if err != nil {
 		return VideoGenResult{}, err
 	}
 	return VideoGenResult{
@@ -439,6 +512,7 @@ func (dashscopeAdapter) Generate(ctx context.Context, gc videoGenContext, req Vi
 		Seed:      req.Seed,
 		TaskID:    submitted.Output.TaskID,
 		ModelVer:  gc.Model,
+		Notes:     videoRetryNote("成片下载", attempts),
 	}, nil
 }
 
@@ -452,18 +526,19 @@ const arkVideoPath = "/contents/generations/tasks"
 // chat 端点不吐视频（接口参考 §3.2），所以不能走通用 OpenAI 兼容适配器。
 type arkAdapter struct{}
 
-func (arkAdapter) Capabilities() VideoCapabilities { return arkCapabilities(true) }
+func (arkAdapter) Capabilities() VideoCapabilities { return arkCapabilities(true, true) }
 
-// CapabilitiesFor 按模型微调：Seedance 1.0 不输出音轨，把台词写进提示词会出现「画面写字」副作用。
+// CapabilitiesFor 按模型微调：Seedance 1.0 不输出音轨，把台词写进提示词会出现「画面写字」副作用；
+// 角色参考图（全模态参考）也只有 2.x 一代才有，声明错了上层会以为图已生效。
 func (arkAdapter) CapabilitiesFor(model string) VideoCapabilities {
-	return arkCapabilities(arkSupportsNativeAudio(model))
+	return arkCapabilities(arkSupportsNativeAudio(model), arkSupportsReferenceImages(model))
 }
 
-func arkCapabilities(nativeAudio bool) VideoCapabilities {
+func arkCapabilities(nativeAudio, referenceImages bool) VideoCapabilities {
 	return VideoCapabilities{
 		I2VFirstFrame:      true,
 		LastFrame:          true,
-		CharacterReference: true,
+		CharacterReference: referenceImages,
 		NativeAudio:        nativeAudio,
 		// duration 是整数秒而非离散档位，给满 [4,15] 避免拆段时被档位吸走。
 		AllowedDurations:    []int{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
@@ -475,10 +550,25 @@ func arkCapabilities(nativeAudio bool) VideoCapabilities {
 	}
 }
 
-// arkSupportsNativeAudio 仅 Seedance 2.x 系列支持音画同步输出。
-func arkSupportsNativeAudio(model string) bool {
+// arkIsSeedance2 判定 Seedance 2.x（2.0 系列与 2.5）：音画同步、全模态参考都是这一代才有的能力。
+func arkIsSeedance2(model string) bool {
 	lower := strings.ToLower(model)
 	return strings.Contains(lower, "seedance-2") || strings.Contains(lower, "seedance_2")
+}
+
+func arkSupportsNativeAudio(model string) bool { return arkIsSeedance2(model) }
+
+// arkSupportsReferenceImages 官方能力表里 role=reference_image 只列了 Seedance 2.5 与 2.0 系列，
+// 1.0 pro / 1.0 pro fast / 1.5 pro 只有文生、首帧、首尾帧三种任务类型。
+func arkSupportsReferenceImages(model string) bool { return arkIsSeedance2(model) }
+
+// arkReferenceImageLimit 全模态参考的图片数量上限：2.5 为 30 张，2.0 系列为 9 张（首帧图也计入）。
+func arkReferenceImageLimit(model string) int {
+	lower := strings.ToLower(model)
+	if strings.Contains(lower, "2-5") || strings.Contains(lower, "2.5") {
+		return 30
+	}
+	return 9
 }
 
 // arkTaskEndpoint 归一化 Base URL 后拼视频端点。
@@ -533,6 +623,146 @@ func arkRatio(aspect string, lockedByFrame bool) (string, bool) {
 	return "adaptive", false
 }
 
+// arkImageEntry 一张待提交给方舟的图片：role 与其在提示词里的称呼。
+type arkImageEntry struct {
+	ref    string
+	role   string
+	source string // 出错信息里的称呼：首帧图片 / 尾帧图片 / 角色参考图
+	label  string // 参与「图片N」绑定时写的说明文字
+}
+
+// arkMediaPlan 组装好的图片列表、提示词素材引用语句、画幅锁定与给用户看的说明。
+type arkMediaPlan struct {
+	Images        []map[string]any
+	Binding       string
+	LockedByFrame bool
+	Notes         []string
+}
+
+// dedupeCharacterImages 同一张定妆图被多个角色引用时只提交一次，免得白占参考图额度。
+// 同一张图同时挂在用户上传与模板生成下时，保留用户那一份身份（提示词措辞要用它）。
+func dedupeCharacterImages(in []VideoCharacterImage) []VideoCharacterImage {
+	seen := make(map[string]int, len(in))
+	out := make([]VideoCharacterImage, 0, len(in))
+	for _, item := range in {
+		url := strings.TrimSpace(item.URL)
+		if url == "" {
+			continue
+		}
+		if index, ok := seen[url]; ok {
+			if item.Source == CharacterImageSourceUser && out[index].Source != CharacterImageSourceUser {
+				out[index].Source = item.Source
+			}
+			continue
+		}
+		seen[url] = len(out)
+		out = append(out, item)
+	}
+	return out
+}
+
+// planArkMedia 按官方“任务类型互斥”规则组装图片：
+// 图生视频-首帧、图生视频-首尾帧、全模态参考生视频三种场景不可混用，
+// 之前把 first_frame 和 reference_image 一起塞进 content，参考图会被模型直接无视。
+// 默认严格首帧：只要有首帧（多为用户输入或尾帧资产带入的那张图）就走「图生视频-首帧」
+// 任务，画面硬从这张图开始，角色参考图让位；关掉严格首帧后才走全模态参考：
+// 首帧图也当参考图提交，再按文档要求用「图片N」（N = 该图在 content 中 image_url 的顺序）把它钉成首帧。
+func planArkMedia(ctx context.Context, req VideoGenRequest, supportsReference bool, maxImages int) (arkMediaPlan, error) {
+	var plan arkMediaPlan
+	// 先去重再把用户上传的图顶到前面：超上限截断时先丢模板生成图，不依赖调用方的入参顺序
+	refs := orderCharacterImages(dedupeCharacterImages(req.CharacterImages))
+	firstFrame := strings.TrimSpace(req.FirstFrame)
+	lastFrame := strings.TrimSpace(req.LastFrame)
+	entries := make([]arkImageEntry, 0, len(refs)+2)
+	// 严格首帧与参考模式互斥：有首帧要锁时不能同时吃角色图，反之亦然
+	referenceMode := supportsReference && len(refs) > 0 && !(req.StrictFirstFrame && firstFrame != "")
+
+	switch {
+	case referenceMode:
+		if firstFrame != "" {
+			entries = append(entries, arkImageEntry{ref: firstFrame, role: "reference_image", source: "首帧图片", label: "本段首帧画面（画面必须从这张图开始）"})
+		}
+		for _, ref := range refs {
+			entries = append(entries, arkImageEntry{
+				ref:    strings.TrimSpace(ref.URL),
+				role:   "reference_image",
+				source: "角色参考图",
+				label:  arkCharacterLabel(ref),
+			})
+		}
+		if lastFrame != "" {
+			entries = append(entries, arkImageEntry{ref: lastFrame, role: "reference_image", source: "尾帧图片", label: "本段尾帧画面（画面结束于这张图）"})
+		}
+		if maxImages > 0 && len(entries) > maxImages {
+			plan.Notes = append(plan.Notes, fmt.Sprintf(
+				"角色参考图超出模型上限（全模态参考最多 %d 张，首帧图也计入），已只提交前 %d 张", maxImages, maxImages))
+			entries = entries[:maxImages]
+		}
+	default:
+		if firstFrame != "" {
+			entries = append(entries, arkImageEntry{ref: firstFrame, role: "first_frame", source: "首帧图片"})
+		}
+		if lastFrame != "" {
+			entries = append(entries, arkImageEntry{ref: lastFrame, role: "last_frame", source: "尾帧图片"})
+		}
+		switch {
+		case len(refs) == 0:
+		case !supportsReference:
+			plan.Notes = append(plan.Notes, fmt.Sprintf(
+				"当前方舟模型不支持角色参考图（role=reference_image 仅 Seedance 2.0 系列 / 2.5 支持），已忽略 %d 张角色图，跨段一致性改用提示词里的外观锚点", len(refs)))
+		default:
+			// 严格首帧优先：官方任务类型互斥，锁帧与角色参考图二选一，帧赢
+			plan.Notes = append(plan.Notes, fmt.Sprintf(
+				"严格首帧已开启：本段按「图生视频-首帧」任务提交，画面从首帧图开始；任务类型互斥，%d 张角色参考图本轮不提交（形象由首帧画面与提示词里的外观锚点保持）。需要同时喂角色图请关闭「严格首帧」。", len(refs)))
+		}
+	}
+
+	plan.LockedByFrame = firstFrame != "" || lastFrame != ""
+	bindings := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		ref, err := arkImageRef(ctx, entry.ref)
+		if err != nil {
+			return plan, fmt.Errorf("%s不可用: %w", entry.source, err)
+		}
+		if ref == "" {
+			continue
+		}
+		plan.Images = append(plan.Images, map[string]any{
+			"type": "image_url", "image_url": map[string]any{"url": ref}, "role": entry.role,
+		})
+		if entry.label != "" {
+			bindings = append(bindings, fmt.Sprintf("图片%d 是%s", len(plan.Images), entry.label))
+		}
+	}
+	if len(bindings) > 0 {
+		plan.Binding = "素材引用（序号按提交的图片顺序，不可改动）：" + strings.Join(bindings, "；") +
+			"。画面里出现的角色必须与其特征参考图完全一致（体型、毛色、服饰、道具），不得自行改写形象。"
+		if hasUserUploadedCharacterImage(refs) {
+			plan.Binding += "标注为“用户上传的定妆图”的那张是该角色的形象基准，与其他描述冲突时以它为准。"
+		}
+	}
+	return plan, nil
+}
+
+// arkCharacterLabel 提示词里对一张角色图的称呼。用户上传的定妆图要把来源写明白：
+// 模型收到多张图时需要一条裁决规则，不然会把几张图的特征平均到一起。
+func arkCharacterLabel(ref VideoCharacterImage) string {
+	name := firstNonEmpty(ref.Name, ref.RoleID)
+	if ref.Source == CharacterImageSourceUser {
+		return fmt.Sprintf("角色「%s」的形象参考图（用户上传的定妆图，以此图为准）", name)
+	}
+	return fmt.Sprintf("角色「%s」的形象参考图", name)
+}
+
+func hasUserUploadedCharacterImage(refs []VideoCharacterImage) bool {
+	for _, ref := range refs {
+		if ref.Source == CharacterImageSourceUser {
+			return true
+		}
+	}
+	return false
+}
+
 func (arkAdapter) Generate(ctx context.Context, gc videoGenContext, req VideoGenRequest) (VideoGenResult, error) {
 	if strings.TrimSpace(gc.Provider.APIKey) == "" {
 		return VideoGenResult{}, errors.New("火山方舟适配器缺少 API Key")
@@ -546,46 +776,21 @@ func (arkAdapter) Generate(ctx context.Context, gc videoGenContext, req VideoGen
 		return VideoGenResult{}, errors.New("火山方舟适配器需要 Base URL（如 https://ark.cn-beijing.volces.com/api/v3）")
 	}
 
-	content := []map[string]any{{"type": "text", "text": req.Prompt}}
-	if req.FirstFrame != "" {
-		ref, err := arkImageRef(ctx, req.FirstFrame)
-		if err != nil {
-			return VideoGenResult{}, fmt.Errorf("首帧图片不可用: %w", err)
-		}
-		if ref != "" {
-			content = append(content, map[string]any{
-				"type": "image_url", "image_url": map[string]any{"url": ref}, "role": "first_frame",
-			})
-		}
+	caps := arkCapabilities(arkSupportsNativeAudio(model), arkSupportsReferenceImages(model))
+	media, err := planArkMedia(ctx, req, caps.CharacterReference, arkReferenceImageLimit(model))
+	if err != nil {
+		return VideoGenResult{}, err
 	}
-	if req.LastFrame != "" {
-		ref, err := arkImageRef(ctx, req.LastFrame)
-		if err != nil {
-			return VideoGenResult{}, fmt.Errorf("尾帧图片不可用: %w", err)
-		}
-		if ref != "" {
-			content = append(content, map[string]any{
-				"type": "image_url", "image_url": map[string]any{"url": ref}, "role": "last_frame",
-			})
-		}
+	prompt := strings.TrimSpace(req.Prompt)
+	if media.Binding != "" {
+		prompt += "\n" + media.Binding
 	}
-	for _, image := range req.CharacterImages {
-		ref, err := arkImageRef(ctx, image)
-		if err != nil {
-			return VideoGenResult{}, fmt.Errorf("角色参考图不可用: %w", err)
-		}
-		if ref != "" {
-			content = append(content, map[string]any{
-				"type": "image_url", "image_url": map[string]any{"url": ref}, "role": "reference_image",
-			})
-		}
-	}
+	content := []map[string]any{{"type": "text", "text": prompt}}
+	content = append(content, media.Images...)
 
-	caps := arkCapabilities(arkSupportsNativeAudio(model))
 	duration := nearestAllowedDuration(float64(req.DurationS), caps.AllowedDurations)
 	// 首帧/尾帧图片会把输出画幅钉在图片自己的比例上
-	lockedByFrame := req.FirstFrame != "" || req.LastFrame != ""
-	ratio, downgraded := arkRatio(req.AspectRatio, lockedByFrame)
+	ratio, downgraded := arkRatio(req.AspectRatio, media.LockedByFrame)
 	payload := map[string]any{
 		"model":     model,
 		"content":   content,
@@ -600,6 +805,7 @@ func (arkAdapter) Generate(ctx context.Context, gc videoGenContext, req VideoGen
 		payload["seed"] = req.Seed
 	}
 	var notes []string
+	notes = append(notes, media.Notes...)
 	if downgraded {
 		notes = append(notes, fmt.Sprintf(
 			"方舟首帧/首尾帧任务的输出画幅跟随首帧图（ratio 已按官方约束改为 adaptive），任务选的 %s 将在合成阶段统一画幅",
@@ -624,12 +830,17 @@ func (arkAdapter) Generate(ctx context.Context, gc videoGenContext, req VideoGen
 	if taskID == "" {
 		return VideoGenResult{}, fmt.Errorf("火山方舟没有返回任务 ID: %s", apiErrorDetail(data))
 	}
+	pollURL := endpoint + "/" + url.PathEscape(taskID)
 
-	videoURL, err := pollVideoJob(ctx, endpoint+"/"+url.PathEscape(taskID), headers, parseArkTaskStatus)
+	videoURL, err := pollVideoJob(ctx, pollURL, headers, parseArkTaskStatus)
 	if err != nil {
 		return VideoGenResult{}, fmt.Errorf("任务 %s: %w", taskID, err)
 	}
-	if err := downloadVideoFile(ctx, videoURL, req.OutputPath, nil); err != nil {
+	// 直链签名过期/对象暂时不可见时，回查任务拿新鲜链接重下
+	attempts, err := downloadGeneratedVideo(ctx, videoURL, req.OutputPath, nil, func(refreshCtx context.Context) (string, error) {
+		return refreshJobResult(refreshCtx, pollURL, headers, parseArkTaskStatus)
+	})
+	if err != nil {
 		return VideoGenResult{}, err
 	}
 	return VideoGenResult{
@@ -639,7 +850,7 @@ func (arkAdapter) Generate(ctx context.Context, gc videoGenContext, req VideoGen
 		Seed:      req.Seed,
 		TaskID:    taskID,
 		ModelVer:  model,
-		Notes:     notes,
+		Notes:     append(notes, videoRetryNote("成片下载", attempts)...),
 	}, nil
 }
 
@@ -663,9 +874,10 @@ type runwayAdapter struct{}
 
 func (runwayAdapter) Capabilities() VideoCapabilities {
 	return VideoCapabilities{
-		I2VFirstFrame:       true,
-		LastFrame:           true,
-		CharacterReference:  true,
+		I2VFirstFrame: true,
+		LastFrame:     true,
+		// image_to_video 只接 promptImage 一张图，没有角色参考字段；声明成 true 会让上层误以为参考图已生效
+		CharacterReference:  false,
 		NativeAudio:         false,
 		AllowedDurations:    []int{5, 10},
 		MaxClipS:            10,
@@ -741,7 +953,8 @@ func (runwayAdapter) Generate(ctx context.Context, gc videoGenContext, req Video
 	if err != nil {
 		return VideoGenResult{}, err
 	}
-	if err := downloadVideoFile(ctx, videoURL, req.OutputPath, nil); err != nil {
+	attempts, err := downloadVideoFile(ctx, videoURL, req.OutputPath, nil)
+	if err != nil {
 		return VideoGenResult{}, err
 	}
 	return VideoGenResult{
@@ -751,6 +964,7 @@ func (runwayAdapter) Generate(ctx context.Context, gc videoGenContext, req Video
 		Seed:      req.Seed,
 		TaskID:    submitted.ID,
 		ModelVer:  model,
+		Notes:     videoRetryNote("成片下载", attempts),
 	}, nil
 }
 
@@ -887,10 +1101,11 @@ func (veoAdapter) Generate(ctx context.Context, gc videoGenContext, req VideoGen
 		}
 		downloadURL += separator + "key=" + apiKey
 	}
-	if err := downloadVideoFile(ctx, downloadURL, req.OutputPath, nil); err != nil {
+	attempts, err := downloadVideoFile(ctx, downloadURL, req.OutputPath, nil)
+	if err != nil {
 		return VideoGenResult{}, err
 	}
-	return VideoGenResult{VideoURI: req.OutputPath, FPS: req.Fps, DurationS: float64(duration), Seed: req.Seed, TaskID: operation.Name, ModelVer: model}, nil
+	return VideoGenResult{VideoURI: req.OutputPath, FPS: req.Fps, DurationS: float64(duration), Seed: req.Seed, TaskID: operation.Name, ModelVer: model, Notes: videoRetryNote("成片下载", attempts)}, nil
 }
 
 /* ------------------------------ 通用 HTTP 适配器 ------------------------------ */
@@ -939,7 +1154,15 @@ func (genericAdapter) Generate(ctx context.Context, gc videoGenContext, req Vide
 		payload["last_frame"] = req.LastFrame
 	}
 	if len(req.CharacterImages) > 0 {
-		payload["reference_images"] = req.CharacterImages
+		urls := make([]string, 0, len(req.CharacterImages))
+		for _, image := range req.CharacterImages {
+			if strings.TrimSpace(image.URL) != "" {
+				urls = append(urls, strings.TrimSpace(image.URL))
+			}
+		}
+		if len(urls) > 0 {
+			payload["reference_images"] = urls
+		}
 	}
 
 	client := videoHTTPClient()
@@ -984,10 +1207,11 @@ func (genericAdapter) Generate(ctx context.Context, gc videoGenContext, req Vide
 		immediate = submitted.Data[0].URL
 	}
 	if immediate != "" {
-		if err := downloadVideoFile(ctx, immediate, req.OutputPath, nil); err != nil {
+		attempts, err := downloadVideoFile(ctx, immediate, req.OutputPath, nil)
+		if err != nil {
 			return VideoGenResult{}, err
 		}
-		return VideoGenResult{VideoURI: req.OutputPath, FPS: req.Fps, DurationS: float64(req.DurationS), Seed: req.Seed, ModelVer: gc.Model}, nil
+		return VideoGenResult{VideoURI: req.OutputPath, FPS: req.Fps, DurationS: float64(req.DurationS), Seed: req.Seed, ModelVer: gc.Model, Notes: videoRetryNote("成片下载", attempts)}, nil
 	}
 
 	taskID := firstNonEmpty(submitted.TaskID, submitted.ID)
@@ -1021,10 +1245,11 @@ func (genericAdapter) Generate(ctx context.Context, gc videoGenContext, req Vide
 	if err != nil {
 		return VideoGenResult{}, err
 	}
-	if err := downloadVideoFile(ctx, videoURL, req.OutputPath, nil); err != nil {
+	attempts, err := downloadVideoFile(ctx, videoURL, req.OutputPath, nil)
+	if err != nil {
 		return VideoGenResult{}, err
 	}
-	return VideoGenResult{VideoURI: req.OutputPath, FPS: req.Fps, DurationS: float64(req.DurationS), Seed: req.Seed, TaskID: taskID, ModelVer: gc.Model}, nil
+	return VideoGenResult{VideoURI: req.OutputPath, FPS: req.Fps, DurationS: float64(req.DurationS), Seed: req.Seed, TaskID: taskID, ModelVer: gc.Model, Notes: videoRetryNote("成片下载", attempts)}, nil
 }
 
 // genericVideoCandidates 给出通用 REST 视频端点候选。
@@ -1061,19 +1286,35 @@ func videoHTTPClient() *http.Client {
 }
 
 func videoRequest(ctx context.Context, client *http.Client, method, endpoint string, headers map[string]string, payload any) ([]byte, error) {
-	var reader io.Reader
+	var body []byte
 	if payload != nil {
-		body, err := json.Marshal(payload)
+		raw, err := json.Marshal(payload)
 		if err != nil {
 			return nil, fmt.Errorf("构造请求失败: %w", err)
 		}
+		body = raw
+	}
+	// 序列化一次、每次重试重建 reader：重试靠轮询建任务接口也适用，不能让第二次 attempt 拿到空体
+	var data []byte
+	_, err := videoRetry(ctx, func() error {
+		var callErr error
+		data, callErr = doVideoRequestOnce(ctx, client, method, endpoint, headers, body)
+		return callErr
+	})
+	return data, err
+}
+
+// doVideoRequestOnce 单次请求。非 2xx 包成 httpStatusError，让重试策略能按方法+状态码区分对待。
+func doVideoRequestOnce(ctx context.Context, client *http.Client, method, endpoint string, headers map[string]string, body []byte) ([]byte, error) {
+	var reader io.Reader
+	if body != nil {
 		reader = bytes.NewReader(body)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
 	if err != nil {
 		return nil, fmt.Errorf("构造请求失败: %w", err)
 	}
-	if payload != nil {
+	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	for key, value := range headers {
@@ -1090,7 +1331,9 @@ func videoRequest(ctx context.Context, client *http.Client, method, endpoint str
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s 返回 %d%s: %s", endpoint, resp.StatusCode, statusReason(resp.Status), apiErrorDetail(data))
+		return nil, &httpStatusError{
+			Method: method, URL: endpoint, Code: resp.StatusCode, Status: resp.Status, Detail: apiErrorDetail(data),
+		}
 	}
 	return data, nil
 }
@@ -1128,7 +1371,76 @@ func pollVideoJob(ctx context.Context, endpoint string, headers map[string]strin
 	}
 }
 
-func downloadVideoFile(ctx context.Context, rawURL, dest string, headers map[string]string) error {
+// downloadVideoFile 下载成片并落盘。方舟成片存在对象存储上（如
+// ark-acg-*.tos-cn-beijing.volces.com），Get 报「net/http: TLS handshake timeout」这类抖动
+// 会重建 TLS 会话按退避重试（重试次数回传给上层写进任务日志）；
+// 每次重试重建文件，不会拼上坏数据。
+func downloadVideoFile(ctx context.Context, rawURL, dest string, headers map[string]string) (int, error) {
+	return videoRetryWith(ctx, videoDownloadAttempts, func() error {
+		return downloadVideoOnce(ctx, rawURL, dest, headers)
+	})
+}
+
+// videoURLRefreshRounds 直链本身失效时最多回查几次任务状态换新签名。
+const videoURLRefreshRounds = 2
+
+// downloadGeneratedVideo 下载成片，并在「链接本身不再可用」时换一条新链接再来一轮。
+// 厂商给的视频地址是带签名的临时直链：403 多为签名过期/签名不匹配，404 多为对象刚写入还不可见，
+// 这两种错重发同一条 URL 一定继续吃闭门羹（downloadVideoFile 故意不重试 4xx）。
+// 而回查任务状态是 GET、幂等、不二次计费，能拿到一条新鲜签名链接。
+// refresh 为 nil 时等同于 downloadVideoFile。
+func downloadGeneratedVideo(ctx context.Context, rawURL, dest string, headers map[string]string, refresh func(context.Context) (string, error)) (int, error) {
+	current := rawURL
+	total := 0
+	for round := 0; ; round++ {
+		attempts, err := downloadVideoFile(ctx, current, dest, headers)
+		total += attempts
+		if err == nil {
+			return total, nil
+		}
+		if refresh == nil || round >= videoURLRefreshRounds || !isStaleSignedURLError(err) {
+			return total, err
+		}
+		fresh, refreshErr := refresh(ctx)
+		if refreshErr != nil || strings.TrimSpace(fresh) == "" || fresh == current {
+			// 换不到新链接就把原始下载错误交回去，别用排障信息更少的错替掉它
+			return total, err
+		}
+		current = fresh
+	}
+}
+
+// isStaleSignedURLError 直链失效特征：鉴权不过（401/403）或对象暂时不可见（404）。
+// 其余 4xx（如 400 参数非法）说明是我们自己请求写错了，换链接也没用。
+func isStaleSignedURLError(err error) bool {
+	var statusErr *httpStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	switch statusErr.Code {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		return true
+	}
+	return false
+}
+
+// refreshJobResult 单次回查任务状态取视频地址；轮询接口本身幂等，重查不产生费用。
+func refreshJobResult(ctx context.Context, endpoint string, headers map[string]string, parse func([]byte) (string, string, error)) (string, error) {
+	body, err := videoRequest(ctx, videoHTTPClient(), http.MethodGet, endpoint, headers, nil)
+	if err != nil {
+		return "", err
+	}
+	_, result, err := parse(body)
+	if err != nil {
+		return "", fmt.Errorf("回查视频地址失败: %w", err)
+	}
+	if strings.TrimSpace(result) == "" {
+		return "", fmt.Errorf("回查任务没有返回视频地址: %s", bodySnippet(body))
+	}
+	return result, nil
+}
+
+func downloadVideoOnce(ctx context.Context, rawURL, dest string, headers map[string]string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return fmt.Errorf("构造下载请求失败: %w", err)
@@ -1136,14 +1448,16 @@ func downloadVideoFile(ctx context.Context, rawURL, dest string, headers map[str
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
-	resp, err := (&http.Client{Timeout: 30 * time.Minute}).Do(req)
+	resp, err := videoResilientClient(30 * time.Minute).Do(req)
 	if err != nil {
 		return fmt.Errorf("下载生成结果失败: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return fmt.Errorf("下载生成结果 %s 返回 %d%s: %s", rawURL, resp.StatusCode, statusReason(resp.Status), apiErrorDetail(body))
+		return fmt.Errorf("下载生成结果失败: %w", &httpStatusError{
+			Method: http.MethodGet, URL: rawURL, Code: resp.StatusCode, Status: resp.Status, Detail: apiErrorDetail(body),
+		})
 	}
 
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
@@ -1156,6 +1470,9 @@ func downloadVideoFile(ctx context.Context, rawURL, dest string, headers map[str
 	defer file.Close()
 
 	if _, err := io.Copy(file, resp.Body); err != nil {
+		// 半截 mp4 留着除了干扰下一轮排障没有用处：先关句柄再删（Windows 上开着删不掉），重试从干净状态开始
+		_ = file.Close()
+		_ = os.Remove(dest)
 		return fmt.Errorf("写入视频文件失败: %w", err)
 	}
 	return nil
@@ -1171,26 +1488,45 @@ func writeBinaryFile(dest string, data []byte) error {
 	return nil
 }
 
+// fetchRemoteImage 单次远程图片拉取。非 2xx 包成 httpStatusError，交给重试策略按状态码判定：
+// 签名 URL 过期这类 4xx 不重试，第一时间报错比干等四轮有用。
+func fetchRemoteImage(ctx context.Context, ref string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ref, nil)
+	if err != nil {
+		return nil, fmt.Errorf("构造图片下载请求失败: %w", err)
+	}
+	resp, err := videoResilientClient(60 * time.Second).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("下载远程图片失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, fmt.Errorf("下载远程图片失败: %w", &httpStatusError{
+			Method: http.MethodGet, URL: ref, Code: resp.StatusCode, Status: resp.Status, Detail: apiErrorDetail(body),
+		})
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		return nil, fmt.Errorf("读取远程图片失败: %w", err)
+	}
+	return data, nil
+}
+
 // readImageBytes 读取本地图片或下载远程图片，供需要内联图片的厂商使用。
+// 远程拉取同样走瞬时故障重试：握手超时死在提交前，跟死在下载一样亏。
 func readImageBytes(ctx context.Context, ref string) ([]byte, string, error) {
 	mimeType := imageMimeType(ref)
 	if isRemoteRef(ref) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ref, nil)
+		var data []byte
+		// 提交前的内联图，重试次数不必回报用户，失败时错误文本里会带上「已重试 N 次」
+		_, err := videoRetry(ctx, func() error {
+			var fetchErr error
+			data, fetchErr = fetchRemoteImage(ctx, ref)
+			return fetchErr
+		})
 		if err != nil {
-			return nil, mimeType, fmt.Errorf("构造图片下载请求失败: %w", err)
-		}
-		resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
-		if err != nil {
-			return nil, mimeType, fmt.Errorf("下载首帧图片失败: %w", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			return nil, mimeType, fmt.Errorf("下载首帧图片 %s 返回 %d%s: %s", ref, resp.StatusCode, statusReason(resp.Status), apiErrorDetail(body))
-		}
-		data, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-		if err != nil {
-			return nil, mimeType, fmt.Errorf("读取首帧图片失败: %w", err)
+			return nil, mimeType, err
 		}
 		return data, mimeType, nil
 	}

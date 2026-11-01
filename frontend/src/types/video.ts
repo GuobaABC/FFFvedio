@@ -23,6 +23,8 @@ export interface VideoCharacterRef {
   roleId: string
   name: string
   images: string[]
+  /** 图片来源：user = 用户上传（优先），template = 模板定妆图；留空后端按 user 处理 */
+  imageSource?: string
   voiceHint: string
 }
 
@@ -60,6 +62,8 @@ export interface VideoRunConfig {
   subtitles: boolean
   /** 逐段确认：每段生成后停住等用户确认/重生成，默认开启 */
   segmentReview: boolean
+  /** 严格首帧：有首帧（含尾帧资产带入）的片段必须从这张图起片，默认开启 */
+  strictFirstFrame: boolean
   /** 保留最后一段尾帧到资产库，供其他任务选作首帧 */
   keepLastFrame: boolean
   videoParams: VideoParams
@@ -348,6 +352,10 @@ export interface VideoAdapterInfo {
   id: string
   label: string
   description: string
+  /** 适配成熟度：primary = 字节跳动火山方舟 Seedance（主力适配），partial = 基础可用但未完整适配，local = 本地联调不计费 */
+  maturity: 'primary' | 'partial' | 'local'
+  maturityLabel: string
+  maturityNote: string
   capabilities: VideoCapabilities
 }
 
@@ -443,6 +451,7 @@ export function createEmptyVideoConfig(): VideoRunConfig {
     language: 'zh-CN',
     subtitles: false,
     segmentReview: true,
+    strictFirstFrame: true,
     keepLastFrame: false,
     videoParams: {
       style: '写实电影感',

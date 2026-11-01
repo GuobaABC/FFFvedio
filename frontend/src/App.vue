@@ -4,6 +4,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import ProviderSettings from './components/ProviderSettings.vue'
 import CrawlResults from './components/CrawlResults.vue'
 import CrawlTaskCreate from './components/CrawlTaskCreate.vue'
+import Dashboard from './components/Dashboard.vue'
 import TemplateLibrary from './components/TemplateLibrary.vue'
 import VideoProjects from './components/VideoProjects.vue'
 import VideoResults from './components/VideoResults.vue'
@@ -28,8 +29,13 @@ interface MainTab {
 const projectName = 'FFFVedioAgent'
 const version = 'v0.0.3'
 
-/** 主选项卡：热点爬取（新建任务 → 执行 → 结果）+ 视频生成 + 系统设置 */
+/** 主选项卡：首页大屏 + 热点爬取（新建任务 → 执行 → 结果）+ 视频生成 + 系统设置 */
 const mainTabs: MainTab[] = [
+  {
+    id: 'overview',
+    label: '首页大屏',
+    children: [{ id: 'dashboard', label: '用量总览', description: '' }],
+  },
   {
     id: 'crawl',
     label: '热点爬取',
@@ -58,7 +64,7 @@ const mainTabs: MainTab[] = [
 const activeMainTabId = ref(mainTabs[0].id)
 const activeSubTabId = ref(mainTabs[0].children[0].id)
 
-/** 主选项卡的展开状态，默认展开首个主选项卡 */
+/** 主选项卡的展开状态：默认展开首页大屏，其余按需展开 */
 const expandedMainTabIds = ref<string[]>([mainTabs[0].id])
 
 const isExpanded = (id: string) => expandedMainTabIds.value.includes(id)
@@ -203,7 +209,7 @@ onUnmounted(() => {
               :aria-current="sub.id === activeSubTabId ? 'page' : undefined"
               @click="selectSubTab(tab, sub.id)"
             >
-              {{ sub.label }}
+              <span>{{ sub.label }}</span>
             </button>
           </div>
         </div>
@@ -218,7 +224,8 @@ onUnmounted(() => {
       <div class="clock">{{ currentTime }}</div>
 
       <section class="panel" role="tabpanel">
-        <CrawlTaskCreate v-if="activeSubTab.id === 'crawl-create'" @created="handleCrawlCreated" />
+        <Dashboard v-if="activeSubTab.id === 'dashboard'" />
+        <CrawlTaskCreate v-else-if="activeSubTab.id === 'crawl-create'" @created="handleCrawlCreated" />
         <CrawlResults v-else-if="activeSubTab.id === 'crawl-results'" @to-video="handleCrawlToVideo" />
         <VideoTaskCreate v-else-if="activeSubTab.id === 'video-create'" @created="handleTaskCreated" />
         <VideoResults v-else-if="activeSubTab.id === 'video-results'" />
@@ -237,7 +244,8 @@ onUnmounted(() => {
 <style scoped>
 .app-shell {
   display: grid;
-  grid-template-columns: 3fr 7fr;
+  /* 在「缩短 5/8」的基础上再拓宽 15%：四档数值同乘 1.15，小屏下限与大屏上限一起放宽，仍由 clamp 兜住 */
+  grid-template-columns: minmax(110px, clamp(126px, 16.17vw, 172px)) 1fr;
   height: 100%;
   background: var(--color-bg);
 }
@@ -247,7 +255,7 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  padding: 18px 16px;
+  padding: 18px 10px;
   border-right: 1px solid var(--color-border);
   background: #0c0c10;
 }
@@ -281,6 +289,7 @@ onUnmounted(() => {
   font-size: 14px;
   font-weight: 600;
   line-height: 1.3;
+  overflow-wrap: anywhere;
 }
 
 .brand__version {
@@ -308,7 +317,7 @@ onUnmounted(() => {
   align-items: center;
   gap: 8px;
   width: 100%;
-  padding: 7px 10px;
+  padding: 7px 8px;
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -317,6 +326,13 @@ onUnmounted(() => {
   text-align: left;
   cursor: pointer;
   transition: color 160ms ease, background-color 160ms ease;
+}
+
+.nav__item span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .nav__item:hover {

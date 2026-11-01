@@ -236,3 +236,27 @@ func TestNormalizeSegmentReviewDefaults(t *testing.T) {
 		t.Fatal("保留尾帧应默认关闭")
 	}
 }
+
+// 严格首帧默认开启：用户给的首帧/尾帧必须作为新视频的第一帧，
+// 只有显式关掉才允许让角色参考图挤掉锁帧（方舟两类任务互斥）。
+func TestStrictFirstFrameDefaultsOn(t *testing.T) {
+	if !(VideoRunConfig{}).strictFirstFrameEnabled() {
+		t.Fatal("严格首帧应默认开启")
+	}
+	cfg, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "严格首帧默认", FirstFrame: "https://example.com/first.png"})
+	if err != nil {
+		t.Fatalf("归一化失败: %v", err)
+	}
+	if cfg.StrictFirstFrame == nil || !*cfg.StrictFirstFrame {
+		t.Fatalf("归一化应写入默认的严格首帧: %v", cfg.StrictFirstFrame)
+	}
+
+	off := false
+	loose, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "换角色参考图", StrictFirstFrame: &off})
+	if err != nil {
+		t.Fatalf("归一化失败: %v", err)
+	}
+	if loose.strictFirstFrameEnabled() {
+		t.Fatal("显式关闭后应保持关闭")
+	}
+}

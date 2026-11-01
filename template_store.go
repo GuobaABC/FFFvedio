@@ -281,7 +281,8 @@ func templateOverrideKeys(overrides map[string]string, sources map[string]string
 	return keys
 }
 
-// seedBuiltinVideoTemplates 首次启动写入内置模板（幂等）。
+// seedBuiltinVideoTemplates 首次启动写入内置模板（幂等）；内置模板升版时同步刷新存量库，
+// 避免老库里继续留着旧的角色锚点；用户自建/团队模板不受影响（WHERE scope = 'builtin'）。
 func seedBuiltinVideoTemplates(db *sql.DB) error {
 	for _, template := range builtinVideoTemplates() {
 		now := time.Now().Format(time.RFC3339)
@@ -295,8 +296,16 @@ func seedBuiltinVideoTemplates(db *sql.DB) error {
 		if err != nil {
 			return err
 		}
-		if _, err := db.Exec(
-			`INSERT OR IGNORE INTO video_templates (`+videoTemplateColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		if _, err := db.Exec(`
+			INSERT INTO video_templates (`+videoTemplateColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				name = excluded.name,
+				version = excluded.version,
+				scope = excluded.scope,
+				tags_json = excluded.tags_json,
+				payload_json = excluded.payload_json,
+				updated_at = excluded.updated_at
+			WHERE video_templates.scope = '`+TemplateScopeBuiltin+`' AND video_templates.version <> excluded.version`,
 			template.ID, template.Name, template.Version, template.Scope, tagsJSON, payload, template.CreatedAt, template.UpdatedAt,
 		); err != nil {
 			return fmt.Errorf("写入内置模板失败: %w", err)
@@ -314,9 +323,9 @@ func builtinVideoTemplates() []VideoTemplate {
 		{
 			ID:          "tpl_builtin_brand_warm",
 			Name:        "品牌口播·暖调",
-			Version:     "1.2",
+			Version:     "1.3",
 			Scope:       TemplateScopeBuiltin,
-			Description: "9:16 竖版暖调口播：暖琥珀色调 + 35mm 浅景深，主理人出镜，适合美食 / 好物上新。",
+			Description: "9:16 竖版暖调口播：暖琥珀色调 + 35mm 浅景深，猫主理人出镜，适合美食 / 好物上新。",
 			Tags:        []string{"品牌", "口播", "美食", "抖音"},
 			Style: VideoTemplateStyle{
 				Tokens: map[string]string{
@@ -328,8 +337,8 @@ func builtinVideoTemplates() []VideoTemplate {
 					"mood":     "温暖、松弛、有食欲",
 				},
 				PromptSnippets: map[string]string{
-					"kling":   "35mm 定焦手持轻推，侧逆光 45°，暖琥珀色调，暗部保留细节，细颗粒胶片质感，温暖口播氛围",
-					"veo":     "handheld 35mm slowly pushing in, 45-degree backlight, warm amber grade with lifted shadows, fine film grain, cozy talking-head mood",
+					"kling":   "35mm 定焦手持轻推，侧逆光 45°，暖琥珀色调，暗部保留细节，细颗粒胶片质感，猫主理人温暖口播氛围",
+					"veo":     "handheld 35mm slowly pushing in, 45-degree backlight, warm amber grade with lifted shadows, fine film grain, cozy animal presenter mood",
 					"runway":  "slow handheld push-in, 35mm lens, warm amber color grade, soft 45-degree backlight, fine grain",
 					"generic": "手持缓慢推近，35mm 定焦浅景深，侧逆光 45°，暖琥珀色调，细颗粒胶片质感",
 				},
@@ -337,9 +346,9 @@ func builtinVideoTemplates() []VideoTemplate {
 			Characters: []VideoTemplateCharacter{
 				{
 					RoleID:          "host",
-					Name:            "主理人",
+					Name:            "主理人（橘猫）",
 					Images:          []string{},
-					AppearanceBlock: "35 岁女性，齐肩黑发别在耳后，米白色针织上衣，亚麻围裙系在腰侧，右手常持杯具",
+					AppearanceBlock: "成年橘色短毛猫，圆脸、耳尖有一小撮白毛，脖子系米白色针织围巾，亚麻小围裙挂在胸前，右前爪常扶着杯具；双后足站立，表情松弛",
 					VoiceHint:       "温暖中音，语速 4.2 字/秒",
 					Perspective:     "主视角，正对镜头半身",
 				},
@@ -380,21 +389,21 @@ func builtinVideoTemplates() []VideoTemplate {
 		{
 			ID:          "tpl_builtin_knowledge_cool",
 			Name:        "知识解说·冷调",
-			Version:     "1.0",
+			Version:     "1.1",
 			Scope:       TemplateScopeBuiltin,
-			Description: "16:9 横版知识解说：冷青蓝色调 + 固定机位，讲解人出镜，适合 B 站 / 深度内容。",
+			Description: "16:9 横版知识解说：冷青蓝色调 + 固定机位，狗讲解人出镜，适合 B 站 / 深度内容。",
 			Tags:        []string{"知识", "解说", "B站", "16:9"},
 			Style: VideoTemplateStyle{
 				Tokens: map[string]string{
 					"lighting": "顶光 + 45° 侧补，背景冷白不发灰",
-					"grade":    "冷青蓝色调低饱和，肤色补偿 +3",
+					"grade":    "冷青蓝色调低饱和，毛色补偿 +3",
 					"lens":     "50mm 中景为主",
 					"camera":   "固定机位 + 缓慢横移",
 					"texture":  "数字锐利，无颗粒",
 					"mood":     "克制、理性、可信",
 				},
 				PromptSnippets: map[string]string{
-					"kling":   "50mm 中景固定机位缓慢横移，顶光加 45° 侧补，冷青蓝低饱和色调，肤色自然，画面锐利无颗粒",
+					"kling":   "50mm 中景固定机位缓慢横移，顶光加 45° 侧补，冷青蓝低饱和色调，毛色自然，画面锐利无颗粒",
 					"veo":     "locked-off 50mm medium shot with slow lateral dolly, top light plus 45-degree fill, cool teal grade, clean digital look",
 					"generic": "50mm 中景固定机位缓慢横移，冷青蓝低饱和色调，顶光加侧补，画面锐利无颗粒",
 				},
@@ -402,9 +411,9 @@ func builtinVideoTemplates() []VideoTemplate {
 			Characters: []VideoTemplateCharacter{
 				{
 					RoleID:          "narrator",
-					Name:            "讲解人",
+					Name:            "讲解人（边牧）",
 					Images:          []string{},
-					AppearanceBlock: "30 岁男性，黑色短发，深灰圆领针织衫，站姿挺直，双手在胸前比划",
+					AppearanceBlock: "黑白边境牧羊犬，眼神专注，深灰圆领针织披肩搭在肩背，坐姿挺直，两只前爪在胸前比划",
 					VoiceHint:       "平稳中低音，语速 4.6 字/秒",
 					Perspective:     "主视角，正面中景",
 				},

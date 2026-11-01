@@ -74,6 +74,10 @@ func extractJSONBlock(raw string) string {
 	return trimmed
 }
 
+// animalCastDirective 出镜主体统一约束：一律用猫/狗/猪/鸡等动物担当，避免真人形象（肖像与合规风险）。
+// 三段 Agent 提示词与最终下发给视频模型的提示词都会带上这条约束。
+const animalCastDirective = `出镜主体优先使用动物角色（猫、狗、猪、鸡等家畜家禽），画面里不要出现真人面孔、人体、人手或人物剪影；需要“说话人”时同样由动物担当，可以拟人化（直立、穿衣、做表情），但动物外形必须清晰可辨`
+
 const scriptSystemPrompt = `你是中文短视频编剧兼导演，擅长 15-60 秒的口播与剧情短视频。
 用户会给出主题、目标时长、语速与首帧信息。
 只输出一个 JSON 对象，不要 Markdown 代码块，不要任何解释。
@@ -87,12 +91,19 @@ JSON 结构：
 5. 画面只写看得见的东西：具体主体、可度量的动作、环境与光线；不要写“字幕”“文字”“标题”“logo”等画面文字要求；
 6. 若提供首帧图，第一段画面必须与首帧衔接，后续段落保持主体外观、服装与光线一致；
 7. 台词口语化，没有台词的段落 dialogue 用空字符串；
-8. roles 只能使用用户给出的角色 role_id，无可出场角色时给空数组。`
+8. roles 只能使用用户给出的角色 role_id；只要该角色出现在画面里（含手部、背影等局部入镜）就必须写进 roles，确实无角色出场时才给空数组；
+9. ` + animalCastDirective + `
+10. 台词里的称呼、自称与比喻也要贴合动物主体，不要出现只有人类才成立的身份动作（如上班打卡、对着镜子化妆的手部特写）。`
 
 func (a *App) llmScript(ctx context.Context, provider Provider, cfg VideoRunConfig, tpl *VideoTemplateRun) (VideoScript, []string, error) {
 	roles := make([]string, 0, len(cfg.CharacterRefs))
 	for _, ref := range cfg.CharacterRefs {
-		roles = append(roles, fmt.Sprintf("%s(%s)", ref.RoleID, ref.Name))
+		label := fmt.Sprintf("%s(%s)", ref.RoleID, ref.Name)
+		// 用户亲自传了图的角色形象已经钉死，分镜不要再编外貌细节去和图对不上
+		if ref.ImageSource == CharacterImageSourceUser && len(ref.Images) > 0 {
+			label += "（形象以上传的定妆图为准）"
+		}
+		roles = append(roles, label)
 	}
 	firstFrame := "未提供"
 	if cfg.FirstFrame != "" {
@@ -127,7 +138,7 @@ func (a *App) llmScript(ctx context.Context, provider Provider, cfg VideoRunConf
 		images = append(images, cfg.FirstFrame)
 	}
 
-	raw, imageWarnings, err := a.chatCompletionTraced(ctx, provider, scriptSystemPrompt, userPrompt, images)
+	raw, imageWarnings, _, err := a.chatCompletionTraced(ctx, provider, scriptSystemPrompt, userPrompt, images)
 	if err != nil {
 		return VideoScript{}, imageWarnings, err
 	}
@@ -424,7 +435,8 @@ const promptSystemPrompt = `你是图像生视频（i2v）与文生视频的提�
 6. 每段只允许一个连续动作，不要出现 then/然后/接着 导致的段内切镜；
 7. 画面内不要出现任何文字、字幕、水印、logo 或 UI 元素，也不要要求模型生成文字；
 8. 相邻分镜的景别或运动至少一项不同，避免全片一个机位；
-9. 台词必须原样返回，不要改写、翻译或添加旁白标记。`
+9. 台词必须原样返回，不要改写、翻译或添加旁白标记；
+10. ` + animalCastDirective + `。`
 
 func (a *App) llmPrompts(ctx context.Context, provider Provider, cfg VideoRunConfig, script VideoScript, tpl *VideoTemplateRun) (map[string]VideoPromptEdit, error) {
 	shotsJSON, err := json.Marshal(script.Shots)
@@ -511,7 +523,9 @@ func (a *App) generatePrompts(ctx context.Context, cfg VideoRunConfig, script Vi
 			visual = localVisualPrompt(cfg, shot)
 		}
 		visual = decorateVisualPrompt(cfg, shot, visual)
-		visual = applyTemplatePromptExtras(visual, shot, caps, tpl)
+		visual = applyTemplatePromptExtras(visual, shot, caps, tpl, cfg)
+		// 动物主体约束钉在末尾：即使文本模型漏写、或模板角色写成了真人，也能在最后一刻纠偏
+		visual = appendCastDirective(visual)
 
 		duration := shot.DurationS
 		if duration <= 0 {
@@ -547,7 +561,11 @@ func localVisualPrompt(cfg VideoRunConfig, shot VideoShot) string {
 	parts = append(parts, fmt.Sprintf("%s镜头，%s", cfg.AspectRatio, firstNonEmpty(shot.Camera, "固定机位微动")))
 	parts = append(parts, "主体："+firstNonEmpty(shot.SceneIntent, cfg.Topic))
 	if len(shot.Roles) > 0 {
-		parts = append(parts, "出场角色："+strings.Join(shot.Roles, "、")+"，外观与角色参考图一致")
+		labels := make([]string, 0, len(shot.Roles))
+		for _, role := range shot.Roles {
+			labels = append(labels, characterDisplayName(cfg, role))
+		}
+		parts = append(parts, "出场角色："+strings.Join(labels, "、")+"，其形体、毛色与服饰必须与随本段提交的角色参考图完全一致")
 	}
 	if shot.AudioCue != "" {
 		parts = append(parts, "环境："+shot.AudioCue)
@@ -559,7 +577,7 @@ func localVisualPrompt(cfg VideoRunConfig, shot VideoShot) string {
 	return strings.Join(parts, "；")
 }
 
-// decorateVisualPrompt 追加用户额外要求与非人物化的统一外观描述块。
+// decorateVisualPrompt 追加用户额外要求与负向提示。
 func decorateVisualPrompt(cfg VideoRunConfig, shot VideoShot, visual string) string {
 	extras := make([]string, 0, 2)
 	if cfg.VideoParams.ExtraPrompt != "" {
@@ -574,9 +592,34 @@ func decorateVisualPrompt(cfg VideoRunConfig, shot VideoShot, visual string) str
 	return visual + "；" + strings.Join(extras, "；")
 }
 
-// applyTemplatePromptExtras 在固定槽位后注入模板风格片段与角色外观锚点（§2 §3）：
-// 支持主体参考的模型直接喂图，不支持的模型用同一段外观文字降级复用。
-func applyTemplatePromptExtras(visual string, shot VideoShot, caps VideoCapabilities, tpl *VideoTemplateRun) string {
+// appendCastDirective 把出镜主体约束追加到画面提示词末尾（已带同一约束时不重复拼接）。
+func appendCastDirective(visual string) string {
+	if strings.TrimSpace(visual) == "" || strings.Contains(visual, animalCastDirective) {
+		return visual
+	}
+	return visual + "；" + animalCastDirective
+}
+
+// characterDisplayName 把 role_id 翻成用户看得懂的角色名（找不到就回退原标识）。
+func characterDisplayName(cfg VideoRunConfig, role string) string {
+	key := strings.ToLower(strings.TrimSpace(role))
+	for _, ref := range cfg.CharacterRefs {
+		if strings.EqualFold(strings.TrimSpace(ref.RoleID), key) || strings.EqualFold(strings.TrimSpace(ref.Name), key) {
+			if strings.TrimSpace(ref.Name) != "" {
+				return ref.Name
+			}
+			return ref.RoleID
+		}
+	}
+	return role
+}
+
+// applyTemplatePromptExtras 在固定槽位后注入模板风格片段与角色外观锚点（§2 §3）。
+// 外观文字锚点无条件保留：支持主体参考的模型除了喂图还要一份文字特征（两者不矛盾），
+// 不支持的模型（方舟 Seedance 1.x 等）完全依赖它做跨段一致性。
+// 但用户自己上传过定妆图的角色要补一句裁决规则：模板里的外观描述可能与上传图不一致，
+// 文字留着兜底，冲突时以图为准。
+func applyTemplatePromptExtras(visual string, shot VideoShot, caps VideoCapabilities, tpl *VideoTemplateRun, cfg VideoRunConfig) string {
 	if tpl == nil || strings.TrimSpace(visual) == "" {
 		return visual
 	}
@@ -584,14 +627,16 @@ func applyTemplatePromptExtras(visual string, shot VideoShot, caps VideoCapabili
 	if snippet := templateStyleSnippet(&tpl.VideoTemplate, caps.PromptStyle); snippet != "" {
 		extras = append(extras, "风格参考："+snippet)
 	}
-	if !caps.CharacterReference {
-		for _, role := range shot.Roles {
-			character := templateCharacterByRole(&tpl.VideoTemplate, role)
-			if character == nil || strings.TrimSpace(character.AppearanceBlock) == "" {
-				continue
-			}
-			extras = append(extras, fmt.Sprintf("角色外观（%s）：%s", character.Name, character.AppearanceBlock))
+	for _, role := range shot.Roles {
+		character := templateCharacterByRole(&tpl.VideoTemplate, role)
+		if character == nil || strings.TrimSpace(character.AppearanceBlock) == "" {
+			continue
 		}
+		anchor := fmt.Sprintf("角色外观（%s）：%s", character.Name, character.AppearanceBlock)
+		if roleUsesUserImages(cfg, role) {
+			anchor += "（该角色已附用户上传的定妆图，文字描述与图片不一致时一律以图片为准）"
+		}
+		extras = append(extras, anchor)
 	}
 	if len(extras) == 0 {
 		return visual
@@ -608,7 +653,8 @@ const segmentPromptSuggestSystemPrompt = `你是图像生视频（i2v）与文�
 4. 每段只允许一个连续动作，禁止 then/然后/接着 导致段内切镜；
 5. 画面内不得出现任何文字、字幕、水印、logo 或 UI 元素；
 6. 禁止空洞标签（cinematic、8K、高级感、masterpiece）；
-7. 针对用户给出不满点做定向重写，其余意图保持稳定。`
+7. 针对用户给出不满点做定向重写，其余意图保持稳定；
+8. ` + animalCastDirective + `。`
 
 // SuggestSegmentPrompt 结合用户反馈重写单段画面提示词：逐段确认关卡里的 AI 辅助。
 func (a *App) SuggestSegmentPrompt(taskID, segmentID, feedback string) (string, error) {
@@ -671,7 +717,9 @@ func (a *App) SuggestSegmentPrompt(taskID, segmentID, feedback string) (string, 
 		firstNonEmpty(strings.TrimSpace(feedback), "效果不佳，请更具体、更可执行"),
 	)
 
-	raw, err := a.chatCompletion(context.Background(), provider, segmentPromptSuggestSystemPrompt, userPrompt)
+	// 逐段返工从 Wails 事件进来，没有流水线上下文，这里自己补上用途与任务 ID
+	raw, err := a.chatCompletion(withUsage(context.Background(), UsagePurposeSegmentFix, task.ID),
+		provider, segmentPromptSuggestSystemPrompt, userPrompt)
 	if err != nil {
 		return "", fmt.Errorf("AI 生成提示词失败: %w", err)
 	}

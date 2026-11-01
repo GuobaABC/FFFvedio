@@ -15,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // 文本模型的三套请求方言（见《模型 API 提供商接口参考》§2）：
@@ -65,31 +66,46 @@ func (a *App) chatCompletion(ctx context.Context, provider Provider, system, use
 // chatCompletionWithImages 支持把首帧图 / 角色定妆图作为多模态输入（文档 §5 的 B 类能力）。
 // images 里的元素可以是本地路径、http(s) URL 或 data URI。
 func (a *App) chatCompletionWithImages(ctx context.Context, provider Provider, system, user string, images []string) (string, error) {
-	content, _, err := a.chatCompletionTraced(ctx, provider, system, user, images)
+	content, _, _, err := a.chatCompletionTraced(ctx, provider, system, user, images)
 	return content, err
 }
 
-// chatCompletionTraced 额外返回“被跳过的参考图”这类降级提示，
-// 避免图片没生效时日志里完全看不出来。
-func (a *App) chatCompletionTraced(ctx context.Context, provider Provider, system, user string, images []string) (string, []string, error) {
+// chatCompletionTraced 额外返回“被跳过的参考图”这类降级提示与实测 token 用量，
+// 前者避免图片没生效时日志里完全看不出来，后者供首页大屏记账。
+// 用途标签由调用点通过 context 注入（withUsagePurpose / withUsageTask）。
+func (a *App) chatCompletionTraced(ctx context.Context, provider Provider, system, user string, images []string) (string, []string, llmTokenUsage, error) {
 	if strings.TrimSpace(provider.BaseURL) == "" {
-		return "", nil, errors.New("文本模型缺少 Base URL")
+		return "", nil, llmTokenUsage{}, errors.New("文本模型缺少 Base URL")
 	}
 	if strings.TrimSpace(provider.Model) == "" {
-		return "", nil, errors.New("文本模型缺少模型名称")
+		return "", nil, llmTokenUsage{}, errors.New("文本模型缺少模型名称")
 	}
 
 	requestCtx, cancel := context.WithTimeout(ctx, agentRequestTimeout)
 	defer cancel()
 
-	switch resolveLLMDialect(provider) {
+	dialect := resolveLLMDialect(provider)
+	started := time.Now()
+	var (
+		content    string
+		warnings   []string
+		usage      llmTokenUsage
+		requestErr error
+	)
+	switch dialect {
 	case DialectAnthropic:
-		return requestAnthropicMessages(requestCtx, provider, system, user, images)
+		content, warnings, usage, requestErr = requestAnthropicMessages(requestCtx, provider, system, user, images)
 	case DialectGemini:
-		return requestGeminiContent(requestCtx, provider, system, user, images)
+		content, warnings, usage, requestErr = requestGeminiContent(requestCtx, provider, system, user, images)
 	default:
-		return requestOpenAIChat(requestCtx, provider, system, user, images)
+		content, warnings, usage, requestErr = requestOpenAIChat(requestCtx, provider, system, user, images)
 	}
+	// 失败也入账：一次报错的调用同样可能已经消耗了额度，大屏要看得见
+	a.recordLLMUsage(ctx, provider, dialect, usage, time.Since(started), requestErr)
+	if requestErr != nil {
+		return "", warnings, usage, requestErr
+	}
+	return content, warnings, usage, nil
 }
 
 // llmImagePayload 把一张参考图整理成「mime + base64 或 URL」，三套方言各自按需取用。
@@ -188,7 +204,7 @@ func doJSONRequest(ctx context.Context, endpoint string, headers map[string]stri
 
 /* --------------------------- ① OpenAI 兼容 --------------------------- */
 
-func requestOpenAIChat(ctx context.Context, provider Provider, system, user string, images []string) (string, []string, error) {
+func requestOpenAIChat(ctx context.Context, provider Provider, system, user string, images []string) (string, []string, llmTokenUsage, error) {
 	warnings := make([]string, 0, 1)
 	payloads := collectLLMImages(images, &warnings)
 
@@ -219,7 +235,7 @@ func requestOpenAIChat(ctx context.Context, provider Provider, system, user stri
 		"Authorization": "Bearer " + provider.APIKey,
 	}, request)
 	if err != nil {
-		return "", warnings, fmt.Errorf("文本模型（OpenAI 兼容 %s）%w", provider.Model, err)
+		return "", warnings, llmTokenUsage{}, fmt.Errorf("文本模型（OpenAI 兼容 %s）%w", provider.Model, err)
 	}
 
 	var parsed struct {
@@ -228,18 +244,29 @@ func requestOpenAIChat(ctx context.Context, provider Provider, system, user stri
 				Content json.RawMessage `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", warnings, fmt.Errorf("解析文本模型响应失败: %w（响应：%s）", err, bodySnippet(data))
+		return "", warnings, llmTokenUsage{}, fmt.Errorf("解析文本模型响应失败: %w（响应：%s）", err, bodySnippet(data))
 	}
 	if len(parsed.Choices) == 0 {
-		return "", warnings, errors.New("文本模型没有返回任何结果：" + bodySnippet(data))
+		return "", warnings, llmTokenUsage{}, errors.New("文本模型没有返回任何结果：" + bodySnippet(data))
 	}
 	content := decodeOpenAIContent(parsed.Choices[0].Message.Content)
 	if strings.TrimSpace(content) == "" {
-		return "", warnings, errors.New("文本模型返回了空内容：" + bodySnippet(data))
+		return "", warnings, llmTokenUsage{}, errors.New("文本模型返回了空内容：" + bodySnippet(data))
 	}
-	return content, warnings, nil
+	usage := llmTokenUsage{
+		PromptTokens:     parsed.Usage.PromptTokens,
+		CompletionTokens: parsed.Usage.CompletionTokens,
+		TotalTokens:      parsed.Usage.TotalTokens,
+		Reported:         parsed.Usage.PromptTokens+parsed.Usage.CompletionTokens+parsed.Usage.TotalTokens > 0,
+	}
+	return content, warnings, usage, nil
 }
 
 func imageRefForOpenAI(image llmImagePayload) string {
@@ -287,7 +314,7 @@ func anthropicEndpoint(baseURL string) string {
 	return base + "/v1/messages"
 }
 
-func requestAnthropicMessages(ctx context.Context, provider Provider, system, user string, images []string) (string, []string, error) {
+func requestAnthropicMessages(ctx context.Context, provider Provider, system, user string, images []string) (string, []string, llmTokenUsage, error) {
 	warnings := make([]string, 0, 1)
 	payloads := collectLLMImages(images, &warnings)
 
@@ -326,7 +353,7 @@ func requestAnthropicMessages(ctx context.Context, provider Provider, system, us
 		"anthropic-version": anthropicVersion,
 	}, request)
 	if err != nil {
-		return "", warnings, fmt.Errorf("文本模型（Anthropic Messages %s）%w", provider.Model, err)
+		return "", warnings, llmTokenUsage{}, fmt.Errorf("文本模型（Anthropic Messages %s）%w", provider.Model, err)
 	}
 
 	var parsed struct {
@@ -334,9 +361,15 @@ func requestAnthropicMessages(ctx context.Context, provider Provider, system, us
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
+		Usage struct {
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", warnings, fmt.Errorf("解析文本模型响应失败: %w（响应：%s）", err, bodySnippet(data))
+		return "", warnings, llmTokenUsage{}, fmt.Errorf("解析文本模型响应失败: %w（响应：%s）", err, bodySnippet(data))
 	}
 	parts := make([]string, 0, len(parsed.Content))
 	for _, block := range parsed.Content {
@@ -346,9 +379,17 @@ func requestAnthropicMessages(ctx context.Context, provider Provider, system, us
 	}
 	content := strings.Join(parts, "")
 	if strings.TrimSpace(content) == "" {
-		return "", warnings, errors.New("文本模型返回了空内容：" + bodySnippet(data))
+		return "", warnings, llmTokenUsage{}, errors.New("文本模型返回了空内容：" + bodySnippet(data))
 	}
-	return content, warnings, nil
+	// Anthropic 不报总量，且命中缓存的输入不写在 input_tokens 里，三项相加才是实际投入量
+	input := parsed.Usage.InputTokens + parsed.Usage.CacheReadInputTokens + parsed.Usage.CacheCreationInputTokens
+	usage := llmTokenUsage{
+		PromptTokens:     input,
+		CompletionTokens: parsed.Usage.OutputTokens,
+		TotalTokens:      input + parsed.Usage.OutputTokens,
+		Reported:         input+parsed.Usage.OutputTokens > 0,
+	}
+	return content, warnings, usage, nil
 }
 
 /* --------------------------- ③ Google Gemini --------------------------- */
@@ -367,7 +408,7 @@ func geminiEndpoint(baseURL, model string) string {
 	return fmt.Sprintf("%s/models/%s:generateContent", base, url.PathEscape(model))
 }
 
-func requestGeminiContent(ctx context.Context, provider Provider, system, user string, images []string) (string, []string, error) {
+func requestGeminiContent(ctx context.Context, provider Provider, system, user string, images []string) (string, []string, llmTokenUsage, error) {
 	warnings := make([]string, 0, 1)
 	payloads := collectLLMImages(images, &warnings)
 
@@ -395,7 +436,7 @@ func requestGeminiContent(ctx context.Context, provider Provider, system, user s
 		"x-goog-api-key": provider.APIKey,
 	}, request)
 	if err != nil {
-		return "", warnings, fmt.Errorf("文本模型（Gemini generateContent %s）%w", provider.Model, err)
+		return "", warnings, llmTokenUsage{}, fmt.Errorf("文本模型（Gemini generateContent %s）%w", provider.Model, err)
 	}
 
 	var parsed struct {
@@ -406,9 +447,14 @@ func requestGeminiContent(ctx context.Context, provider Provider, system, user s
 				} `json:"parts"`
 			} `json:"content"`
 		} `json:"candidates"`
+		UsageMetadata struct {
+			PromptTokenCount     int `json:"promptTokenCount"`
+			CandidatesTokenCount int `json:"candidatesTokenCount"`
+			TotalTokenCount      int `json:"totalTokenCount"`
+		} `json:"usageMetadata"`
 	}
 	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", warnings, fmt.Errorf("解析文本模型响应失败: %w（响应：%s）", err, bodySnippet(data))
+		return "", warnings, llmTokenUsage{}, fmt.Errorf("解析文本模型响应失败: %w（响应：%s）", err, bodySnippet(data))
 	}
 	texts := make([]string, 0, 4)
 	for _, candidate := range parsed.Candidates {
@@ -420,7 +466,14 @@ func requestGeminiContent(ctx context.Context, provider Provider, system, user s
 	}
 	content := strings.Join(texts, "")
 	if strings.TrimSpace(content) == "" {
-		return "", warnings, errors.New("文本模型返回了空内容：" + bodySnippet(data))
+		return "", warnings, llmTokenUsage{}, errors.New("文本模型返回了空内容：" + bodySnippet(data))
 	}
-	return content, warnings, nil
+	usage := llmTokenUsage{
+		PromptTokens:     parsed.UsageMetadata.PromptTokenCount,
+		CompletionTokens: parsed.UsageMetadata.CandidatesTokenCount,
+		TotalTokens:      parsed.UsageMetadata.TotalTokenCount,
+		Reported: parsed.UsageMetadata.PromptTokenCount+parsed.UsageMetadata.CandidatesTokenCount+
+			parsed.UsageMetadata.TotalTokenCount > 0,
+	}
+	return content, warnings, usage, nil
 }

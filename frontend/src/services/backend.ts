@@ -1,4 +1,5 @@
 import type { Provider, ProviderDraft } from '../types/provider'
+import type { DashboardSnapshot } from '../types/dashboard'
 import type {
   CrawlEnvironment,
   CrawlItem,
@@ -23,6 +24,9 @@ import type { VideoTemplate, VideoTemplatePreview } from '../types/template'
  * 独立运行 `npm run dev` / `npm run build`，仅在调用时提示缺少运行时。
  */
 interface AppBindings {
+  /* 首页大屏：模型用量与适配成熟度快照 */
+  GetDashboard(): Promise<DashboardSnapshot>
+
   ListProviders(): Promise<Provider[]>
   SaveProvider(input: ProviderDraft): Promise<Provider>
   DeleteProvider(id: string): Promise<void>
@@ -95,6 +99,8 @@ function bindings(): AppBindings {
 }
 
 export const backend = {
+  getDashboard: (): Promise<DashboardSnapshot> => bindings().GetDashboard(),
+
   listProviders: (): Promise<Provider[]> => bindings().ListProviders(),
   saveProvider: (input: ProviderDraft): Promise<Provider> => bindings().SaveProvider(input),
   deleteProvider: (id: string): Promise<void> => bindings().DeleteProvider(id),

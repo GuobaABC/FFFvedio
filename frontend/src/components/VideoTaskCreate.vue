@@ -51,6 +51,9 @@ const sourceDraft = ref<CrawlVideoDraft | null>(null)
 
 /** 角色参考图以「; 分隔的路径文本」编辑，提交时再转成 images 数组 */
 const characterImagesText = ref<string[]>([])
+/** 模板带进来的那一份图路径：用来区分「模板定妆图」与「我自己选的图」 */
+const templateCharacterImages = ref<string[]>([])
+const characterUploadNote = ref('')
 
 /* ---------------- 尾帧资产：历史任务的尾帧可直接选作本任务首帧 ---------------- */
 const tailAssets = ref<TailFrameAsset[]>([])
@@ -133,9 +136,14 @@ const selectedTemplate = computed(
 
 /** 读取表单字段的字符串快照，仅用于来源比对与 overrides 上报 */
 function readPath(path: string): string {
-  // 角色是对象数组，直接 String() 会变成 [object Object]
+  // 角色是对象数组，直接 String() 会变成 [object Object]；
+  // 图片路径必须一并入快照，否则只换了图不改角色名时会被当成「没动过」
   if (path === 'characterRefs') {
-    return form.characterRefs.map((ref) => ref.name || ref.roleId).join('、')
+    const names = form.characterRefs.map((ref) => ref.name || ref.roleId).join('、')
+    const images = form.characterRefs
+      .map((_, index) => characterImagesText.value[index] ?? '')
+      .join(';')
+    return `${names}|${images}`
   }
   const [head, tail] = path.split('.')
   const record = form as unknown as Record<string, unknown>
@@ -178,6 +186,12 @@ function displayValue(key: string, value: string): string {
         .split(',')
         .map((id) => VIDEO_PLATFORMS.find((item) => item.id === id)?.label ?? id)
         .join('、')
+    case 'characterRefs': {
+      // 快照里带完整路径（用于比对），表格里只展示名字与张数，免得一串路径挤爆单元格
+      const [names, images] = value.split('|')
+      const count = (images ?? '').split(';').filter(Boolean).length
+      return `${names}（共 ${count} 张图）`
+    }
     default:
       return value
   }
@@ -211,6 +225,7 @@ function styleSummary(template: VideoTemplate): string {
 /** 把模板默认值填进表单，并记下「哪些字段真的来自模板」用于来源标注 */
 function applyTemplate(template: VideoTemplate) {
   const baseline: Record<string, string> = {}
+  templateCharacterImages.value = []
   const mark = (key: string) => {
     baseline[key] = readPath(key)
   }
@@ -315,6 +330,7 @@ function applyTemplate(template: VideoTemplate) {
       voiceHint: character.voiceHint,
     }))
     characterImagesText.value = form.characterRefs.map((ref) => ref.images.join(';'))
+    templateCharacterImages.value = [...characterImagesText.value]
     mark('characterRefs')
   }
 
@@ -348,6 +364,7 @@ async function selectTemplate(templateId: string) {
   const template = templates.value.find((item) => item.id === templateId)
   if (!template) {
     templateBaseline.value = {}
+    templateCharacterImages.value = []
     openingVars.value = {}
     templatePreview.value = null
     return
@@ -364,6 +381,7 @@ async function selectTemplate(templateId: string) {
 function clearTemplate() {
   selectedTemplateId.value = ''
   templateBaseline.value = {}
+  templateCharacterImages.value = []
   openingVars.value = {}
   templatePreview.value = null
   templateError.value = ''
@@ -446,13 +464,22 @@ function formatDurations(durations: number[]): string {
 }
 
 const adapterHint = computed(() => {
+  const maturity = selectedAdapter.value?.maturityNote
+    ? `适配状态：${selectedAdapter.value?.maturityLabel}——${selectedAdapter.value?.maturityNote}。`
+    : ''
   const caps = selectedAdapter.value?.capabilities
   if (!caps) {
-    return '适配器将根据已登记提供商的 Base URL / 模型名自动推断；也可显式选择「本地联调占位」跑通流水线。'
+    return (
+      maturity +
+      '适配器将根据已登记提供商的 Base URL / 模型名自动推断；也可显式选择「本地联调占位」跑通流水线。'
+    )
   }
-  return `时长档位 ${formatDurations(caps.allowedDurations)}，单段上限 ${caps.maxClipS}s；` +
+  return (
+    maturity +
+    `时长档位 ${formatDurations(caps.allowedDurations)}，单段上限 ${caps.maxClipS}s；` +
     `画幅 ${caps.allowedAspectRatios.join(' / ')}；尾帧条件 ${caps.lastFrame ? '支持' : '不支持'}；` +
     `原生音频 ${caps.nativeAudio ? '支持（台词写入提示词）' : '不支持（字幕按语速估算）'}。`
+  )
 })
 
 const providerHint = computed(() => {
@@ -509,11 +536,28 @@ function addCharacter() {
     voiceHint: '',
   })
   characterImagesText.value.push('')
+  templateCharacterImages.value.push('')
+}
+
+/** 一个角色的图到底是谁给的：上传图优先，模板生成图只作退路 */
+function characterImageBadge(index: number): string {
+  const current = (characterImagesText.value[index] ?? '').trim()
+  if (!current) {
+    return ''
+  }
+  return current === (templateCharacterImages.value[index] ?? '').trim()
+    ? '模板定妆图'
+    : '上传图（优先）'
+}
+
+function characterImageBadgeClass(index: number): string {
+  return characterImageBadge(index) === '模板定妆图' ? 'src src--template' : 'src src--override'
 }
 
 function removeCharacter(index: number) {
   form.characterRefs.splice(index, 1)
   characterImagesText.value.splice(index, 1)
+  templateCharacterImages.value.splice(index, 1)
 }
 
 async function pickFirstFrame() {
@@ -531,7 +575,11 @@ async function pickCharacterImages(index: number) {
   try {
     const files = await backend.pickImageFiles()
     if (files.length > 0) {
+      const previous = (characterImagesText.value[index] ?? '').trim()
       characterImagesText.value[index] = files.join(';')
+      characterUploadNote.value = previous
+        ? `已用你选的 ${files.length} 张图替掉该角色原有的定妆图：同一角色只用一份来源，模板里的生成图不会再提交给模型。`
+        : `已为该角色选了 ${files.length} 张上传图：它们会排在参考图最前面，并在提示词里标为形象基准。`
     }
   } catch (error) {
     submitError.value = errorText(error)
@@ -577,12 +625,20 @@ async function submit() {
     topic: form.topic.trim(),
     templateRef: buildTemplateRef(),
     characterRefs: form.characterRefs
-      .map((ref, index) => ({
-        ...ref,
-        name: ref.name.trim(),
-        roleId: ref.roleId.trim() || `char_${index + 1}`,
-        images: splitImages(characterImagesText.value[index] ?? ''),
-      }))
+      .map((ref, index) => {
+        const images = splitImages(characterImagesText.value[index] ?? '')
+        // 没动过的模板行标 template、换过的标 user：后端靠这个判定谁能优先提交
+        const inherited =
+          images.length > 0 &&
+          (characterImagesText.value[index] ?? '').trim() === (templateCharacterImages.value[index] ?? '').trim()
+        return {
+          ...ref,
+          name: ref.name.trim(),
+          roleId: ref.roleId.trim() || `char_${index + 1}`,
+          images,
+          imageSource: images.length > 0 ? (inherited ? 'template' : 'user') : '',
+        }
+      })
       .filter((ref) => ref.name || ref.images.length > 0),
   }
 
@@ -792,6 +848,9 @@ async function submit() {
         <p class="hint">
           首帧驱动叙事：Agent1 会把画面基调、主体、光线与首帧对齐；i2v 提示词只描述「从首帧开始发生的变化」。
         </p>
+        <p v-if="form.firstFrame" class="hint hint--warn">
+          严格锁帧已开启（默认）：新视频一定从这张图开始，有角色参考图也不让位；若连通道本身不支持以首帧起片，任务会直接报错而不是静默忽略。
+        </p>
       </section>
 
       <section class="ui-card block">
@@ -800,10 +859,11 @@ async function submit() {
           <button class="ui-btn" type="button" @click="addCharacter">+ 添加角色</button>
         </div>
         <p v-if="form.characterRefs.length === 0" class="hint">
-          角色图用于跨段保持人物外观一致；不支持主体参考的模型会把统一外观描述写进每段提示词。
+          角色图用于跨段保持主体外观一致；不支持主体参考的模型会把统一外观描述写进每段提示词。
+          出镜主体默认优先使用猫 / 狗 / 猪 / 鸡等动物（可拟人化），避开真人形象。
         </p>
         <div v-for="(ref, index) in form.characterRefs" :key="index" class="character">
-          <input v-model="ref.name" class="ui-input" type="text" placeholder="角色名称，如 女主" />
+          <input v-model="ref.name" class="ui-input" type="text" placeholder="角色名称，如 橘座（猫）" />
           <input
             v-model="characterImagesText[index]"
             class="ui-input"
@@ -811,9 +871,22 @@ async function submit() {
             spellcheck="false"
             placeholder="参考图路径，多个用 ; 分隔"
           />
+          <span v-if="characterImageBadge(index)" :class="characterImageBadgeClass(index)">{{
+            characterImageBadge(index)
+          }}</span>
           <button class="ui-btn" type="button" @click="pickCharacterImages(index)">选择…</button>
           <button class="ui-btn ui-btn--ghost" type="button" @click="removeCharacter(index)">移除</button>
         </div>
+        <p v-if="characterUploadNote" class="hint">{{ characterUploadNote }}</p>
+        <p v-if="form.characterRefs.length > 0" class="hint">
+          默认严格锁帧：有首帧（含上一段尾帧延续出的首帧）的片段按「图生视频-首帧」提交，角色图会让位（官方规则：首帧与参考图两类任务互斥），
+          形象靠首帧画面与提示词里的外观锚点保持；在「3. 时长、画幅与衔接」里关掉「严格首帧」后，才把首帧图与角色图一起按「全模态参考」提交，
+          并在提示词里按「图片N」逐张绑定（需 Seedance 2.0 系列 / 2.5，Seedance 1.x 仅能走首帧延续）。
+        </p>
+        <p v-if="form.characterRefs.length > 0" class="hint">
+          图片来源优先级：你选的上传图 &gt; 模板定妆图。同一角色只用一份来源（两张不同的图丢给模型只会平均出第三个形象），
+          所以下拉模板后直接点「选择…」就能逐角色覆盖模板图，没覆盖的角色继续用模板图；参考图超模型上限时先丢模板图。
+        </p>
       </section>
 
       <section class="ui-card block">
@@ -864,10 +937,18 @@ async function submit() {
             <input v-model="form.keepLastFrame" type="checkbox" />
             保留最后一段尾帧到资产库
           </label>
+          <label class="check check--inline">
+            <input v-model="form.strictFirstFrame" type="checkbox" />
+            严格首帧（有首帧的片段必须从这张图起片）
+          </label>
         </div>
         <p class="hint">
           逐段确认开启后，渲染阶段每生成一段就停住等你验收：不满意可修改提示词（或让 AI 重写）只重生成这一段；
           关闭则一次串行生成全部片段。开启保留尾帧后，最后一段的尾帧会存入资产库，其他任务可选作首帧续写。
+        </p>
+        <p class="hint">
+          严格首帧（默认开）：你填的首帧或从尾帧资产带入的那张图，会作为「图生视频-首帧」任务的 first_frame 提交，画面硬从这张图开始。
+          关掉它才能与角色参考图共用（走全模态参考，锁帧降为提示词里的「图片1」软约定，模型可能只做近似开场）。
         </p>
         <p class="hint">{{ adapterHint }}</p>
         <p class="hint">{{ aspectHint }}</p>
@@ -932,7 +1013,7 @@ async function submit() {
           </label>
           <label class="ui-field">
             <span class="ui-label">负向提示</span>
-            <input v-model="form.videoParams.negativePrompt" class="ui-input" type="text" placeholder="避免出现：文字水印、畸形手指" />
+            <input v-model="form.videoParams.negativePrompt" class="ui-input" type="text" placeholder="避免出现：真人面孔与人体、文字水印、畸形手指" />
           </label>
           <label class="ui-field">
             <span class="ui-label">随机种子（0 = 随机）</span>
@@ -1150,7 +1231,8 @@ async function submit() {
 
 .character {
   display: grid;
-  grid-template-columns: minmax(120px, 0.6fr) minmax(220px, 2fr) auto auto;
+  /* 新增一列给来源标签：没图时 v-if 不渲染，auto 轨道自然为 0 */
+  grid-template-columns: minmax(120px, 0.6fr) minmax(220px, 2fr) auto auto auto;
   gap: 8px;
   align-items: center;
 }

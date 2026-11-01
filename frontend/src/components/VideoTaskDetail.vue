@@ -145,10 +145,24 @@ const summaryRows = computed(() => [
   { label: '适配器', value: run.value?.adapter ? run.value.adapter : '自动推断' },
   { label: '首帧', value: config.value.firstFrame || '未指定（纯文生视频）' },
   {
+    label: '首帧约束',
+    value:
+      config.value.strictFirstFrame === false
+        ? '宽松（与角色图一起走全模态参考，锁帧靠提示词里的「图片1」约定）'
+        : '严格（有首帧的片段必须从这张图起片，角色参考图让位）',
+  },
+  {
     label: '角色参考',
     value:
       config.value.characterRefs.length > 0
-        ? config.value.characterRefs.map((item) => item.name || item.roleId).join('、')
+        ? config.value.characterRefs
+            .map((item) => {
+              const images = item.images ?? []
+              const source =
+                item.imageSource === 'template' ? '模板定妆图' : item.imageSource === 'user' ? '用户上传' : '未标注来源'
+              return `${item.name || item.roleId}（${source}，${images.length} 张）`
+            })
+            .join('、')
         : '无',
   },
 ])
@@ -503,7 +517,7 @@ function revealOutput() {
       </p>
 
       <div v-if="(templateRun.characters ?? []).length > 0" class="roles">
-        <span class="roles__label">人物插图</span>
+        <span class="roles__label">角色插图</span>
         <div v-for="character in templateRun.characters" :key="character.roleId" class="role">
           <span class="role__name">{{ character.name || character.roleId }}</span>
           <span class="role__meta">{{ (character.images ?? []).length }} 张定妆图</span>

@@ -266,6 +266,8 @@ func (r *crawlRunner) save() error {
 
 // processURL 单条 URL 的完整链路：短链展开 → 缓存 → 抓取 → 抽取 → 校验 → 沉淀。
 func (r *crawlRunner) processURL(ctx context.Context, fetcher *crawlFetcher, provider Provider, result CrawlResult, force bool) (CrawlResult, *VideoItem, int) {
+	// 本条 URL 里发生的模型调用都归到这个爬取任务名下（用途由 L3/L4 自己标）
+	ctx = withUsageTask(ctx, r.task.ID)
 	llmCalls := 0
 	result.Steps = []CrawlStep{}
 	result.ErrorCode = ""
