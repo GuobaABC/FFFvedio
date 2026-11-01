@@ -338,7 +338,7 @@ func TestTemplateInjectionIntoPromptAndLocalScript(t *testing.T) {
 	caps := defaultVideoCapabilities()
 	caps.CharacterReference = false
 	caps.PromptStyle = "kling"
-	prompts, warnings := (&App{}).generatePrompts(t.Context(), merged, script, caps, run)
+	prompts, warnings := (&App{}).generatePrompts(t.Context(), merged, script, caps, "", run)
 	if len(prompts) == 0 {
 		t.Fatal("提示词不应为空")
 	}

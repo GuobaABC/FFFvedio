@@ -310,7 +310,7 @@ type VideoPublishEdit struct {
 
 // generatePublishMeta 有文本模型时走 LLM，失败或无模型回退本地规则；
 // 发布时段始终用本地时区/平台档位计算，避免模型凭空编日期。
-func (a *App) generatePublishMeta(ctx context.Context, cfg VideoRunConfig, script *VideoScript, prompts []VideoPromptItem) (*PublishMeta, []string) {
+func (a *App) generatePublishMeta(ctx context.Context, cfg VideoRunConfig, script *VideoScript, prompts []VideoPromptItem, feedback string) (*PublishMeta, []string) {
 	warnings := make([]string, 0, 3)
 	profile := platformProfile(primaryPlatform(cfg))
 	if len(cfg.Platforms) == 0 {
@@ -321,7 +321,7 @@ func (a *App) generatePublishMeta(ctx context.Context, cfg VideoRunConfig, scrip
 
 	provider := a.pickTextProvider(cfg)
 	if provider.ID != "" {
-		if llm, err := a.llmPublishMeta(ctx, provider, cfg, script, prompts, profile); err == nil && strings.TrimSpace(llm.Title.Primary) != "" {
+		if llm, err := a.llmPublishMeta(ctx, provider, cfg, script, prompts, profile, feedback); err == nil && strings.TrimSpace(llm.Title.Primary) != "" {
 			meta.Title.Primary = strings.TrimSpace(llm.Title.Primary)
 			meta.Title.Alternatives = trimList(llm.Title.Alternatives, 3)
 			meta.Title.HookType = firstNonEmpty(strings.TrimSpace(llm.Title.HookType), meta.Title.HookType)
@@ -338,6 +338,12 @@ func (a *App) generatePublishMeta(ctx context.Context, cfg VideoRunConfig, scrip
 		}
 	} else {
 		warnings = append(warnings, "未配置文本模型，发布元数据由本地规则生成")
+	}
+	// 没走成 LLM 就等于本轮意见无人执行，要写进日志而不是默默回退本地文案
+	if meta.Source != "llm" {
+		if warning := feedbackDroppedWarning(feedback); warning != "" {
+			warnings = append(warnings, warning)
+		}
 	}
 
 	finalizePublishMeta(meta, cfg, profile)
@@ -758,11 +764,11 @@ type llmPublishPayload struct {
 	} `json:"cover"`
 }
 
-func (a *App) llmPublishMeta(ctx context.Context, provider Provider, cfg VideoRunConfig, script *VideoScript, prompts []VideoPromptItem, profile PlatformProfile) (*PublishMeta, error) {
+func (a *App) llmPublishMeta(ctx context.Context, provider Provider, cfg VideoRunConfig, script *VideoScript, prompts []VideoPromptItem, profile PlatformProfile, feedback string) (*PublishMeta, error) {
 	system := "你是短视频平台的发布运营。只输出严格 JSON，不要 Markdown 代码块，不要解释。" +
 		"标题必须关键词前置、带一个可验证的钩子（数字清单/反常识/悬念），不得夸大或违规。" +
 		"标签要能追溯到画面提示词或主题，不要蹭无关热点。"
-	user := buildPublishPrompt(cfg, script, prompts, profile)
+	user := buildPublishPrompt(cfg, script, prompts, profile, feedback)
 	content, err := a.chatCompletion(ctx, provider, system, user)
 	if err != nil {
 		return nil, err
@@ -785,7 +791,7 @@ func (a *App) llmPublishMeta(ctx context.Context, provider Provider, cfg VideoRu
 	return meta, nil
 }
 
-func buildPublishPrompt(cfg VideoRunConfig, script *VideoScript, prompts []VideoPromptItem, profile PlatformProfile) string {
+func buildPublishPrompt(cfg VideoRunConfig, script *VideoScript, prompts []VideoPromptItem, profile PlatformProfile, feedback string) string {
 	var builder strings.Builder
 	builder.WriteString("平台：" + profile.Label + "（标题最多 " + fmt.Sprintf("%d", profile.TitleMaxLen) +
 		" 字，首屏可见约 " + fmt.Sprintf("%d", profile.TitleVisibleLen) + " 字；话题最多 " +
@@ -807,6 +813,8 @@ func buildPublishPrompt(cfg VideoRunConfig, script *VideoScript, prompts []Video
 			builder.WriteString("- " + truncateRunes(item.VisualPrompt, 160) + "\n")
 		}
 	}
+	// 关卡③上敲的意见（“标签太多”“换个更晚的时段”）必须让模型看见，拼在输出格式前一条
+	builder.WriteString(feedbackDirective(feedback))
 	builder.WriteString("\n输出 JSON：{\"title\":{\"primary\":\"\",\"alternatives\":[\"\",\"\"],\"hook_type\":\"\"}," +
 		"\"tags\":{\"hashtags\":[\"\"],\"keywords\":[\"\"]},\"description\":\"\",\"category\":\"\",\"cover\":{\"text_overlay\":\"\"}}")
 	return builder.String()

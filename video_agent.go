@@ -76,67 +76,56 @@ func extractJSONBlock(raw string) string {
 
 // animalCastDirective 出镜主体统一约束：一律用猫/狗/猪/鸡等动物担当，避免真人形象（肖像与合规风险）。
 // 三段 Agent 提示词与最终下发给视频模型的提示词都会带上这条约束。
-const animalCastDirective = `出镜主体优先使用动物角色（猫、狗、猪、鸡等家畜家禽），画面里不要出现真人面孔、人体、人手或人物剪影；需要“说话人”时同样由动物担当，可以拟人化（直立、穿衣、做表情），但动物外形必须清晰可辨`
+// 刻意写短（约 60 字）：它会被拼到每段提示词末尾，而 Seedance 单镜头提示词的舒适区只有几十到一百多字，
+// 一条 90 字以上的尾巴会直接挤掉动作与光线描述。
+const animalCastDirective = `画面主体只用动物角色（猫狗猪鸡等家畜家禽），可拟人化（直立、穿衣、做表情）但外形必须清晰可辨，不出现真人面孔与人体`
 
-const scriptSystemPrompt = `你是中文短视频编剧兼导演，擅长 15-60 秒的口播与剧情短视频。
-用户会给出主题、目标时长、语速与首帧信息。
-只输出一个 JSON 对象，不要 Markdown 代码块，不要任何解释。
-JSON 结构：
-{"logline":"一句话主题","language":"zh-CN","shots":[{"id":"s1","durationS":6,"roles":["char_a"],"sceneIntent":"画面意图：具体主体+物理可度量的动作+环境","dialogue":"口播台词","camera":"运镜","mood":"情绪","audioCue":"环境音"}]}
-硬性约束：
-1. 输出 2-4 个分镜，durationS 之和必须等于目标总时长；
-2. 第一段承担“3 秒钩子”：开场就抛冲突、悬念或反常识结论，不要寒暄与自我介绍；
-3. 台词长度受语速预算约束：单段台词字数 <= 段时长 × 语速，并给停顿留出 0.3 秒余量；超预算就精简台词；
-4. 台词是说出来给人听的口语短句，单句不超过 20 字，避免书面语、成语堆叠、括号说明与表情符号；
-5. 画面只写看得见的东西：具体主体、可度量的动作、环境与光线；不要写“字幕”“文字”“标题”“logo”等画面文字要求；
-6. 若提供首帧图，第一段画面必须与首帧衔接，后续段落保持主体外观、服装与光线一致；
-7. 台词口语化，没有台词的段落 dialogue 用空字符串；
-8. roles 只能使用用户给出的角色 role_id；只要该角色出现在画面里（含手部、背影等局部入镜）就必须写进 roles，确实无角色出场时才给空数组；
-9. ` + animalCastDirective + `
-10. 台词里的称呼、自称与比喻也要贴合动物主体，不要出现只有人类才成立的身份动作（如上班打卡、对着镜子化妆的手部特写）。`
+const scriptSystemPrompt = `【角色】你是中文短视频分镜编剧兼导演，擅长 15-60 秒口播与剧情短片。你的输出会被程序直接解析，不要 Markdown 代码块、不要任何解释。
 
-func (a *App) llmScript(ctx context.Context, provider Provider, cfg VideoRunConfig, tpl *VideoTemplateRun) (VideoScript, []string, error) {
-	roles := make([]string, 0, len(cfg.CharacterRefs))
-	for _, ref := range cfg.CharacterRefs {
-		label := fmt.Sprintf("%s(%s)", ref.RoleID, ref.Name)
-		// 用户亲自传了图的角色形象已经钉死，分镜不要再编外貌细节去和图对不上
-		if ref.ImageSource == CharacterImageSourceUser && len(ref.Images) > 0 {
-			label += "（形象以上传的定妆图为准）"
-		}
-		roles = append(roles, label)
-	}
-	firstFrame := "未提供"
-	if cfg.FirstFrame != "" {
-		firstFrame = cfg.FirstFrame
-	}
+【输出结构】
+{"logline":"一句话主题","shots":[{"id":"s1","durationS":6,"roles":["char_a"],"speaker":"char_a","sceneIntent":"画面意图","dialogue":"台词","camera":"运镜","mood":"情绪","audioCue":"环境音"}]}
+- id 从 s1 起顺序编号；durationS 为数字（秒）；roles 只能取用户给出的 role_id
+- speaker 是这句台词的说话人：填 roles 里的 role_id，或填 "narration" 表示旁白（画外音）；无台词时填空字符串
+- 不要输出 timeRange / language / source：时间轴与语言由系统计算
 
-	userPrompt := fmt.Sprintf(`主题：%s
-目标总时长：%d 秒
-语言：%s
-语速预算：%.1f %s/秒
-画幅：%s
-首帧：%s
-可出场角色：%s
-风格偏好：%s；运镜偏好：%s；情绪偏好：%s
-请按 system 中的 JSON 结构输出分镜。`,
-		cfg.Topic, cfg.DurationS, cfg.Language, cfg.SpeechRate,
-		unitName(cfg.Language), cfg.AspectRatio, firstFrame,
-		firstNonEmpty(strings.Join(roles, "、"), "无"),
-		firstNonEmpty(cfg.VideoParams.Style, "不限"),
-		firstNonEmpty(cfg.VideoParams.Camera, "不限"),
-		firstNonEmpty(cfg.VideoParams.Mood, "不限"),
-	)
-	// 模板只提供骨架：风格词表、角色外观锚点与开场钩子候选（§2 §3 §4）
-	if hints := templateScriptHints(tpl); hints != "" {
-		userPrompt += "\n" + hints
-	}
+【规划规则】
+1. 先定镜头数：总时长 ÷ 8 四舍五入，再限制在 2-8 个；镜头越短，一段里能发生的动作越少，别在 4 秒里塞完整故事；
+2. 单段时长 4-12 秒（渲染单段上限 15 秒，超过 12 秒的叙事请拆成两个镜头）；
+3. 各段 durationS 之和必须等于目标总时长；
+4. 第一段承担 3 秒钩子：开场直接抛冲突、悬念或反常识结论，不要寒暄、自我介绍、空镜铺垫；
+5. 相邻两段至少在景别、机位或动作方向上有一项不同，避免全片一个机位。
+
+【台词规则】
+6. 台词字数上限 =（段时长 - 0.3 秒）× 语速；宁可少写，不要靠压缩停顿蒙混；
+7. 单句不超 20 字，一段最多两句；口语短句，不用成语堆叠、括号说明、表情符号与书面语；
+8. 台词必须写清是谁在说：speaker 填该段的 role_id，画外解说填 "narration"（旁白），不允许空着或写“他/她/大家”；无台词段落 dialogue 与 speaker 都留空；台词里的称呼、自称与比喻要贴合动物主体，不要出现“上班打卡”“对着镜子化妆”这类只有人类才成立的身份动作。
+
+【画面意图规则】
+9. sceneIntent 只写看得见的东西：具体主体 + 可度量的动作 + 环境与光线；不写“字幕”“文字”“标题”“logo”等画面文字要求；
+10. camera / mood / audioCue 各用 2-8 字的具体描述（如“缓慢推近”“克制/期待”“雨声垫底”），不要“电影感”“高级”这类空词；
+11. 若提供首帧图，第一段必须与首帧衔接（同主体、同光线方向），后续段落保持主体外观、服装与光线一致；
+12. 角色只要入镜（含手部、背影等局部）就必须写进 roles，确实无角色出场时才给空数组。
+
+【硬性约束】
+13. ` + animalCastDirective + `；
+14. 用户给出的参数（时长、画幅、语言、语速、平台、垂类、风格/运镜/情绪、额外要求、负向约束）都是权威输入，不得改写；与上述规则冲突时，优先保证“不超时长与台词预算”；
+15. 额外要求必须落到具体画面或台词里，负向约束必须全片都不出现。
+
+【输出前自检】
+① 段数在 2-8 且 durationS 之和 = 总时长？② 每段 4-12 秒？
+③ 每段台词字数 ≤（时长-0.3）× 语速、单句 ≤ 20 字？④ roles 全部是给定 role_id？
+⑤ 没有画面文字要求？⑥ 第一段是钩子且衔接首帧？⑦ 没有真人或人类专属动作？
+⑧ 有台词的段落 speaker 都填了，并且是 role_id 或 "narration"？
+自检不合格就改到合格再输出。`
+
+func (a *App) llmScript(ctx context.Context, provider Provider, cfg VideoRunConfig, tpl *VideoTemplateRun, feedback string) (VideoScript, []string, error) {
+	userPrompt := buildScriptUserPrompt(cfg, tpl)
+	// 用户在分镜关卡敲的返工意见：不拼进去就等于没听见
+	userPrompt += feedbackDirective(feedback)
 
 	// 首帧作为多模态输入（文档 §5 的 B 类能力）：模型支持读图时能让分镜与首帧外观一致；
 	// 不支持读图的文本模型只是忽略图片块，仍按纯文本返回。
-	images := make([]string, 0, 1)
-	if strings.TrimSpace(cfg.FirstFrame) != "" {
-		images = append(images, cfg.FirstFrame)
-	}
+	images := firstFrameImages(cfg)
 
 	raw, imageWarnings, _, err := a.chatCompletionTraced(ctx, provider, scriptSystemPrompt, userPrompt, images)
 	if err != nil {
@@ -185,6 +174,216 @@ func (a *App) llmScript(ctx context.Context, provider Provider, cfg VideoRunConf
 	return script, imageWarnings, nil
 }
 
+/* ------------------------------------------------------------------
+   用户参数契约：用户在任务里填的每一项，都要真的进模型输入
+   否则“填了参数”跟“没填”对生成结果毫无区别。
+   ------------------------------------------------------------------ */
+
+// firstFrameImages 首帧图作为多模态输入（文档 §5 的 B 类能力）。
+func firstFrameImages(cfg VideoRunConfig) []string {
+	if strings.TrimSpace(cfg.FirstFrame) == "" {
+		return nil
+	}
+	return []string{cfg.FirstFrame}
+}
+
+// firstFrameHint 只说明首帧“有没有、起什么作用”，绝不把本地路径塞进模型输入：
+// 模型读不懂 C:\...\first.png，本地绝对路径也没有理由发给第三方。
+func firstFrameHint(cfg VideoRunConfig) string {
+	if strings.TrimSpace(cfg.FirstFrame) == "" {
+		return "无首帧（纯文生视频，第一段可自由构图）"
+	}
+	if cfg.strictFirstFrameEnabled() {
+		return "已提供首帧图（随消息附图）：第一段画面必须从这张图开始，主体与光线方向保持一致"
+	}
+	return "已提供首帧图（随消息附图，作画面起点参考，可与角色参考图同时使用）"
+}
+
+// continuationHint 段与段之间怎么接：尾帧续接时后一段的第一帧就是前一段最后画面。
+func continuationHint(cfg VideoRunConfig) string {
+	switch strings.ToLower(strings.TrimSpace(cfg.ContinuationMode)) {
+	case "overlap":
+		return "相邻段重叠过渡（后段开头接前段结尾画面）"
+	case "none":
+		return "不续接（每段独立构图）"
+	default:
+		return "尾帧续接（后段从上一段最后的画面继续，不要重复上一段已完成的动作）"
+	}
+}
+
+// audienceHint 发布平台/垂类/受众时区：它们决定钩子强度与节奏，
+// 只喂给 Agent4 等于创作阶段没用上，这里补进两段 Agent 的输入。
+func audienceHint(cfg VideoRunConfig) string {
+	parts := make([]string, 0, 3)
+	if len(cfg.Platforms) > 0 {
+		parts = append(parts, "主平台 "+platformProfile(primaryPlatform(cfg)).Label)
+	} else {
+		parts = append(parts, "平台未指定（按通用短视频节奏）")
+	}
+	if cfg.Vertical != "" {
+		parts = append(parts, "垂类 "+cfg.Vertical)
+	}
+	if strings.TrimSpace(cfg.Region) != "" {
+		parts = append(parts, "受众时区 "+cfg.Region)
+	}
+	return strings.Join(parts, "；")
+}
+
+// userParams 把用户填的每一项参数压成权威清单（两段 Agent 共用）。
+// 这是“参数真正参与生成”的唯一入口：没进这份清单的参数，模型压根不知道它存在。
+func userParams(cfg VideoRunConfig) []string {
+	lines := []string{
+		"主题：" + cfg.Topic,
+		fmt.Sprintf("目标总时长：%d 秒（各段时长之和必须等于它）", cfg.DurationS),
+		"画幅：" + cfg.AspectRatio,
+		fmt.Sprintf("语言：%s；语速预算：%.1f %s/秒", cfg.Language, cfg.SpeechRate, unitName(cfg.Language)),
+		"发布：" + audienceHint(cfg),
+		fmt.Sprintf("风格偏好：%s；运镜偏好：%s；情绪偏好：%s",
+			firstNonEmpty(cfg.VideoParams.Style, "不限"),
+			firstNonEmpty(cfg.VideoParams.Camera, "不限"),
+			firstNonEmpty(cfg.VideoParams.Mood, "不限")),
+		"首帧：" + firstFrameHint(cfg),
+		"续接方式：" + continuationHint(cfg),
+	}
+	if extra := strings.TrimSpace(cfg.VideoParams.ExtraPrompt); extra != "" {
+		lines = append(lines, "必须落实的额外要求："+extra)
+	}
+	if negative := strings.TrimSpace(cfg.VideoParams.NegativePrompt); negative != "" {
+		lines = append(lines, "必须全片避开的元素（用正面表述达成）："+negative)
+	}
+	if cfg.Subtitles {
+		lines = append(lines, "字幕：后期烧录，台词要能独立成句、便于按句断行")
+	}
+	return lines
+}
+
+// characterTable 角色表：role_id、名字、形象来源与外观锚点。
+// Agent2 只看得到 shots 里的 role_id 时写不出可辨识特征，四段会各画一只不同的猫。
+func characterTable(cfg VideoRunConfig, tpl *VideoTemplateRun) string {
+	if len(cfg.CharacterRefs) == 0 {
+		return "无固定角色（画面主体由分镜决定）"
+	}
+	lines := make([]string, 0, len(cfg.CharacterRefs))
+	for _, ref := range cfg.CharacterRefs {
+		line := fmt.Sprintf("- %s（%s）", ref.RoleID, firstNonEmpty(ref.Name, ref.RoleID))
+		switch {
+		case ref.ImageSource == CharacterImageSourceUser && len(ref.Images) > 0:
+			line += "｜形象：用户上传的定妆图（以此为准，不要另编外貌）"
+		case len(ref.Images) > 0:
+			line += "｜形象：模板定妆图"
+		default:
+			line += "｜形象：无图，只能靠文字描述"
+		}
+		// 模板角色的外观锚点已由 templateScriptHints 列出，这里只在模板没给时补
+		if tpl != nil {
+			if character := templateCharacterByRole(&tpl.VideoTemplate, ref.RoleID); character != nil && strings.TrimSpace(character.AppearanceBlock) != "" {
+				lines = append(lines, line)
+				continue
+			}
+		}
+		if strings.TrimSpace(ref.VoiceHint) != "" {
+			line += "｜声音：" + ref.VoiceHint
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// capabilityHint 让 Agent2 知道“这台机器能干什么”：能力不同，写法就该不同。
+func capabilityHint(caps VideoCapabilities) string {
+	parts := []string{fmt.Sprintf("单段时长 %s 秒（只能是整数秒）", durationRangeText(caps.AllowedDurations))}
+	if caps.CharacterReference {
+		parts = append(parts, "角色参考图：支持（形象交给图，文字只补图里没有的信息）")
+	} else {
+		parts = append(parts, "角色参考图：不支持（必须用 2 个静态外观锚点把形象写死）")
+	}
+	if caps.NativeAudio {
+		parts = append(parts, "原生音频：支持（台词会随提示词下发，画面不要另写配音指令）")
+	} else {
+		parts = append(parts, "原生音频：不支持（台词只走字幕与后期配音，画面里不要写说话或口型动作）")
+	}
+	return strings.Join(parts, "；")
+}
+
+func durationRangeText(allowed []int) string {
+	if len(allowed) == 0 {
+		allowed = defaultVideoCapabilities().AllowedDurations
+	}
+	return fmt.Sprintf("%d-%d", allowed[0], allowed[len(allowed)-1])
+}
+
+// userParamDigest 一行说明“本次生成真正带上了哪些用户参数”，写进阶段日志：
+// 参数有没有参与，用户应该能在日志里一眼验证，而不是靠猜。
+func userParamDigest(cfg VideoRunConfig) string {
+	parts := []string{
+		fmt.Sprintf("主题「%s」", truncateRunes(cfg.Topic, 16)),
+		fmt.Sprintf("时长 %ds", cfg.DurationS),
+		cfg.AspectRatio,
+		cfg.Language,
+		fmt.Sprintf("%.1f %s/秒", cfg.SpeechRate, unitName(cfg.Language)),
+	}
+	if len(cfg.Platforms) > 0 {
+		parts = append(parts, "平台 "+platformProfile(primaryPlatform(cfg)).Label)
+	}
+	if cfg.Vertical != "" {
+		parts = append(parts, "垂类 "+cfg.Vertical)
+	}
+	if cfg.Region != "" {
+		parts = append(parts, "受众 "+cfg.Region)
+	}
+	for _, item := range []struct{ label, value string }{
+		{"风格", cfg.VideoParams.Style},
+		{"运镜", cfg.VideoParams.Camera},
+		{"情绪", cfg.VideoParams.Mood},
+	} {
+		if strings.TrimSpace(item.value) != "" {
+			parts = append(parts, item.label+" "+truncateRunes(item.value, 12))
+		}
+	}
+	if cfg.FirstFrame != "" {
+		parts = append(parts, "首帧 有")
+	}
+	if len(cfg.CharacterRefs) > 0 {
+		parts = append(parts, fmt.Sprintf("角色 %d 个", len(cfg.CharacterRefs)))
+	}
+	if cfg.VideoParams.ExtraPrompt != "" {
+		parts = append(parts, "额外要求 有")
+	}
+	if cfg.VideoParams.NegativePrompt != "" {
+		parts = append(parts, "负向约束 有")
+	}
+	if cfg.Subtitles {
+		parts = append(parts, "烧录字幕")
+	}
+	return strings.Join(parts, "／")
+}
+
+// buildScriptUserPrompt Agent1 的完整输入：参数清单 + 角色表 + 模板骨架 + 首帧说明。
+func buildScriptUserPrompt(cfg VideoRunConfig, tpl *VideoTemplateRun) string {
+	lines := userParams(cfg)
+	lines = append(lines, "可出场角色：\n"+characterTable(cfg, tpl))
+	if hints := templateScriptHints(tpl); hints != "" {
+		lines = append(lines, hints)
+	}
+	lines = append(lines, "请按 system 中的 JSON 结构输出分镜。")
+	return strings.Join(lines, "\n")
+}
+
+// buildPromptUserPrompt Agent2 的完整输入：参数清单 + 模型能力 + 角色表 + 分镜 JSON。
+// Agent2 看到的必须和 Agent1、渲染层同一套参数，否则两段 Agent 各拧一股绳。
+func buildPromptUserPrompt(cfg VideoRunConfig, shotsJSON string, caps VideoCapabilities, tpl *VideoTemplateRun) string {
+	lines := userParams(cfg)
+	lines = append(lines, "本段模型能力："+capabilityHint(caps))
+	lines = append(lines, "角色表：\n"+characterTable(cfg, tpl))
+	if hints := templateScriptHints(tpl); hints != "" {
+		lines = append(lines, hints)
+	}
+	lines = append(lines,
+		"分镜（JSON，shotId 必须逐字复用）：\n"+shotsJSON,
+		"请为每个 shot 输出 visualPrompt 与原样 dialogue；单段 60-120 字，不要写否定句与画面文字要求。")
+	return strings.Join(lines, "\n")
+}
+
 func unitName(lang string) string {
 	if isEnglishLanguage(lang) {
 		return "词"
@@ -192,26 +391,58 @@ func unitName(lang string) string {
 	return "字"
 }
 
+// feedbackDirective 把人工返工意见拼进 Agent 的输入末尾。
+// 关卡上敲的意见必须真的进模型输入，否则“按意见重生成”只是拿同一份提示词重掷一次骰子；
+// 但意见不能凌驾结构与安全硬约束（JSON 格式、台词原样保留、动物主体），所以写成“冲突时仍守硬性约束”。
+func feedbackDirective(feedback string) string {
+	feedback = strings.TrimSpace(feedback)
+	if feedback == "" {
+		return ""
+	}
+	return "\n用户返工意见（本轮重生成必须逐条落实；与上面的硬性约束冲突时仍守硬性约束）：" + feedback
+}
+
+// feedbackDroppedWarning 降级到本地规则时没人读懂自然语言意见，必须明说“没生效”，
+// 不能让用户看到“已重新生成”就以为意见被采纳了。
+func feedbackDroppedWarning(feedback string) string {
+	if strings.TrimSpace(feedback) == "" {
+		return ""
+	}
+	return "本轮返工意见未生效：本地规则不能理解自然语言，请在「系统设置 - 提供商」登记文本模型后重生成"
+}
+
 // generateScript 先尝试文本模型，失败或未配置时降级为本地规则（设计文档 §9 的最小闭环思路）。
-func (a *App) generateScript(ctx context.Context, cfg VideoRunConfig, templates ...*VideoTemplateRun) (VideoScript, []string) {
+func (a *App) generateScript(ctx context.Context, cfg VideoRunConfig, feedback string, templates ...*VideoTemplateRun) (VideoScript, []string) {
 	tpl := firstTemplateRun(templates)
 	warnings := make([]string, 0, 2)
 	provider := a.pickTextProvider(cfg)
 	if provider.ID != "" {
-		script, llmWarnings, err := a.llmScript(ctx, provider, cfg, tpl)
+		script, llmWarnings, err := a.llmScript(ctx, provider, cfg, tpl, feedback)
 		warnings = append(warnings, llmWarnings...)
 		if err == nil {
 			normalized := normalizeScript(script, cfg, tpl)
 			if len(normalized.Shots) > 0 {
-				return normalized, warnings
+				bound, speakerWarnings := bindSpeakers(normalized, cfg)
+				return bound, append(warnings, speakerWarnings...)
 			}
 			err = errors.New("模型返回的分镜归一化后为空")
 		}
+		// 用户关掉本地兜底后不许偷偷降级：返回空分镜交给上层报错，别让他以为这是模型写的
+		if !cfg.localFallbackEnabled() {
+			return VideoScript{}, append(warnings, fmt.Sprintf("已关闭本地兜底：文本模型未产出可用分镜（%v）", err))
+		}
 		warnings = append(warnings, fmt.Sprintf("文本模型生成分镜失败，已回退本地规则：%v", err))
 	} else {
+		if !cfg.localFallbackEnabled() {
+			return VideoScript{}, append(warnings, "已关闭本地兜底：本任务需要文本模型产出分镜，请在「系统设置 - 提供商」登记后再试")
+		}
 		warnings = append(warnings, "未配置文本模型，已使用本地规则生成分镜（可在「系统设置 - 提供商」登记文本模型）")
 	}
-	return normalizeScript(localVideoScript(cfg, tpl), cfg, tpl), warnings
+	if warning := feedbackDroppedWarning(feedback); warning != "" {
+		warnings = append(warnings, warning)
+	}
+	bound, speakerWarnings := bindSpeakers(normalizeScript(localVideoScript(cfg, tpl), cfg, tpl), cfg)
+	return bound, append(warnings, speakerWarnings...)
 }
 
 // firstTemplateRun 取首个非空模板快照，便于保持旧调用点兼容。
@@ -256,6 +487,129 @@ func templateScopeLabel(scope string) string {
 	default:
 		return "个人模板"
 	}
+}
+
+// isNarrationSpeaker 模型可能把旁白写成 narration / 旁白 / 画外音 / VO，这里统一认出来。
+func isNarrationSpeaker(value string) bool {
+	key := normalizeRoleKey(value)
+	if key == "" {
+		return false
+	}
+	if key == "vo" {
+		return true
+	}
+	for _, alias := range []string{"narration", "voiceover", "旁白", "画外音", "解说"} {
+		if strings.Contains(key, alias) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchSpeakerRole 把说话人写法映回角色表：模型可能写 role_id、角色名，或“主理人（橘猫）”里的片段。
+func matchSpeakerRole(cfg VideoRunConfig, value string) (string, bool) {
+	key := normalizeRoleKey(value)
+	if key == "" {
+		return "", false
+	}
+	set := map[string]bool{key: true}
+	for _, ref := range cfg.CharacterRefs {
+		if roleMatches(set, ref) {
+			return ref.RoleID, true
+		}
+	}
+	return "", false
+}
+
+// normalizeSpeakerOrRaw 优先归一到 role_id；角色表里没有但这个值本身是合法标识时原样保留。
+func normalizeSpeakerOrRaw(cfg VideoRunConfig, role string) string {
+	if roleID, ok := matchSpeakerRole(cfg, role); ok {
+		return roleID
+	}
+	return strings.TrimSpace(role)
+}
+
+// normalizeSpeaker 把外部传来的台词归属（关卡编辑 / 模型回显）归一成 role_id 或 narration。
+func normalizeSpeaker(cfg VideoRunConfig, value string) string {
+	if isNarrationSpeaker(value) {
+		return VideoSpeakerNarration
+	}
+	if roleID, ok := matchSpeakerRole(cfg, value); ok {
+		return roleID
+	}
+	return ""
+}
+
+// promptMentionsSpeaker 画面提示词里有没有出现这个说话人：role_id、角色名，或名字的中文部分。
+// 名字常带括号说明（“主理人（橘猫）”），逐段写全名不自然，所以允许只写前半段。
+func promptMentionsSpeaker(visual string, cfg VideoRunConfig, speaker string) bool {
+	if strings.TrimSpace(speaker) == "" {
+		return false
+	}
+	if strings.Contains(visual, speaker) {
+		return true
+	}
+	for _, ref := range cfg.CharacterRefs {
+		if ref.RoleID != speaker {
+			continue
+		}
+		name := strings.TrimSpace(ref.Name)
+		if name == "" {
+			return false
+		}
+		if strings.Contains(visual, name) {
+			return true
+		}
+		if idx := strings.IndexAny(name, "（("); idx > 0 {
+			return strings.Contains(visual, strings.TrimSpace(name[:idx]))
+		}
+		return false
+	}
+	return false
+}
+
+// bindSpeakers 给每段有台词的镜头钉上“谁在说”：角色台词必须是角色表里的 role_id，
+// 画外解说落到 narration。台词归属不定，渲染层就不知道该给谁拍口型，字幕与配音也会含糊。
+// 模型没写时先看本段是否只有一个出场角色，再看是不是旁白；猜不准就按旁白处理并明说原因，
+// 不静默替用户选一个“大概是他”。
+func bindSpeakers(script VideoScript, cfg VideoRunConfig) (VideoScript, []string) {
+	warnings := make([]string, 0, 2)
+	shots := make([]VideoShot, len(script.Shots))
+	for i, shot := range script.Shots {
+		raw := strings.TrimSpace(shot.Speaker)
+		shot.Speaker = ""
+		if shot.Dialogue == "" {
+			// 没台词就没有说话人：留着归属只会让渲染层去拍一张不存在的嘴
+			shots[i] = shot
+			continue
+		}
+		switch {
+		case raw != "" && isNarrationSpeaker(raw):
+			shot.Speaker = VideoSpeakerNarration
+		case raw != "":
+			if roleID, ok := matchSpeakerRole(cfg, raw); ok {
+				shot.Speaker = roleID
+			} else if len(shot.Roles) == 1 {
+				// 写了个角色表里没有的名字，但本段只出现一个角色：大概率就是他
+				shot.Speaker = normalizeSpeakerOrRaw(cfg, shot.Roles[0])
+				warnings = append(warnings, fmt.Sprintf("%s 的说话人「%s」不在角色表里，已按本段唯一出场角色「%s」处理", shot.ID, raw, shot.Speaker))
+			} else {
+				shot.Speaker = VideoSpeakerNarration
+				warnings = append(warnings, fmt.Sprintf("%s 的说话人「%s」不在角色表里，已按旁白（画外音）处理", shot.ID, raw))
+			}
+		case len(shot.Roles) == 1:
+			shot.Speaker = normalizeSpeakerOrRaw(cfg, shot.Roles[0])
+		case len(shot.Roles) == 0:
+			// 画里没人，台词只能是画外音
+			shot.Speaker = VideoSpeakerNarration
+		default:
+			shot.Speaker = VideoSpeakerNarration
+			warnings = append(warnings, fmt.Sprintf("%s 有台词但没写说话人，本段出现多个角色，已按旁白（画外音）处理；可在逐段确认里改成某个角色说话", shot.ID))
+		}
+		shots[i] = shot
+	}
+	script.Shots = shots
+	return script, warnings
 }
 
 // normalizeScript 把任意来源的分镜整理成"时长之和等于总时长、时间轴连续"的稳定结构。
@@ -352,6 +706,12 @@ func localVideoScript(cfg VideoRunConfig, templates ...*VideoTemplateRun) VideoS
 	for _, ref := range cfg.CharacterRefs {
 		roles = append(roles, ref.RoleID)
 	}
+	// 本地模式的台词取自主题短语，不带任何说话人信息：一个角色就当他说的，
+	// 多个角色（无人可归）一律按旁白——虽然短，但总比让下游猜“谁在说”强。
+	localSpeaker := VideoSpeakerNarration
+	if len(roles) == 1 {
+		localSpeaker = roles[0]
+	}
 
 	shots := make([]VideoShot, 0, shotCount)
 	per := float64(cfg.DurationS) / float64(shotCount)
@@ -377,6 +737,7 @@ func localVideoScript(cfg VideoRunConfig, templates ...*VideoTemplateRun) VideoS
 			Roles:       append([]string{}, roles...),
 			SceneIntent: sceneIntent,
 			Dialogue:    dialogue,
+			Speaker:     localSpeaker,
 			Camera:      camera,
 			Mood:        mood,
 			AudioCue:    "环境音垫底，保持整体氛围连续",
@@ -422,45 +783,52 @@ func trimDialogueToBudget(text string, duration, rate float64, lang string) stri
 	return strings.TrimSpace(string(runes[:clampInt(budget, 1, len(runes))]))
 }
 
-const promptSystemPrompt = `你是图像生视频（i2v）与文生视频的提示词工程师。把分镜展开为可直接给视频模型执行的画面提示词，并原样保留台词。
-只输出 JSON：{"prompts":[{"shotId":"s1","visualPrompt":"...","dialogue":"..."}]}
-提示词写法（槽位顺序固定）：
-[镜头/景别+运动] + [主体及其可辨识特征] + [物理可度量的动作] + [环境/道具/时间天气] + [光线方向/质感/色调] + [风格与氛围]
-硬性约束：
-1. 第一句写镜头（景别、角度、运动、速度），并锁定画幅；
-2. 主体用具体特征（服装/发型/年龄/材质），禁止“美女/帅哥”这类空词；
-3. 动作写成物理量（重心、步伐、接触面），禁止“很美地走动”这类描述；
-4. 禁止空洞标签（cinematic、8K、高级感、masterpiece）；
-5. 只描述“从首帧开始发生的变化”，不要重复描述首帧已有内容；
-6. 每段只允许一个连续动作，不要出现 then/然后/接着 导致的段内切镜；
-7. 画面内不要出现任何文字、字幕、水印、logo 或 UI 元素，也不要要求模型生成文字；
-8. 相邻分镜的景别或运动至少一项不同，避免全片一个机位；
-9. 台词必须原样返回，不要改写、翻译或添加旁白标记；
-10. ` + animalCastDirective + `。`
+const promptSystemPrompt = `【角色】你是图像生视频（i2v）与文生视频的提示词工程师。分镜结构与台词已经定稿：你只决定“画面怎么写”，不改剧情、不改台词、不改段数。你的输出会被程序直接解析，不要 Markdown 代码块、不要解释。
 
-func (a *App) llmPrompts(ctx context.Context, provider Provider, cfg VideoRunConfig, script VideoScript, tpl *VideoTemplateRun) (map[string]VideoPromptEdit, error) {
+【输出结构】
+{"prompts":[{"shotId":"s1","visualPrompt":"...","dialogue":"...","speaker":"char_a"}]}
+- shotId 必须与输入分镜的 id 逐字一致（写成别的值会导致该段被系统丢弃）
+- 每段都要输出，条数必须等于输入分镜数
+- dialogue 原样返回，不要翻译、改写或加旁白标记；台词偏长由系统提示，不由你压缩
+- speaker 原样返回输入里该分镜的归属（role_id 或 "narration"），不要改归属、也不要新增说话人
+
+【单段写法】按槽位一次写完，总长 60-120 字：
+[镜头/景别+运动] + [主体：角色名 + 1 个可辨识特征] + [一个可度量的动作] + [场景与锚点物件] + [光位/色温] + [风格氛围]
+
+【台词归属必须落到画面】
+- speaker 是角色的分段：说话人必须在画面里（正面或侧脸），口型、神态跟着台词走，镜头对向说话人；不要让他背对镜头念台词；
+- speaker 是 "narration" 的分段：不安排任何主体对口型，用空镜、环境细节或主体反应镜头承载画外音；
+- 同一段只允许一个主体说话；
+- 这一节是硬约束：画面里找不到说话人，台词就会变成“画外飘音”，配音与口型对不上。
+
+【写法规则】
+1. 第一句写镜头（景别、角度、运动、速度）；
+2. 主体用具体特征；禁止“美女/帅哥/一个人”这类空词，也禁止 cinematic、8K、高级感、masterpiece 这类空洞标签；
+3. 动作写成物理量（重心、步伐、接触面）；一段只允许一个连续动作，不要 then/然后/接着 造成的段内切镜；
+4. 只写画面里发生的变化；不要复述角色整段外观与服装（下游会统一追加外观锚点，重复写只会稀释动作指令）；
+5. 不要写“不出现文字/水印/logo”这类否定句：本模型按正向描述理解画面，直接写“画面只有角色与实物道具”即可；
+6. 相邻分镜的景别或运动至少一项不同；
+7. 段落分工：第一段从首帧图开始，只写之后发生的变化；第二段起接续上一段结尾画面，不重复上一段已完成的动作；
+8. 用户给的画幅、风格、运镜、情绪、额外要求、负向约束都是权威输入，必须体现；负向约束改写成正面表述（“保持 X”而不是“不要 Y”）；
+9. ` + animalCastDirective + `。
+
+【输出前自检】
+① 条数等于输入分镜数、shotId 全部逐字命中？② 每段 60-120 字、只有一个连续动作？
+③ 没有否定句与空洞标签？④ 台词逐字未改？⑤ 相邻段景别或运动有变化？
+⑥ 有台词的段落都拍到了说话人，或者明确按旁白处理？
+自检不合格就改到合格再输出。`
+
+func (a *App) llmPrompts(ctx context.Context, provider Provider, cfg VideoRunConfig, script VideoScript, caps VideoCapabilities, tpl *VideoTemplateRun, feedback string) (map[string]VideoPromptEdit, error) {
 	shotsJSON, err := json.Marshal(script.Shots)
 	if err != nil {
 		return nil, err
 	}
-	userPrompt := fmt.Sprintf(`主题：%s
-画幅：%s；语言：%s；风格：%s；运镜：%s；情绪：%s
-总时长：%d 秒；语速预算：%.1f %s/秒（台词偏长时只提示，不要改写台词）
-分镜（JSON）：
-%s
-请为每个 shot 输出 visualPrompt 与 dialogue；visualPrompt 中不得出现任何画面文字要求。`,
-		cfg.Topic, cfg.AspectRatio, cfg.Language,
-		firstNonEmpty(cfg.VideoParams.Style, "不限"),
-		firstNonEmpty(cfg.VideoParams.Camera, "不限"),
-		firstNonEmpty(cfg.VideoParams.Mood, "不限"),
-		cfg.DurationS, cfg.SpeechRate, unitName(cfg.Language),
-		string(shotsJSON),
-	)
-	if hints := templateScriptHints(tpl); hints != "" {
-		userPrompt += "\n" + hints
-	}
+	userPrompt := buildPromptUserPrompt(cfg, string(shotsJSON), caps, tpl)
+	// 提示词关卡上敲的意见（“整体偏冷调”“主体动作更克制”）只能在这里交给模型
+	userPrompt += feedbackDirective(feedback)
 
-	raw, err := a.chatCompletion(ctx, provider, promptSystemPrompt, userPrompt)
+	// 首帧图也给 Agent2：它要写“相对首帧的变化”，不能凭空想象首帧长什么样
+	raw, err := a.chatCompletionWithImages(ctx, provider, promptSystemPrompt, userPrompt, firstFrameImages(cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -484,21 +852,49 @@ func (a *App) llmPrompts(ctx context.Context, provider Provider, cfg VideoRunCon
 }
 
 // generatePrompts 逐段展开提示词并做"字数 → 秒数"预算校验（§4.2）。
-func (a *App) generatePrompts(ctx context.Context, cfg VideoRunConfig, script VideoScript, caps VideoCapabilities, templates ...*VideoTemplateRun) ([]VideoPromptItem, []string) {
+func (a *App) generatePrompts(ctx context.Context, cfg VideoRunConfig, script VideoScript, caps VideoCapabilities, feedback string, templates ...*VideoTemplateRun) ([]VideoPromptItem, []string) {
 	tpl := firstTemplateRun(templates)
 	warnings := make([]string, 0, 2)
 	visuals := map[string]VideoPromptEdit{}
 
+	// 关①确认后分镜可能被用户改过台词，也可能来自旧任务（当时还没有台词归属）：
+	// 进模型前再钉一次，保证每句台词都有确定归宿。
+	script, speakerWarnings := bindSpeakers(script, cfg)
+	warnings = append(warnings, speakerWarnings...)
+
 	provider := a.pickTextProvider(cfg)
 	if provider.ID != "" {
-		items, err := a.llmPrompts(ctx, provider, cfg, script, tpl)
+		items, err := a.llmPrompts(ctx, provider, cfg, script, caps, tpl, feedback)
 		if err == nil {
 			visuals = items
+		} else if !cfg.localFallbackEnabled() {
+			return nil, append(warnings, fmt.Sprintf("已关闭本地兜底：文本模型展开提示词失败（%v）", err))
 		} else {
 			warnings = append(warnings, fmt.Sprintf("文本模型展开提示词失败，已回退本地模板：%v", err))
 		}
+	} else if !cfg.localFallbackEnabled() {
+		return nil, append(warnings, "已关闭本地兜底：本任务需要文本模型展开提示词，请在「系统设置 - 提供商」登记后再试")
 	} else {
 		warnings = append(warnings, "未配置文本模型，提示词由本地模板生成")
+	}
+	// 模型漏段或写错 shotId 时，那几段会退回本地模板：必须说出来，
+	// 否则用户以为整片提示词都是 AI 写的，实际是半自动拼接。
+	if len(visuals) > 0 && len(visuals) < len(script.Shots) {
+		missing := make([]string, 0, len(script.Shots)-len(visuals))
+		for _, shot := range script.Shots {
+			if _, ok := visuals[shot.ID]; !ok {
+				missing = append(missing, shot.ID)
+			}
+		}
+		if len(missing) > 0 {
+			warnings = append(warnings, fmt.Sprintf("提示词只覆盖 %d/%d 段：%s 已改用本地模板（模型漏写或 shotId 不一致）",
+				len(visuals), len(script.Shots), strings.Join(missing, "、")))
+		}
+	}
+	if len(visuals) == 0 {
+		if warning := feedbackDroppedWarning(feedback); warning != "" {
+			warnings = append(warnings, warning)
+		}
 	}
 	if tpl != nil && len(tpl.Characters) > 0 && !caps.CharacterReference {
 		warnings = append(warnings, "当前模型不支持主体参考图：已用模板的外观描述块做文本降级，跨段一致性依赖文字锚点")
@@ -527,6 +923,20 @@ func (a *App) generatePrompts(ctx context.Context, cfg VideoRunConfig, script Vi
 		// 动物主体约束钉在末尾：即使文本模型漏写、或模板角色写成了真人，也能在最后一刻纠偏
 		visual = appendCastDirective(visual)
 
+		// 台词归属以分镜为准（模型只负责把它写进画面）：说话人写错了不会丢台词，但会直接让口型对不上嘴。
+		speaker := shot.Speaker
+		if speaker == "" && dialogue != "" {
+			speaker = normalizeSpeaker(cfg, visuals[shot.ID].Speaker)
+		}
+		if dialogue == "" {
+			speaker = ""
+		}
+		// 说好是角色在讲，画面提示词里却找不到他：配音出声、画面里无人对嘴
+		if speaker != "" && speaker != VideoSpeakerNarration && !promptMentionsSpeaker(visual, cfg, speaker) {
+			warnings = append(warnings, fmt.Sprintf("%s 的台词属于「%s」，但画面提示词没提到这个角色，渲染时可能找不到对口型的说话人",
+				shot.ID, speakerLabel(cfg, speaker)))
+		}
+
 		duration := shot.DurationS
 		if duration <= 0 {
 			duration = shot.TimeRange[1] - shot.TimeRange[0]
@@ -543,6 +953,7 @@ func (a *App) generatePrompts(ctx context.Context, cfg VideoRunConfig, script Vi
 			ShotID:          shot.ID,
 			VisualPrompt:    visual,
 			Dialogue:        dialogue,
+			Speaker:         speaker,
 			Start:           shot.TimeRange[0],
 			End:             shot.TimeRange[1],
 			CharCount:       charCount,
@@ -573,7 +984,8 @@ func localVisualPrompt(cfg VideoRunConfig, shot VideoShot) string {
 	parts = append(parts, "氛围："+firstNonEmpty(shot.Mood, "自然"))
 	parts = append(parts, "风格："+firstNonEmpty(cfg.VideoParams.Style, "写实电影感"))
 	parts = append(parts, "只描述从首帧开始发生的连续运动，保持主体、光线与色彩一致")
-	parts = append(parts, "画面内不出现任何文字、字幕、水印与 logo")
+	// 正向表述：画面文字是模型的常见幻觉，但“不要文字”这种否定句会被模型当成要写文字
+	parts = append(parts, "画面只保留角色与实物道具，字幕在后期单独叠加")
 	return strings.Join(parts, "；")
 }
 
@@ -646,15 +1058,15 @@ func applyTemplatePromptExtras(visual string, shot VideoShot, caps VideoCapabili
 
 const segmentPromptSuggestSystemPrompt = `你是图像生视频（i2v）与文生视频的提示词工程师。用户对某一已生成片段不满意，需要你重写一段更能达成意图的画面提示词。
 只输出新的提示词正文，不要解释、引号、JSON 或 Markdown。
-硬性约束：
-1. 槽位顺序固定：[镜头/景别+运动] + [主体及其可辨识特征] + [物理可度量的动作] + [环境/道具/时间天气] + [光线方向/质感/色调] + [风格与氛围]；
-2. 第一句写镜头（景别、角度、运动、速度），并锁定画幅；
-3. 只描述“从首帧开始发生的变化”，不要重复首帧已有内容；
-4. 每段只允许一个连续动作，禁止 then/然后/接着 导致段内切镜；
-5. 画面内不得出现任何文字、字幕、水印、logo 或 UI 元素；
-6. 禁止空洞标签（cinematic、8K、高级感、masterpiece）；
-7. 针对用户给出不满点做定向重写，其余意图保持稳定；
-8. ` + animalCastDirective + `。`
+【写法】按槽位一次写完，总长 60-120 字：
+[镜头/景别+运动] + [主体：角色名 + 1 个可辨识特征] + [一个可度量的动作] + [场景与锚点物件] + [光位/色温] + [风格氛围]
+【硬性约束】
+1. 第一句写镜头（景别、角度、运动、速度）；
+2. 只写画面里发生的变化；一段只允许一个连续动作，不要 then/然后/接着 造成的段内切镜；
+3. 用正向描述，不写否定句（“保持 X”而不是“不要 Y”）；画面文字由后期叠加，提示词里不提；
+4. 禁止空洞标签（cinematic、8K、高级感、masterpiece）；
+5. 针对用户的不满点做定向重写，其余意图保持稳定；
+6. ` + animalCastDirective + `。`
 
 // SuggestSegmentPrompt 结合用户反馈重写单段画面提示词：逐段确认关卡里的 AI 辅助。
 func (a *App) SuggestSegmentPrompt(taskID, segmentID, feedback string) (string, error) {

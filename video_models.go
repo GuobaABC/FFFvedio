@@ -121,12 +121,23 @@ func (cfg VideoRunConfig) segmentReviewEnabled() bool {
 	return cfg.SegmentReview == nil || *cfg.SegmentReview
 }
 
+// localFallbackEnabled 本地兜底默认开启；用户显式关掉后，没有文本模型就直接失败，
+// 不再拿本地模板顶替——参数写了“不要兜底”就得真的不兜底。
+func (cfg VideoRunConfig) localFallbackEnabled() bool {
+	return cfg.LocalFallback == nil || *cfg.LocalFallback
+}
+
 // strictFirstFrameEnabled 严格首帧默认开启：用户既然给了首帧/尾帧，新视频就得从这张画面起。
 // 关掉它才会让首帧图与角色参考图一起走方舟「全模态参考」（官方两类任务互斥，
 // 参考模式下锁帧只能靠提示词里的「图片1 是本段首帧画面」这种软约定）。
 func (cfg VideoRunConfig) strictFirstFrameEnabled() bool {
 	return cfg.StrictFirstFrame == nil || *cfg.StrictFirstFrame
 }
+
+// VideoSpeakerNarration 旁白（画外音）：台词由镜头外的解说承担，画面里不需要有人对口型。
+// 除它以外，说话人必须是角色表里的 role_id——“谁在说”必须有确定归宿，
+// 否则渲染层不知道给谁拍口型、字幕与配音也会含糊。
+const VideoSpeakerNarration = "narration"
 
 // VideoShot Agent1 的分镜数组元素。
 type VideoShot struct {
@@ -135,10 +146,12 @@ type VideoShot struct {
 	Roles       []string   `json:"roles"`
 	SceneIntent string     `json:"sceneIntent"`
 	Dialogue    string     `json:"dialogue"`
-	Camera      string     `json:"camera"`
-	Mood        string     `json:"mood"`
-	AudioCue    string     `json:"audioCue"`
-	DurationS   float64    `json:"durationS"`
+	// Speaker 这句台词谁说：role_id，或 VideoSpeakerNarration 表示旁白；无台词时为空
+	Speaker   string  `json:"speaker"`
+	Camera    string  `json:"camera"`
+	Mood      string  `json:"mood"`
+	AudioCue  string  `json:"audioCue"`
+	DurationS float64 `json:"durationS"`
 }
 
 // VideoScript Agent1 输出契约。
@@ -154,6 +167,7 @@ type VideoPromptItem struct {
 	ShotID          string  `json:"shotId"`
 	VisualPrompt    string  `json:"visualPrompt"`
 	Dialogue        string  `json:"dialogue"`
+	Speaker         string  `json:"speaker"` // 台词归属：role_id 或 VideoSpeakerNarration
 	Start           float64 `json:"start"`
 	End             float64 `json:"end"`
 	CharCount       int     `json:"charCount"`
@@ -165,14 +179,17 @@ type VideoPromptItem struct {
 
 // VideoSegment 渲染段：分镜按模型时长档位切分后的最小生成单元。
 type VideoSegment struct {
-	ID        string  `json:"id"`
-	ShotID    string  `json:"shotId"`
-	Index     int     `json:"index"`
-	Prompt    string  `json:"prompt"`
-	Dialogue  string  `json:"dialogue"`
-	Start     float64 `json:"start"`
-	End       float64 `json:"end"`
-	DurationS int     `json:"durationS"`
+	ID       string `json:"id"`
+	ShotID   string `json:"shotId"`
+	Index    int    `json:"index"`
+	Prompt   string `json:"prompt"`
+	Dialogue string `json:"dialogue"`
+	// Speaker 台词归属（role_id / narration）；SpeakerName 是写进提示词的显示名（旁白 / 角色名）
+	Speaker     string  `json:"speaker"`
+	SpeakerName string  `json:"speakerName"`
+	Start       float64 `json:"start"`
+	End         float64 `json:"end"`
+	DurationS   int     `json:"durationS"`
 }
 
 // VideoPlan 成本/拼接计划（确认门②前展示段数×单价 + 串行/并行）。
@@ -308,6 +325,7 @@ type VideoPromptEdit struct {
 	ShotID       string `json:"shotId"`
 	VisualPrompt string `json:"visualPrompt"`
 	Dialogue     string `json:"dialogue"`
+	Speaker      string `json:"speaker"` // 留空表示不改台词归属
 }
 
 // VideoGateEdits 确认关卡提交的局部修改；按阶段决定生效分支。
@@ -707,6 +725,18 @@ func splitShotDurations(duration float64, allowed []int, maxClip float64) []int 
 	return out
 }
 
+// speakerLabel 把台词归属翻译成提示词里能读的名字：旁白就叫旁白，角色用角色名。
+func speakerLabel(cfg VideoRunConfig, speaker string) string {
+	speaker = strings.TrimSpace(speaker)
+	switch speaker {
+	case "":
+		return ""
+	case VideoSpeakerNarration:
+		return "旁白"
+	}
+	return firstNonEmpty(characterDisplayName(cfg, speaker), speaker)
+}
+
 // buildVideoPlan 依据分镜提示词与适配器能力生成拼接/成本计划。
 func buildVideoPlan(cfg VideoRunConfig, prompts []VideoPromptItem, caps VideoCapabilities, adapterID string) VideoPlan {
 	plan := VideoPlan{Adapter: adapterID, Segments: make([]VideoSegment, 0, len(prompts))}
@@ -742,6 +772,9 @@ func buildVideoPlan(cfg VideoRunConfig, prompts []VideoPromptItem, caps VideoCap
 			}
 			if index == 0 {
 				segment.Dialogue = item.Dialogue
+				// 台词只在首段下发，归属跟着一起下：下游才能决定是给谁拍口型，还是按旁白处理
+				segment.Speaker = item.Speaker
+				segment.SpeakerName = speakerLabel(cfg, item.Speaker)
 			}
 			plan.Segments = append(plan.Segments, segment)
 			cursor += float64(part)

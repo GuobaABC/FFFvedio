@@ -64,6 +64,7 @@ function syncDrafts() {
     shotId: item.shotId,
     visualPrompt: item.visualPrompt,
     dialogue: item.dialogue,
+    speaker: item.speaker ?? '',
   }))
 
   const meta = props.task.run?.publishMeta ?? null
@@ -76,6 +77,27 @@ function syncDrafts() {
 }
 
 watch(() => `${props.task.id}:${props.task.updatedAt}`, syncDrafts, { immediate: true })
+
+/** 台词归属可选值：旁白 + 任务里的角色表；空值表示交给后端按出场角色推断 */
+const speakerOptions = computed(() => {
+  const options = [
+    { value: '', label: '自动（本段唯一角色→他，否则旁白）' },
+    { value: 'narration', label: '旁白（画外音）' },
+  ]
+  for (const ref of props.task.config?.characterRefs ?? []) {
+    if (!ref.roleId) continue
+    options.push({ value: ref.roleId, label: ref.name || ref.roleId })
+  }
+  return options
+})
+
+/** 把归属值翻译成人看得懂的名字：说话人写错时，用户要能一眼发现 */
+function speakerLabelOf(speaker?: string): string {
+  if (!speaker) return '归属待定'
+  if (speaker === 'narration') return '旁白'
+  const ref = (props.task.config?.characterRefs ?? []).find((item) => item.roleId === speaker)
+  return ref?.name || speaker
+}
 
 const run = computed(() => props.task.run)
 const config = computed(() => props.task.config)
@@ -560,6 +582,7 @@ function revealOutput() {
           <span class="ui-chip" :class="shotBudget(shot).fits ? 'ui-chip--ok' : 'ui-chip--error'">
             台词 ≈ {{ shotBudget(shot).seconds }}s / {{ formatSeconds(shotBudget(shot).window) }}
           </span>
+          <span class="ui-chip">{{ speakerLabelOf(shot.speaker) }}</span>
         </header>
         <div class="grid grid--2">
           <label class="ui-field">
@@ -569,6 +592,11 @@ function revealOutput() {
           <label class="ui-field">
             <span class="ui-label">台词（语速预算内）</span>
             <textarea v-model="shot.dialogue" class="ui-textarea" rows="2" :disabled="!canEditShots"></textarea>
+            <select v-model="shot.speaker" class="ui-input" :disabled="!canEditShots || !shot.dialogue.trim()">
+              <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
+                {{ option.label }}
+              </option>
+            </select>
           </label>
           <label class="ui-field">
             <span class="ui-label">角色（顿号 / 逗号分隔）</span>
@@ -653,6 +681,7 @@ function revealOutput() {
       <div v-for="(prompt, index) in promptDrafts" :key="prompt.shotId || index" class="prompt">
         <header class="prompt__head">
           <span class="shot__name">{{ prompt.shotId }}</span>
+          <span class="ui-chip">{{ speakerLabelOf(prompt.speaker) }}</span>
           <span v-if="promptNote(prompt.shotId)" class="ui-chip ui-chip--error">{{ promptNote(prompt.shotId) }}</span>
         </header>
         <label class="ui-field">
@@ -667,6 +696,14 @@ function revealOutput() {
         <label class="ui-field">
           <span class="ui-label">台词</span>
           <textarea v-model="prompt.dialogue" class="ui-textarea" rows="2" :disabled="!canEditPrompts"></textarea>
+        </label>
+        <label class="ui-field">
+          <span class="ui-label">台词归属（决定镜头要不要给到说话人）</span>
+          <select v-model="prompt.speaker" class="ui-input" :disabled="!canEditPrompts || !prompt.dialogue.trim()">
+            <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
+              {{ option.label }}
+            </option>
+          </select>
         </label>
       </div>
 

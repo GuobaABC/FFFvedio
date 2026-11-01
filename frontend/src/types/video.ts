@@ -88,6 +88,8 @@ export interface VideoShot {
   roles: string[]
   sceneIntent: string
   dialogue: string
+  /** 台词归属：roleId，或 narration 表示旁白（画外音）；无台词时为空 */
+  speaker?: string
   camera: string
   mood: string
   audioCue: string
@@ -105,6 +107,8 @@ export interface VideoPromptItem {
   shotId: string
   visualPrompt: string
   dialogue: string
+  /** 台词归属：roleId 或 narration（旁白） */
+  speaker?: string
   start: number
   end: number
   charCount: number
@@ -120,6 +124,9 @@ export interface VideoSegment {
   index: number
   prompt: string
   dialogue: string
+  /** 台词归属（roleId / narration）与写进提示词的显示名 */
+  speaker?: string
+  speakerName?: string
   start: number
   end: number
   durationS: number
@@ -226,6 +233,8 @@ export interface VideoPromptEdit {
   shotId: string
   visualPrompt: string
   dialogue: string
+  /** 台词归属：roleId 或 narration；留空表示不改 */
+  speaker?: string
 }
 
 export interface VideoGateEdits {

@@ -358,10 +358,19 @@ func (a *App) GetVideoEnvironment() VideoEnvironment {
 
 // composeRenderPrompt 按厂商提示词风格拼装最终提示词。
 // 只有原生音频模型才把台词写进提示词（无音频模型会出现"画面写字"的副作用）。
+// 台词必须带说话人：角色说话要让模型把口型给到该角色，旁白则明确不安排人对口型。
 func composeRenderPrompt(segment VideoSegment, caps VideoCapabilities) string {
 	prompt := strings.TrimSpace(segment.Prompt)
-	if caps.NativeAudio && strings.TrimSpace(segment.Dialogue) != "" {
-		prompt += fmt.Sprintf("\n口播台词（只允许一个主体说话，保持口型在画面内）：“%s”", strings.TrimSpace(segment.Dialogue))
+	dialogue := strings.TrimSpace(segment.Dialogue)
+	if caps.NativeAudio && dialogue != "" {
+		speaker := strings.TrimSpace(segment.Speaker)
+		switch {
+		case speaker == "" || speaker == VideoSpeakerNarration:
+			prompt += fmt.Sprintf("\n旁白（画外音，说话人不在画面内，画面里不出现对口型的动作）：“%s”", dialogue)
+		default:
+			name := firstNonEmpty(strings.TrimSpace(segment.SpeakerName), speaker)
+			prompt += fmt.Sprintf("\n%s 说（只允许这一个主体说话，面部与口型在画面内）：“%s”", name, dialogue)
+		}
 	}
 	if caps.PromptStyle == "veo" {
 		prompt += "\n限制：单镜头、不切镜，动作连续，保持主体与产品外观一致。"

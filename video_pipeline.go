@@ -452,6 +452,13 @@ func applyPromptEdits(prompts []VideoPromptItem, edits []VideoPromptEdit, cfg Vi
 		}
 		prompts[i].VisualPrompt = appendCastDirective(strings.TrimSpace(edit.VisualPrompt))
 		prompts[i].Dialogue = strings.TrimSpace(edit.Dialogue)
+		// 台词归属：关卡里改了就按关卡，没改就保留原归属；台词被清空则归属也清空
+		if speaker := strings.TrimSpace(edit.Speaker); speaker != "" {
+			prompts[i].Speaker = firstNonEmpty(normalizeSpeaker(cfg, speaker), speaker)
+		}
+		if prompts[i].Dialogue == "" {
+			prompts[i].Speaker = ""
+		}
 		prompts[i].CharCount = speechUnitCount(prompts[i].Dialogue, cfg.Language)
 		prompts[i].EstSpeechS = estimateSpeechSeconds(prompts[i].Dialogue, cfg.Language, cfg.SpeechRate)
 		duration := prompts[i].End - prompts[i].Start
@@ -468,6 +475,8 @@ type videoRunner struct {
 	app  *App
 	task *VideoTask
 	ctx  context.Context
+	// feedbackStage 本轮返工意见归属的阶段：只有用户按下「重生成」的那个阶段才能消费它
+	feedbackStage string
 }
 
 func stageLog(message string) string {
@@ -495,6 +504,22 @@ func (r *videoRunner) warn(format string, args ...any) {
 // usageCtx 给本阶段的模型调用标上用途与任务身份，首页大屏才能把消耗拆到「分镜/提示词/渲染」上。
 func (r *videoRunner) usageCtx(purpose string) context.Context {
 	return withUsage(r.ctx, purpose, r.task.ID)
+}
+
+// consumeFeedback 取走本轮人工返工意见并清空：不拼进模型输入的话，“按意见重生成”只是拿同一份提示词重掷一次骰子。
+// 只让意见归属的那个阶段读到它：渲染阶段顺带预生成发布元数据时，
+// 针对画面的意见不该被 Agent4 拿去改标题。
+func (r *videoRunner) consumeFeedback(stage string) string {
+	if r.feedbackStage != stage {
+		return ""
+	}
+	feedback := strings.TrimSpace(r.task.Run.Feedback)
+	if feedback == "" {
+		return ""
+	}
+	r.task.Run.Feedback = ""
+	r.logf("本轮按人工返工意见重出：%s", truncateRunes(feedback, 80))
+	return feedback
 }
 
 func (r *videoRunner) save() error {
@@ -532,7 +557,7 @@ func (a *App) runVideoPipeline(id, from, feedback string) {
 		task.Run.Gates[VideoGatePrompt] = videoGateApproved
 	}
 
-	runner := &videoRunner{app: a, task: &task, ctx: withUsageTask(context.Background(), id)}
+	runner := &videoRunner{app: a, task: &task, ctx: withUsageTask(context.Background(), id), feedbackStage: from}
 	runner.logf("开始执行阶段 %s", from)
 	_ = runner.save()
 
@@ -624,7 +649,9 @@ func (r *videoRunner) runScriptStage() error {
 	if tpl := r.task.Run.Template; tpl != nil {
 		r.logf("按模板「%s」v%s 执行：%d 个字段来自模板，%d 个字段本次改过", tpl.Name, tpl.Version, len(tpl.Sources), len(tpl.Overrides))
 	}
-	script, warnings := r.app.generateScript(r.usageCtx(UsagePurposeScript), r.task.Config, r.task.Run.Template)
+	script, warnings := r.app.generateScript(r.usageCtx(UsagePurposeScript), r.task.Config, r.consumeFeedback(VideoStageDraftScript), r.task.Run.Template)
+	// 把真正带进模型输入的用户参数写进日志：参数有没有生效，用户要能一眼验证
+	r.logf("Agent1 输入参数：%s", userParamDigest(r.task.Config))
 	for _, warning := range warnings {
 		r.warn("%s", warning)
 	}
@@ -663,7 +690,10 @@ func (r *videoRunner) runPromptStage() error {
 	caps := adapterCapabilities(adapter, provider.Model)
 	r.task.Run.Adapter = adapterID
 
-	prompts, promptWarnings := r.app.generatePrompts(r.usageCtx(UsagePurposePrompt), r.task.Config, *r.task.Run.Script, caps, r.task.Run.Template)
+	prompts, promptWarnings := r.app.generatePrompts(r.usageCtx(UsagePurposePrompt), r.task.Config, *r.task.Run.Script, caps,
+		r.consumeFeedback(VideoStageBuildPrompt), r.task.Run.Template)
+	r.logf("Agent2 输入参数：%s／能力：%s", userParamDigest(r.task.Config), capabilityHint(caps))
+	r.logf("台词归属：%s", speakerDigest(r.task.Config, prompts))
 	for _, warning := range promptWarnings {
 		r.warn("%s", warning)
 	}
@@ -710,6 +740,13 @@ func (r *videoRunner) runPromptStage() error {
 // runRenderStage Agent3：按段串行生成，支持尾帧延续与断点续跑。
 // 逐段确认开启时，每段新渲染成功即返回 paused=true，由流水线置 waiting 停住等用户动作。
 func (r *videoRunner) runRenderStage() (bool, error) {
+	// 渲染阶段没有文本模型参与：重跑只是按现有提示词重新生成画面。
+	// 不跟用户说清楚去哪改，他会以为 AI 听懂了意见。
+	if pending := strings.TrimSpace(r.task.Run.Feedback); pending != "" && r.feedbackStage == VideoStageRender {
+		r.warn("返工意见「%s」本轮未被采纳：渲染阶段只按现有提示词重跑画面；要改画面写法请用逐段确认里的「AI 优化提示词」，或回到提示词关卡重新生成",
+			truncateRunes(pending, 60))
+		r.task.Run.Feedback = ""
+	}
 	cfg := r.task.Config
 	adapterID, adapter, provider, warnings, err := r.app.resolveVideoAdapter(cfg)
 	if err != nil {
@@ -922,7 +959,8 @@ func (r *videoRunner) runMetaStage() error {
 		return errors.New("缺少分镜，无法生成发布元数据")
 	}
 
-	meta, warnings := r.app.generatePublishMeta(r.usageCtx(UsagePurposePublishMeta), r.task.Config, r.task.Run.Script, r.task.Run.Prompts)
+	meta, warnings := r.app.generatePublishMeta(r.usageCtx(UsagePurposePublishMeta), r.task.Config, r.task.Run.Script, r.task.Run.Prompts,
+		r.consumeFeedback(VideoStageBuildMeta))
 	for _, warning := range warnings {
 		r.warn("%s", warning)
 	}
@@ -984,6 +1022,12 @@ func characterImagesForSegment(cfg VideoRunConfig, script *VideoScript, segment 
 			}
 		}
 	}
+	// 说话人即使没写进 roles，也得算出场：台词归他、画面却没参考过他，脸一定翻。
+	if segment.Speaker != "" && segment.Speaker != VideoSpeakerNarration {
+		if key := normalizeRoleKey(segment.Speaker); key != "" {
+			roles[key] = true
+		}
+	}
 
 	matched := make([]VideoCharacterImage, 0, 4)
 	for _, ref := range cfg.CharacterRefs {
@@ -1007,6 +1051,22 @@ func characterImagesForSegment(cfg VideoRunConfig, script *VideoScript, segment 
 		"第 %d 段没有匹配到出场角色（分镜 roles 为空或与角色表不一致），已附带全部 %d 张角色参考图",
 		segment.Index+1, len(all),
 	)
+}
+
+// speakerDigest 一行说明每段台词归谁：“谁在说”是硬信息，不该藏在 JSON 里让人点开看。
+func speakerDigest(cfg VideoRunConfig, prompts []VideoPromptItem) string {
+	parts := make([]string, 0, len(prompts))
+	for _, item := range prompts {
+		switch {
+		case item.Dialogue == "":
+			parts = append(parts, item.ShotID+"=无台词")
+		case item.Speaker == "":
+			parts = append(parts, item.ShotID+"=未定")
+		default:
+			parts = append(parts, item.ShotID+"="+speakerLabel(cfg, item.Speaker))
+		}
+	}
+	return strings.Join(parts, "／")
 }
 
 // normalizeRoleKey role 标识大小写 / 空格不敏感，便于容忍模型返回的写法差异。

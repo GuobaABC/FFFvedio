@@ -1,6 +1,13 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -306,7 +313,7 @@ func TestLocalPublishMetaRespectsPlatformProfile(t *testing.T) {
 		t.Fatalf("归一化失败: %v", err)
 	}
 	script := normalizeScript(localVideoScript(cfg), cfg)
-	prompts, _ := (&App{}).generatePrompts(t.Context(), cfg, script, defaultVideoCapabilities())
+	prompts, _ := (&App{}).generatePrompts(t.Context(), cfg, script, defaultVideoCapabilities(), "")
 	profile := platformProfile(primaryPlatform(cfg))
 
 	meta := localPublishMeta(cfg, &script, prompts, profile)
@@ -508,7 +515,7 @@ func TestLocalScriptCoversTotalDuration(t *testing.T) {
 	if total < float64(cfg.DurationS)-0.2 || total > float64(cfg.DurationS)+0.2 {
 		t.Fatalf("分镜时长之和应等于目标时长，实际 %.2f / %d", total, cfg.DurationS)
 	}
-	prompts, _ := (&App{}).generatePrompts(t.Context(), cfg, script, defaultVideoCapabilities())
+	prompts, _ := (&App{}).generatePrompts(t.Context(), cfg, script, defaultVideoCapabilities(), "")
 	if len(prompts) != len(script.Shots) {
 		t.Fatalf("提示词数量应与分镜一致: %d / %d", len(prompts), len(script.Shots))
 	}
@@ -550,7 +557,7 @@ func TestAnimalCastDirectiveAppliedEverywhere(t *testing.T) {
 		t.Fatalf("归一化失败: %v", err)
 	}
 	script := normalizeScript(localVideoScript(cfg), cfg)
-	prompts, _ := (&App{}).generatePrompts(t.Context(), cfg, script, defaultVideoCapabilities())
+	prompts, _ := (&App{}).generatePrompts(t.Context(), cfg, script, defaultVideoCapabilities(), "")
 	if len(prompts) == 0 {
 		t.Fatal("提示词不应为空")
 	}
@@ -670,5 +677,588 @@ func TestNormalizeVideoConfigKeepsCharacterImageSource(t *testing.T) {
 	}
 	if cfg.CharacterRefs[1].ImageSource != CharacterImageSourceTemplate {
 		t.Fatalf("模板来源应原样保留: %+v", cfg.CharacterRefs[1])
+	}
+}
+
+/* ------------------------------------------------------------------
+   人工返工意见：关卡上敲的话必须真的进模型输入
+   ------------------------------------------------------------------ */
+
+// feedbackStub 起一个假的对话模型：记下每次收到的 user 文本，返回指定的模型输出。
+func feedbackStub(t *testing.T, modelContent string) (*httptest.Server, *[]string) {
+	t.Helper()
+
+	users := &[]string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		var body struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content any    `json:"content"`
+			} `json:"messages"`
+		}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		for _, message := range body.Messages {
+			if message.Role != "user" {
+				continue
+			}
+			switch text := message.Content.(type) {
+			case string:
+				*users = append(*users, text)
+			default:
+				// 带图片的多模态请求：content 是数组，把所有 text 块拼起来
+				var builder strings.Builder
+				if parts, ok := message.Content.([]any); ok {
+					for _, part := range parts {
+						if block, ok := part.(map[string]any); ok {
+							if piece, ok := block["text"].(string); ok {
+								builder.WriteString(piece)
+							}
+						}
+					}
+				}
+				*users = append(*users, builder.String())
+			}
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": modelContent}}},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, string(payload))
+	}))
+	t.Cleanup(server.Close)
+
+	return server, users
+}
+
+func feedbackTestConfig() VideoRunConfig {
+	return VideoRunConfig{Topic: "小猫打哈欠", DurationS: 6, Language: "zh", Adapter: "mock", Platforms: []string{"douyin"}}
+}
+
+func feedbackTestScript() VideoScript {
+	return VideoScript{Logline: "小猫打哈欠", Language: "zh", Shots: []VideoShot{{
+		ID: "s1-1", TimeRange: [2]float64{0, 6}, DurationS: 6, SceneIntent: "开场", Dialogue: "喵", Camera: "固定", Mood: "好奇",
+	}}}
+}
+
+func feedbackTestPrompts() []VideoPromptItem {
+	return []VideoPromptItem{{ShotID: "s1-1", VisualPrompt: "小猫对着镜头缓慢转头", Dialogue: "喵", RenderDurationS: 6}}
+}
+
+// lastUserPrompt 取最近一次发给模型的 user 文本。
+func lastUserPrompt(t *testing.T, users *[]string) string {
+	t.Helper()
+	if len(*users) == 0 {
+		t.Fatal("没有发出任何模型请求")
+	}
+	return (*users)[len(*users)-1]
+}
+
+// 三个关卡上的「重新生成意见」必须拼进对应 Agent 的输入：只写进 task.Run.Feedback 而没人读，
+// 就等于让用户对着空气提意见。
+func TestFeedbackReachesEveryAgent(t *testing.T) {
+	const opinion = "第 2 个镜头推进太快，改成缓慢横移"
+	cfg := feedbackTestConfig()
+	script := feedbackTestScript()
+	prompts := feedbackTestPrompts()
+
+	agents := []struct {
+		name    string
+		content string // 模型返回的 JSON，形状按各 Agent 的输出契约
+		run     func(app *App, feedback string) []string
+	}{
+		{
+			name:    "Agent1 编剧",
+			content: `{"logline":"小猫打哈欠","language":"zh","shots":[{"id":"s1-1","timeRange":[0,6],"durationS":6,"sceneIntent":"开场","dialogue":"喵","camera":"固定","mood":"好奇"}]}`,
+			run: func(app *App, feedback string) []string {
+				_, warnings := app.generateScript(context.Background(), cfg, feedback)
+				return warnings
+			},
+		},
+		{
+			name:    "Agent2 提示词",
+			content: `{"prompts":[{"shotId":"s1-1","visualPrompt":"缓慢横移镜头，小猫对着镜头打哈欠","dialogue":"喵"}]}`,
+			run: func(app *App, feedback string) []string {
+				_, warnings := app.generatePrompts(context.Background(), cfg, script, defaultVideoCapabilities(), feedback)
+				return warnings
+			},
+		},
+		{
+			name:    "Agent4 发布元数据",
+			content: `{"title":{"primary":"小猫打哈欠的 3 个瞬间","alternatives":[],"hook_type":"数字清单"},"tags":{"hashtags":["小猫"],"keywords":["猫咪日常"]},"description":"小猫打哈欠","category":"宠物","cover":{"text_overlay":"打哈欠"}}`,
+			run: func(app *App, feedback string) []string {
+				_, warnings := app.generatePublishMeta(context.Background(), cfg, &script, prompts, feedback)
+				return warnings
+			},
+		},
+	}
+
+	for _, agent := range agents {
+		t.Run(agent.name, func(t *testing.T) {
+			server, users := feedbackStub(t, agent.content)
+			app := newTestApp(t)
+			if _, err := app.SaveProvider(Provider{
+				Category: CategoryText, Name: "测试文本", BaseURL: server.URL, APIKey: "sk-test", Model: "test-model",
+			}); err != nil {
+				t.Fatalf("登记提供商失败: %v", err)
+			}
+
+			warnings := strings.Join(agent.run(app, opinion), "\n")
+			// 模型正常返回了可用结果，就不该冒出「没生效」：这条能拦住“失败路径默默回退”
+			if strings.Contains(warnings, "未生效") {
+				t.Fatalf("模型已返回可用结果，不应提示意见没生效：%s", warnings)
+			}
+			sent := lastUserPrompt(t, users)
+			if !strings.Contains(sent, "用户返工意见") || !strings.Contains(sent, opinion) {
+				t.Fatalf("意见没拼进模型输入：\n%s", sent)
+			}
+
+			// 没填意见时不该凭空多出这一段，免得模型把空意见当成指令
+			agent.run(app, "   ")
+			if strings.Contains(lastUserPrompt(t, users), "用户返工意见") {
+				t.Fatal("空意见不应拼进提示词")
+			}
+		})
+	}
+}
+
+// 本地规则读不懂自然语言意见：回退时必须明确说“没生效”，
+// 不能让用户看到“已重新生成”就以为 AI 听了话。
+func TestFeedbackDroppedWarningOnLocalFallback(t *testing.T) {
+	app := newTestApp(t) // 没登记任何提供商：三个 Agent 都会走本地规则
+	cfg := feedbackTestConfig()
+	script := feedbackTestScript()
+
+	fallbacks := []struct {
+		name string
+		run  func(feedback string) []string
+	}{
+		{"Agent1 编剧", func(feedback string) []string {
+			_, warnings := app.generateScript(context.Background(), cfg, feedback)
+			return warnings
+		}},
+		{"Agent2 提示词", func(feedback string) []string {
+			_, warnings := app.generatePrompts(context.Background(), cfg, script, defaultVideoCapabilities(), feedback)
+			return warnings
+		}},
+		{"Agent4 发布元数据", func(feedback string) []string {
+			_, warnings := app.generatePublishMeta(context.Background(), cfg, &script, feedbackTestPrompts(), feedback)
+			return warnings
+		}},
+	}
+
+	for _, fallback := range fallbacks {
+		if warnings := strings.Join(fallback.run("镜头2 太赶"), "\n"); !strings.Contains(warnings, "返工意见未生效") {
+			t.Fatalf("%s 回退本地规则时应告知意见没生效：%s", fallback.name, warnings)
+		}
+		if warnings := strings.Join(fallback.run(""), "\n"); strings.Contains(warnings, "未生效") {
+			t.Fatalf("%s 没提意见时不该冒出这句：%s", fallback.name, warnings)
+		}
+	}
+}
+
+// 意见只能被按下「重生成」的那个阶段消费：渲染阶段会顺带预生成发布元数据，
+// 针对画面的意见不该被 Agent4 拿去改标题。
+func TestConsumeFeedbackScopedToOwnerStage(t *testing.T) {
+	task := &VideoTask{ID: "t-feedback", Run: VideoRunContext{Feedback: "整体偏冷调"}}
+	runner := &videoRunner{task: task, feedbackStage: VideoStageBuildPrompt}
+
+	if got := runner.consumeFeedback(VideoStageBuildMeta); got != "" {
+		t.Fatal("别的阶段不该读到意见")
+	}
+	if task.Run.Feedback != "整体偏冷调" {
+		t.Fatalf("没消费时不该清空：%q", task.Run.Feedback)
+	}
+	if got := runner.consumeFeedback(VideoStageBuildPrompt); got != "整体偏冷调" {
+		t.Fatalf("归属阶段应拿到意见，实际 %q", got)
+	}
+	if task.Run.Feedback != "" {
+		t.Fatalf("消费后应清空，免得下一轮莫名继承：%q", task.Run.Feedback)
+	}
+	if got := runner.consumeFeedback(VideoStageBuildPrompt); got != "" {
+		t.Fatal("同一份意见不该被消费两次")
+	}
+	if !strings.Contains(strings.Join(task.Run.Logs, "\n"), "本轮按人工返工意见重出：整体偏冷调") {
+		t.Fatalf("日志要留下意见原文便于核对：%v", task.Run.Logs)
+	}
+}
+
+// 端到端：提示词关卡点「重新生成」时敲的意见，要出现在真正发出的模型请求里，
+// 并从任务上消费掉，同时不影响提示词落库。
+func TestRegeneratePromptStageSendsFeedbackToModel(t *testing.T) {
+	withTempVideoRoot(t)
+
+	const opinion = "整体色调改暖，主体动作更克制"
+	server, users := feedbackStub(t, `{"prompts":[{"shotId":"s1-1","visualPrompt":"暖色逆光，小猫缓慢抬头","dialogue":"喵"}]}`)
+	app := newTestApp(t)
+	if _, err := app.SaveProvider(Provider{
+		Category: CategoryText, Name: "测试文本", BaseURL: server.URL, APIKey: "sk-test", Model: "test-model",
+	}); err != nil {
+		t.Fatalf("登记提供商失败: %v", err)
+	}
+
+	created, err := app.CreateVideoTask(VideoTaskInput{Config: feedbackTestConfig()})
+	if err != nil {
+		t.Fatalf("新建任务失败: %v", err)
+	}
+	task, err := app.videoTaskByID(created.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	task.Stage = VideoStageConfirmPrompt
+	script := feedbackTestScript()
+	task.Run.Script = &script
+	if err := app.updateVideoTaskRecord(task); err != nil {
+		t.Fatalf("写入任务失败: %v", err)
+	}
+
+	app.runVideoPipeline(created.ID, VideoStageBuildPrompt, opinion)
+
+	if sent := lastUserPrompt(t, users); !strings.Contains(sent, opinion) {
+		t.Fatalf("意见没进模型输入：\n%s", sent)
+	}
+
+	final, err := app.videoTaskByID(created.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	if final.Status == VideoStatusFailed {
+		t.Fatalf("流水线失败：%s", final.Error)
+	}
+	if final.Run.Feedback != "" {
+		t.Fatalf("意见应被消费掉：%q", final.Run.Feedback)
+	}
+	if final.Stage != VideoStageConfirmPrompt {
+		t.Fatalf("提示词阶段完成后应停在关卡②，实际 %s", final.Stage)
+	}
+	if len(final.Run.Prompts) == 0 || !strings.Contains(final.Run.Prompts[0].VisualPrompt, "暖色逆光") {
+		t.Fatalf("模型给的提示词应落到任务上：%+v", final.Run.Prompts)
+	}
+}
+
+/* ------------------------------------------------------------------
+   用户参数契约：表单上能填的每一项都必须真的进模型输入
+   ------------------------------------------------------------------ */
+
+// fullParamConfig 把新建任务表单能填的参数全填上（含本地首帧路径）。
+func fullParamConfig(firstFrame string) VideoRunConfig {
+	return VideoRunConfig{
+		Topic:            "橘猫开咖啡馆",
+		DurationS:        15,
+		Fps:              30,
+		AspectRatio:      "9:16",
+		ContinuationMode: "last_frame",
+		SpeechRate:       5.2,
+		Language:         "zh-CN",
+		Subtitles:        true,
+		FirstFrame:       firstFrame,
+		CharacterRefs: []VideoCharacterRef{{
+			RoleID: "host", Name: "主理人（橘猫）", Images: []string{"host.png"},
+			ImageSource: CharacterImageSourceUser, VoiceHint: "低沉男声",
+		}},
+		VideoParams: VideoParams{
+			Style: "暖色逆光实拍", Camera: "缓慢推近", Mood: "克制期待",
+			ExtraPrompt: "桌面永远有一只搪瓷杯", NegativePrompt: "真人面孔、文字水印",
+		},
+		Platforms: []string{"douyin", "xiaohongshu"},
+		Region:    "Asia/Shanghai",
+		Vertical:  "美食",
+		Adapter:   "mock",
+	}
+}
+
+// multimodalStub 同时记录 user 文本与“本次请求带了几张图”：用来验证首帧图真的作为附图交给了 Agent。
+func multimodalStub(t *testing.T, modelContent string) (*httptest.Server, *[]string, *[]bool) {
+	t.Helper()
+
+	users := &[]string{}
+	withImage := &[]bool{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Content any `json:"content"`
+			} `json:"messages"`
+		}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		hasImage := false
+		for _, message := range body.Messages {
+			parts, ok := message.Content.([]any)
+			if !ok {
+				continue
+			}
+			var builder strings.Builder
+			for _, part := range parts {
+				block, ok := part.(map[string]any)
+				if !ok {
+					continue
+				}
+				if block["type"] == "image_url" {
+					hasImage = true
+				}
+				if piece, ok := block["text"].(string); ok {
+					builder.WriteString(piece)
+				}
+			}
+			*users = append(*users, builder.String())
+		}
+		*withImage = append(*withImage, hasImage)
+		payload, _ := json.Marshal(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": modelContent}}},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, string(payload))
+	}))
+	t.Cleanup(server.Close)
+
+	return server, users, withImage
+}
+
+// 表单上填的每一个参数都要出现在对应 Agent 的输入里：只存在于 cfg 结构体的参数，等于没填。
+func TestUserParamsReachBothAgents(t *testing.T) {
+	firstFrame := filepath.Join(t.TempDir(), "first.png")
+	if err := os.WriteFile(firstFrame, []byte("fake-png"), 0o644); err != nil {
+		t.Fatalf("写首帧失败: %v", err)
+	}
+	cfg := fullParamConfig(firstFrame)
+
+	// 两段 Agent 必须看到同一套参数
+	expect := []string{
+		"主题：橘猫开咖啡馆",
+		"目标总时长：15 秒",
+		"画幅：9:16",
+		"语言：zh-CN；语速预算：5.2 字/秒",
+		"主平台 抖音",
+		"垂类 美食",
+		"受众时区 Asia/Shanghai",
+		"风格偏好：暖色逆光实拍",
+		"运镜偏好：缓慢推近",
+		"情绪偏好：克制期待",
+		"必须落实的额外要求：桌面永远有一只搪瓷杯",
+		"必须全片避开的元素（用正面表述达成）：真人面孔、文字水印",
+		"续接方式：尾帧续接",
+		"已提供首帧图",
+		"host（主理人（橘猫））",
+		"形象：用户上传的定妆图",
+		"声音：低沉男声",
+		"字幕：后期烧录",
+	}
+
+	t.Run("Agent1 编剧", func(t *testing.T) {
+		server, users := feedbackStub(t, `{"logline":"橘猫开咖啡馆","shots":[{"id":"s1","durationS":15,"roles":["host"],"sceneIntent":"推门","dialogue":"开业"}]}`)
+		app := newTestApp(t)
+		if _, err := app.SaveProvider(Provider{Category: CategoryText, Name: "测试文本", BaseURL: server.URL, APIKey: "sk-test", Model: "test-model"}); err != nil {
+			t.Fatalf("登记提供商失败: %v", err)
+		}
+		app.generateScript(context.Background(), cfg, "")
+
+		sent := lastUserPrompt(t, users)
+		for _, want := range expect {
+			if !strings.Contains(sent, want) {
+				t.Fatalf("Agent1 输入缺参数 %q：\n%s", want, sent)
+			}
+		}
+		// 本地绝对路径不进模型输入：模型读不懂，也没必要发给第三方
+		if strings.Contains(sent, firstFrame) || strings.Contains(sent, ".png") {
+			t.Fatalf("首帧路径不应泄漏进提示词：\n%s", sent)
+		}
+	})
+
+	t.Run("Agent2 提示词", func(t *testing.T) {
+		server, users, withImage := multimodalStub(t, `{"prompts":[{"shotId":"s1-1","visualPrompt":"推镜，橘猫推门","dialogue":"喵"}]}`)
+		app := newTestApp(t)
+		if _, err := app.SaveProvider(Provider{Category: CategoryText, Name: "测试文本", BaseURL: server.URL, APIKey: "sk-test", Model: "test-model"}); err != nil {
+			t.Fatalf("登记提供商失败: %v", err)
+		}
+		app.generatePrompts(context.Background(), cfg, feedbackTestScript(), defaultVideoCapabilities(), "")
+
+		sent := lastUserPrompt(t, users)
+		for _, want := range expect {
+			if !strings.Contains(sent, want) {
+				t.Fatalf("Agent2 输入缺参数 %q：\n%s", want, sent)
+			}
+		}
+		// 两张图的信息也要给到：模型能力与角色表
+		for _, want := range []string{"本段模型能力：", "角色表：", "分镜（JSON，shotId 必须逐字复用）"} {
+			if !strings.Contains(sent, want) {
+				t.Fatalf("Agent2 输入缺 %q：\n%s", want, sent)
+			}
+		}
+		if strings.Contains(sent, firstFrame) {
+			t.Fatalf("首帧路径不应泄漏进提示词：\n%s", sent)
+		}
+		if len(*withImage) == 0 || !(*withImage)[len(*withImage)-1] {
+			t.Fatalf("首帧图应作为附图随 Agent2 请求发出：%v", *withImage)
+		}
+	})
+}
+
+// 用户关掉本地兜底后不许偷偷降级：没模型就失败，别拿本地模板顶上假装是 AI 写的。
+func TestLocalFallbackSwitchRespected(t *testing.T) {
+	disabled := false
+	cfg := feedbackTestConfig()
+	cfg.LocalFallback = &disabled
+
+	app := newTestApp(t) // 没登记任何文本模型
+	script, warnings := app.generateScript(context.Background(), cfg, "")
+	if len(script.Shots) != 0 {
+		t.Fatalf("关闭本地兜底后不该产出本地分镜：%+v", script.Shots)
+	}
+	if !strings.Contains(strings.Join(warnings, "\n"), "已关闭本地兜底") {
+		t.Fatalf("关闭本地兜底应明确告知原因：%v", warnings)
+	}
+
+	prompts, promptWarnings := app.generatePrompts(context.Background(), cfg, feedbackTestScript(), defaultVideoCapabilities(), "")
+	if len(prompts) != 0 || !strings.Contains(strings.Join(promptWarnings, "\n"), "已关闭本地兜底") {
+		t.Fatalf("关闭本地兜底后不应产出本地提示词：%v / %v", prompts, promptWarnings)
+	}
+
+	// 默认值（nil）仍然兜底，旧行为不变
+	enabled, _ := app.generateScript(context.Background(), feedbackTestConfig(), "")
+	if len(enabled.Shots) == 0 {
+		t.Fatal("默认设置下仍应使用本地规则兜底")
+	}
+}
+
+// 模型漏写段落（或 shotId 写错）时，那几段会静默退回本地模板：必须打出告警。
+func TestMissingShotWarningWhenModelSkipsSegment(t *testing.T) {
+	cfg := feedbackTestConfig()
+	script := feedbackTestScript()
+	script.Shots = append(script.Shots, VideoShot{ID: "s1-2", TimeRange: [2]float64{6, 12}, DurationS: 6, SceneIntent: "收尾", Dialogue: ""})
+
+	server, _ := feedbackStub(t, `{"prompts":[{"shotId":"s1-1","visualPrompt":"推镜，小猫回头","dialogue":"喵"}]}`)
+	app := newTestApp(t)
+	if _, err := app.SaveProvider(Provider{Category: CategoryText, Name: "测试文本", BaseURL: server.URL, APIKey: "sk-test", Model: "test-model"}); err != nil {
+		t.Fatalf("登记提供商失败: %v", err)
+	}
+
+	_, warnings := app.generatePrompts(context.Background(), cfg, script, defaultVideoCapabilities(), "")
+	joined := strings.Join(warnings, "\n")
+	if !strings.Contains(joined, "只覆盖 1/2 段") || !strings.Contains(joined, "s1-2") {
+		t.Fatalf("漏段必须告警：%v", warnings)
+	}
+}
+
+/* ------------------------------------------------------------------
+   台词强绑定：每句台词必须有确定的说话人（角色或旁白）
+   ------------------------------------------------------------------ */
+
+func speakerTestConfig() VideoRunConfig {
+	return VideoRunConfig{
+		Topic: "橘猫开咖啡馆", DurationS: 12, AspectRatio: "9:16", Language: "zh-CN", SpeechRate: 4,
+		CharacterRefs: []VideoCharacterRef{
+			{RoleID: "host", Name: "主理人（橘猫）", Images: []string{"host.png"}},
+			{RoleID: "guest", Name: "客人（边牧）", Images: []string{"guest.png"}},
+		},
+		Adapter: "mock",
+	}
+}
+
+// 说话人写法要归一：role_id、角色名、名字片段都该落到 role_id；猜不准就落到旁白并说清楚。
+func TestSpeakerBindingNormalization(t *testing.T) {
+	cfg := speakerTestConfig()
+	script := VideoScript{Shots: []VideoShot{
+		{ID: "s1", Roles: []string{"host"}, Dialogue: "今日开业", Speaker: "主理人"},
+		{ID: "s2", Roles: []string{"host", "guest"}, Dialogue: "欢迎光临"},
+		{ID: "s3", Roles: []string{"guest"}, Dialogue: "", Speaker: "guest"},
+		{ID: "s4", Roles: []string{"guest"}, Dialogue: "谢谢，下次再来", Speaker: "隔壁老王"},
+		{ID: "s5", Roles: nil, Dialogue: "三个月后…", Speaker: "旁白"},
+	}}
+
+	bound, warnings := bindSpeakers(script, cfg)
+	joined := strings.Join(warnings, "\n")
+
+	if got := bound.Shots[0].Speaker; got != "host" {
+		t.Fatalf("角色名应归一成 role_id，得到 %q", got)
+	}
+	if got := bound.Shots[1].Speaker; got != VideoSpeakerNarration {
+		t.Fatalf("多角色且未指定说话人，应落到旁白，得到 %q", got)
+	}
+	if !strings.Contains(joined, "s2") || !strings.Contains(joined, "旁白") {
+		t.Fatalf("多角色猜不准必须告警：%v", warnings)
+	}
+	if got := bound.Shots[2].Speaker; got != "" {
+		t.Fatalf("没台词的段落不该有说话人，得到 %q", got)
+	}
+	if got := bound.Shots[3].Speaker; got != "guest" {
+		t.Fatalf("说话人不在角色表但本段只有一个角色，应归他，得到 %q", got)
+	}
+	if !strings.Contains(joined, "隔壁老王") {
+		t.Fatalf("降级要给出来源：%v", warnings)
+	}
+	if got := bound.Shots[4].Speaker; got != VideoSpeakerNarration {
+		t.Fatalf("“旁白”应归一成 narration，得到 %q", got)
+	}
+}
+
+// 归属要一路带到渲染提示词：角色说话就把口型给到他，旁白就让画面别安排人对口型。
+func TestDialogueSpeakerReachesRenderPrompt(t *testing.T) {
+	cfg := speakerTestConfig()
+	script := VideoScript{Shots: []VideoShot{
+		{ID: "s1", TimeRange: [2]float64{0, 6}, DurationS: 6, Roles: []string{"host"}, SceneIntent: "橘猫推开店门", Dialogue: "今日开业"},
+		{ID: "s2", TimeRange: [2]float64{6, 12}, DurationS: 6, Roles: nil, SceneIntent: "空镜收尾", Dialogue: "三个月过去了"},
+	}}
+
+	caps := defaultVideoCapabilities()
+	caps.NativeAudio = true
+	prompts, warnings := (&App{}).generatePrompts(context.Background(), cfg, script, caps, "")
+	if len(prompts) != 2 {
+		t.Fatalf("应有两条提示词：%d / %v", len(prompts), warnings)
+	}
+	if prompts[0].Speaker != "host" || prompts[1].Speaker != VideoSpeakerNarration {
+		t.Fatalf("台词归属没落到提示词上：%+v", prompts)
+	}
+
+	plan := buildVideoPlan(cfg, prompts, caps, "mock")
+	if len(plan.Segments) < 2 {
+		t.Fatalf("渲染计划段数不够：%+v", plan.Segments)
+	}
+	if plan.Segments[0].SpeakerName != "主理人（橘猫）" {
+		t.Fatalf("角色台词应带显示名，得到 %q", plan.Segments[0].SpeakerName)
+	}
+
+	first := composeRenderPrompt(plan.Segments[0], caps)
+	if !strings.Contains(first, "主理人（橘猫） 说") || !strings.Contains(first, "今日开业") {
+		t.Fatalf("角色台词没绑定到说话人：\n%s", first)
+	}
+
+	narration := composeRenderPrompt(plan.Segments[1], caps)
+	if !strings.Contains(narration, "旁白（画外音") || strings.Contains(narration, "说（只允许") {
+		t.Fatalf("旁白不该要求主体对口型：\n%s", narration)
+	}
+}
+
+// 说话人即使没写进 roles，也要带上他的定妆图：台词归他、画面却没参考过他，脸一定翻。
+func TestSpeakerRoleBringsCharacterImage(t *testing.T) {
+	cfg := speakerTestConfig()
+	script := &VideoScript{Shots: []VideoShot{{ID: "s1", Roles: nil}}}
+	images, warning := characterImagesForSegment(cfg, script, VideoSegment{ShotID: "s1", Speaker: "guest"})
+	if len(images) != 1 || images[0].RoleID != "guest" || warning != "" {
+		t.Fatalf("说话人的定妆图应被带上：%+v / %q", images, warning)
+	}
+}
+
+// 关卡②里改台词归属要真的生效，清空台词则归属一并清空。
+func TestPromptEditorCanRebindSpeaker(t *testing.T) {
+	cfg := speakerTestConfig()
+	prompts := []VideoPromptItem{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: "谢谢惠顾", Speaker: "host"}}
+
+	applyPromptEdits(prompts, []VideoPromptEdit{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: "谢谢惠顾", Speaker: "画外音"}}, cfg)
+	if prompts[0].Speaker != VideoSpeakerNarration {
+		t.Fatalf("改成旁白应归一成 narration，得到 %q", prompts[0].Speaker)
+	}
+
+	applyPromptEdits(prompts, []VideoPromptEdit{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: "谢谢惠顾", Speaker: "客人"}}, cfg)
+	if prompts[0].Speaker != "guest" {
+		t.Fatalf("按角色名改归属应归一成 role_id，得到 %q", prompts[0].Speaker)
+	}
+
+	applyPromptEdits(prompts, []VideoPromptEdit{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: ""}}, cfg)
+	if prompts[0].Speaker != "" {
+		t.Fatalf("台词清空后归属应跟着清空，得到 %q", prompts[0].Speaker)
 	}
 }
