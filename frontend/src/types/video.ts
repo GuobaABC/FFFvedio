@@ -5,8 +5,9 @@ import type { VideoTemplateRef, VideoTemplateRun } from './template'
 export type VideoStage =
   | 'DRAFT_SCRIPT'
   | 'CONFIRM_SCRIPT'
-  | 'BUILD_PROMPT_SUBS'
+  | 'BUILD_PROMPT'
   | 'CONFIRM_PROMPT'
+  | 'BUILD_SUBS'
   | 'RENDER_VIDEO'
   | 'COMPOSE'
   | 'BUILD_PUBLISH_META'
@@ -379,8 +380,9 @@ export interface VideoEnvironment {
 export const VIDEO_STAGES: { id: VideoStage; label: string; hint: string }[] = [
   { id: 'DRAFT_SCRIPT', label: '剧本分镜', hint: 'Agent1 生成结构化分镜' },
   { id: 'CONFIRM_SCRIPT', label: '确认分镜', hint: '人工确认关卡 ①' },
-  { id: 'BUILD_PROMPT_SUBS', label: '提示词与字幕', hint: 'Agent2 展开提示词、字幕时间轴' },
+  { id: 'BUILD_PROMPT', label: '提示词', hint: 'Agent2 展开画面提示词' },
   { id: 'CONFIRM_PROMPT', label: '确认提示词', hint: '人工确认关卡 ②（成本拍板）' },
+  { id: 'BUILD_SUBS', label: '字幕生成', hint: '台词定稿后铺字幕时间轴' },
   { id: 'RENDER_VIDEO', label: '生成视频', hint: 'Agent3 适配器逐段生成' },
   { id: 'COMPOSE', label: '合成成片', hint: 'ffmpeg 拼接 + 烧录字幕' },
   { id: 'BUILD_PUBLISH_META', label: '发布元数据', hint: 'Agent4 标题 / 标签 / 发布时段' },
@@ -391,8 +393,9 @@ export const VIDEO_STAGES: { id: VideoStage; label: string; hint: string }[] = [
 export const STAGE_LABELS: Record<string, string> = {
   DRAFT_SCRIPT: '剧本分镜',
   CONFIRM_SCRIPT: '确认分镜',
-  BUILD_PROMPT_SUBS: '提示词与字幕',
+  BUILD_PROMPT: '提示词',
   CONFIRM_PROMPT: '确认提示词',
+  BUILD_SUBS: '字幕生成',
   RENDER_VIDEO: '生成视频',
   COMPOSE: '合成成片',
   BUILD_PUBLISH_META: '发布元数据',

@@ -44,6 +44,8 @@ func scanVideoTask(scanner interface{ Scan(dest ...any) error }) (VideoTask, err
 	if err := json.Unmarshal([]byte(contextJSON), &task.Run); err != nil {
 		return task, fmt.Errorf("解析任务产物失败: %w", err)
 	}
+	// 旧任务里的阶段名可能是拆分前的别名（如 BUILD_PROMPT_SUBS）
+	task.Stage = normalizeVideoStage(task.Stage)
 	ensureVideoGates(&task.Run)
 	return task, nil
 }

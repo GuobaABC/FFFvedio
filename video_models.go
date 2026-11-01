@@ -14,17 +14,33 @@ import (
 // 视频生成流水线的阶段（与《视频生成工具·架构与最佳实践设计》§2 一致，
 // 并在合成之后接入 Agent4 发布元数据与 gate③）。
 // 人工确认关卡本身也是一个阶段，处于该阶段时任务状态为 waiting。
+// 字幕排在 gate② 之后：台词要等用户在提示词关卡改完定稿，再铺字幕时间轴。
 const (
 	VideoStageDraftScript   = "DRAFT_SCRIPT"
 	VideoStageConfirmScript = "CONFIRM_SCRIPT"
-	VideoStageBuildPrompt   = "BUILD_PROMPT_SUBS"
+	VideoStageBuildPrompt   = "BUILD_PROMPT"
 	VideoStageConfirmPrompt = "CONFIRM_PROMPT"
+	VideoStageBuildSubs     = "BUILD_SUBS"
 	VideoStageRender        = "RENDER_VIDEO"
 	VideoStageCompose       = "COMPOSE"
 	VideoStageBuildMeta     = "BUILD_PUBLISH_META"
 	VideoStageConfirmMeta   = "CONFIRM_META"
 	VideoStageDone          = "DONE"
 )
+
+// legacyVideoStages 把历史任务里存过的旧阶段名映射到当前阶段名：
+// v0.0.5 之前提示词与字幕挤在同一阶段（BUILD_PROMPT_SUBS），现在拆成两段。
+var legacyVideoStages = map[string]string{
+	"BUILD_PROMPT_SUBS": VideoStageBuildPrompt,
+}
+
+func normalizeVideoStage(stage string) string {
+	stage = strings.TrimSpace(stage)
+	if mapped, ok := legacyVideoStages[stage]; ok {
+		return mapped
+	}
+	return stage
+}
 
 // 任务状态
 const (

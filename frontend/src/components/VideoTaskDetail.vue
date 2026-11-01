@@ -142,6 +142,7 @@ const canRun = computed(
     !isRunning.value &&
     !reviewPendingSegment.value &&
     (props.task.stage === 'DRAFT_SCRIPT' ||
+      props.task.stage === 'BUILD_SUBS' ||
       props.task.stage === 'RENDER_VIDEO' ||
       props.task.stage === 'COMPOSE' ||
       props.task.stage === 'BUILD_PUBLISH_META'),
@@ -990,6 +991,9 @@ function revealOutput() {
       </p>
       <p v-if="run?.subtitles" class="hint">
         字幕文件：{{ run.subtitles.srtPath || '—' }}
+      </p>
+      <p v-else-if="plan && config.subtitles" class="hint">
+        字幕将在确认提示词后生成：先按台词与分镜预算时间轴铺轴，合成时再按各片段实测时长重排。
       </p>
       <p v-else-if="plan" class="hint">
         本次未生成字幕（默认关闭）：成片不含字幕；需要时在新建任务勾选「生成字幕并烧录」。

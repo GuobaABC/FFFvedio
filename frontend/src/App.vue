@@ -27,7 +27,8 @@ interface MainTab {
 }
 
 const projectName = 'FFFVedioAgent'
-const version = 'v0.0.3'
+// 版本号由构建时从 package.json 注入，不再手写，免得界面版本与实际发版对不上
+const version = __APP_VERSION__
 
 /** 主选项卡：首页大屏 + 热点爬取（新建任务 → 执行 → 结果）+ 视频生成 + 系统设置 */
 const mainTabs: MainTab[] = [

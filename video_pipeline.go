@@ -66,7 +66,8 @@ func (a *App) ApproveVideoGate(id string) error {
 	case VideoStageConfirmScript:
 		next = VideoStageBuildPrompt
 	case VideoStageConfirmPrompt:
-		next = VideoStageRender
+		// 提示词确认后再落字幕：台词定稿才铺时间轴，改台词不用返工字幕
+		next = VideoStageBuildSubs
 	default:
 		return errors.New("当前阶段没有待确认的关卡")
 	}
@@ -102,7 +103,7 @@ func (a *App) RegenerateVideoStage(id, feedback string) error {
 	case VideoStageConfirmMeta:
 		// gate③ 重生成只回 Agent4，不动视频
 		from = VideoStageBuildMeta
-	case VideoStageDraftScript, VideoStageBuildPrompt, VideoStageBuildMeta:
+	case VideoStageDraftScript, VideoStageBuildPrompt, VideoStageBuildSubs, VideoStageBuildMeta:
 		// 保持当前阶段
 	default:
 		from = VideoStageDraftScript
@@ -311,19 +312,10 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		plan := buildVideoPlan(task.Config, task.Run.Prompts, caps, task.Run.Adapter)
 		task.Run.Plan = &plan
 
-		// 字幕默认关闭：未开启时不生成 SRT/ASS，成片也不烧录
+		// 字幕在 gate② 之后才生成：这里只作废旧字幕，确认后由 BUILD_SUBS 按新台词重铺
 		task.Run.Subtitles = nil
-		if task.Config.Subtitles {
-			if workDir, dirErr := a.ensureTaskWorkDir(task.ID); dirErr != nil {
-				task.Run.Warnings = append(task.Run.Warnings, "字幕文件重算失败: "+dirErr.Error())
-			} else if subtitles, subErr := prepareSubtitleFiles(workDir, task.ID, task.Config, &plan); subErr != nil {
-				task.Run.Warnings = append(task.Run.Warnings, "字幕文件重算失败: "+subErr.Error())
-			} else {
-				task.Run.Subtitles = subtitles
-			}
-		}
 
-		// 提示词/台词改动 → 渲染 + 合成失效，字幕按新时间轴重生
+		// 提示词/台词改动 → 渲染 + 合成失效，字幕等确认后按新时间轴重生
 		task.Run.Renders = nil
 		task.Run.Output = nil
 		task.Run.PublishMeta = nil
@@ -331,7 +323,11 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		task.Run.Gates[VideoGateMeta] = videoGatePending
 		task.Status = VideoStatusWaiting
 		task.Error = ""
-		task.Run.Logs = append(task.Run.Logs, stageLog("提示词已修改，渲染计划已重算（字幕未开启）"))
+		if task.Config.Subtitles {
+			task.Run.Logs = append(task.Run.Logs, stageLog("提示词已修改，渲染计划已重算（字幕将在确认后重新生成）"))
+		} else {
+			task.Run.Logs = append(task.Run.Logs, stageLog("提示词已修改，渲染计划已重算（字幕未开启）"))
+		}
 
 	case VideoStageConfirmMeta:
 		if edits.Meta == nil {
@@ -553,7 +549,7 @@ func (a *App) runVideoPipeline(id, from, feedback string) {
 	switch from {
 	case VideoStageBuildPrompt:
 		task.Run.Gates[VideoGateScript] = videoGateApproved
-	case VideoStageRender:
+	case VideoStageBuildSubs, VideoStageRender:
 		task.Run.Gates[VideoGatePrompt] = videoGateApproved
 	}
 
@@ -584,6 +580,16 @@ func (a *App) runVideoPipeline(id, from, feedback string) {
 			runner.task.Status = VideoStatusWaiting
 			_ = runner.save()
 			return
+
+		case VideoStageBuildSubs:
+			// gate② 之后才落字幕：台词已经定稿，改台词不会再让早生成的字幕作废
+			if err := runner.runSubtitleStage(); err != nil {
+				runner.fail(err)
+				return
+			}
+			runner.task.Stage = VideoStageRender
+			runner.task.Status = VideoStatusRunning
+			_ = runner.save()
 
 		case VideoStageRender:
 			// Agent4 只依赖已确认的提示词与剧本，可与渲染并行准备（§10.1）
@@ -674,7 +680,7 @@ func (r *videoRunner) runScriptStage() error {
 	return nil
 }
 
-// runPromptStage Agent2：提示词 + 字幕 + 成本计划。
+// runPromptStage Agent2：提示词 + 成本计划。字幕不在这里做，等 gate② 确认后再落。
 func (r *videoRunner) runPromptStage() error {
 	if r.task.Run.Script == nil || len(r.task.Run.Script.Shots) == 0 {
 		return errors.New("缺少分镜脚本，无法展开提示词")
@@ -711,19 +717,12 @@ func (r *videoRunner) runPromptStage() error {
 	}
 	r.task.Run.Plan = &plan
 
-	workDir, err := r.app.ensureTaskWorkDir(r.task.ID)
-	if err != nil {
-		return err
-	}
+	// 字幕不在这一阶段做：台词要等 gate② 定稿，字幕由 BUILD_SUBS 阶段铺轴
+	r.task.Run.Subtitles = nil
 	if r.task.Config.Subtitles {
-		if subtitles, subErr := prepareSubtitleFiles(workDir, r.task.ID, r.task.Config, &plan); subErr != nil {
-			r.warn("生成字幕文件失败: %v", subErr)
-		} else {
-			r.task.Run.Subtitles = subtitles
-		}
+		r.logf("字幕将在确认提示词后生成（此时台词还可能被改）")
 	} else {
 		// 字幕默认关闭：不产出 SRT/ASS，成片也不烧录
-		r.task.Run.Subtitles = nil
 		r.logf("字幕未开启，本次不生成字幕文件")
 	}
 
@@ -734,6 +733,44 @@ func (r *videoRunner) runPromptStage() error {
 	r.task.Run.Gates[VideoGatePrompt] = videoGatePending
 	r.task.Run.Gates[VideoGateMeta] = videoGatePending
 	r.logf("Agent2 完成：%d 段提示词，计划 %d 个片段（%.1fs）", len(prompts), plan.ClipCount, plan.TotalS)
+	return nil
+}
+
+// runSubtitleStage 字幕阶段：排在 gate②（确认提示词）之后、渲染之前。
+// 此时台词与归属已经定稿，字幕不会因为用户改台词而白生成一遍。
+// 这里产出的是预算时间轴；合成阶段会按各片段实测时长再重排一次。
+func (r *videoRunner) runSubtitleStage() error {
+	cfg := r.task.Config
+	if !cfg.Subtitles {
+		// 字幕默认关闭：不产出 SRT/ASS，成片也不烧录
+		r.task.Run.Subtitles = nil
+		r.logf("字幕未开启，跳过字幕阶段")
+		return nil
+	}
+
+	plan := r.task.Run.Plan
+	if plan == nil || len(plan.Segments) == 0 {
+		// 兜底：直接用已确认的提示词重建计划，免得旧任务卡在这一步
+		if len(r.task.Run.Prompts) == 0 {
+			return errors.New("缺少已确认的提示词，无法生成字幕")
+		}
+		_, adapter, provider, _, _ := r.app.resolveVideoAdapter(cfg)
+		rebuilt := buildVideoPlan(cfg, r.task.Run.Prompts, adapterCapabilities(adapter, provider.Model), r.task.Run.Adapter)
+		plan = &rebuilt
+		r.task.Run.Plan = plan
+	}
+
+	workDir, err := r.app.ensureTaskWorkDir(r.task.ID)
+	if err != nil {
+		return err
+	}
+	subtitles, err := prepareSubtitleFiles(workDir, r.task.ID, cfg, plan)
+	if err != nil {
+		return fmt.Errorf("生成字幕文件失败: %w", err)
+	}
+	r.task.Run.Subtitles = subtitles
+	r.logf("字幕已生成：%d 条，时间轴来源 %s（提示词已确认，按 %d 段渲染计划铺轴）",
+		len(subtitles.Cues), subtitles.TimingSource, len(plan.Segments))
 	return nil
 }
 

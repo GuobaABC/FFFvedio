@@ -1,9 +1,14 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
-// 前端既可以单独运行（npm run dev），也可以由 Wails 内嵌加载（wails dev / wails build）
+import pkg from './package.json'
+
+// 界面版本号直接取 package.json：发版只改一处，侧边栏不会再落后于实际版本
 export default defineConfig({
   plugins: [vue()],
+  define: {
+    __APP_VERSION__: JSON.stringify(`v${pkg.version}`),
+  },
   // 桌面端通过本地资源服务器加载，相对路径在开发与内嵌两种模式下都可用
   base: './',
   server: {

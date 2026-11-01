@@ -1262,3 +1262,95 @@ func TestPromptEditorCanRebindSpeaker(t *testing.T) {
 		t.Fatalf("台词清空后归属应跟着清空，得到 %q", prompts[0].Speaker)
 	}
 }
+
+// 字幕要等 gate②（确认提示词）之后才落：台词还可能被改，提前铺轴等于白做一遍。
+func TestSubtitleGeneratedOnlyAfterPromptConfirm(t *testing.T) {
+	withTempVideoRoot(t)
+	app := newTestApp(t)
+
+	created, err := app.CreateVideoTask(VideoTaskInput{Config: VideoRunConfig{
+		Topic: "小猫开店第一天", DurationS: 12, Adapter: "mock", Subtitles: true,
+	}})
+	if err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	task, err := app.videoTaskByID(created.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+
+	runner := &videoRunner{app: app, task: &task, ctx: context.Background(), feedbackStage: VideoStageBuildPrompt}
+	if err := runner.runScriptStage(); err != nil {
+		t.Fatalf("剧本阶段失败: %v", err)
+	}
+	if err := runner.runPromptStage(); err != nil {
+		t.Fatalf("提示词阶段失败: %v", err)
+	}
+	if task.Run.Subtitles != nil {
+		t.Fatalf("提示词阶段不该生成字幕：%+v", task.Run.Subtitles)
+	}
+	if logs := strings.Join(task.Run.Logs, "\n"); !strings.Contains(logs, "字幕将在确认提示词后生成") {
+		t.Fatalf("日志要说明字幕延后到确认之后：%v", task.Run.Logs)
+	}
+
+	if err := runner.runSubtitleStage(); err != nil {
+		t.Fatalf("字幕阶段失败: %v", err)
+	}
+	if task.Run.Subtitles == nil || len(task.Run.Subtitles.Cues) == 0 {
+		t.Fatalf("确认提示词后应产出字幕：%+v", task.Run.Subtitles)
+	}
+	if !fileExists(task.Run.Subtitles.SRTPath) {
+		t.Fatalf("SRT 没落盘: %s", task.Run.Subtitles.SRTPath)
+	}
+	if logs := strings.Join(task.Run.Logs, "\n"); !strings.Contains(logs, "字幕已生成") {
+		t.Fatalf("日志要留下字幕生成记录：%v", task.Run.Logs)
+	}
+}
+
+// 关卡②改台词只作废旧字幕，不等确认不再生成：字幕时机固定在 gate② 之后。
+func TestPromptStageEditClearsSubtitlesInsteadOfRebuilding(t *testing.T) {
+	withTempVideoRoot(t)
+	app := newTestApp(t)
+
+	created, err := app.CreateVideoTask(VideoTaskInput{Config: VideoRunConfig{
+		Topic: "字幕时机", DurationS: 8, Adapter: "mock", Subtitles: true,
+	}})
+	if err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	task, err := app.videoTaskByID(created.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	task.Stage = VideoStageConfirmPrompt
+	task.Status = VideoStatusWaiting
+	task.Run.Script = &VideoScript{Shots: []VideoShot{{ID: "s1", TimeRange: [2]float64{0, 8}, DurationS: 8, Dialogue: "旧台词"}}}
+	task.Run.Prompts = []VideoPromptItem{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: "旧台词", Start: 0, End: 8}}
+	task.Run.Subtitles = &VideoSubtitles{SRTPath: "output/subtitles.srt"}
+	if err := app.updateVideoTaskRecord(task); err != nil {
+		t.Fatalf("写入任务失败: %v", err)
+	}
+
+	saved, err := app.SaveVideoStageEdits(created.ID, VideoGateEdits{
+		Prompts: []VideoPromptEdit{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: "新台词"}},
+	})
+	if err != nil {
+		t.Fatalf("保存提示词修改失败: %v", err)
+	}
+	if saved.Run.Subtitles != nil {
+		t.Fatalf("关卡②不该提前生成字幕：%+v", saved.Run.Subtitles)
+	}
+	if logs := strings.Join(saved.Run.Logs, "\n"); !strings.Contains(logs, "字幕将在确认后重新生成") {
+		t.Fatalf("日志要说明字幕等确认后重生：%v", saved.Run.Logs)
+	}
+}
+
+// v0.0.5 之前的任务存在 BUILD_PROMPT_SUBS 阶段，读取时要落回拆分后的提示词阶段。
+func TestLegacyBuildPromptStageAlias(t *testing.T) {
+	if got := normalizeVideoStage("BUILD_PROMPT_SUBS"); got != VideoStageBuildPrompt {
+		t.Fatalf("旧阶段名要映射到新阶段：%q", got)
+	}
+	if got := normalizeVideoStage(VideoStageBuildSubs); got != VideoStageBuildSubs {
+		t.Fatalf("当前阶段名不该被改写：%q", got)
+	}
+}
