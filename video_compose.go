@@ -71,6 +71,176 @@ func extractLastFrame(ctx context.Context, clipPath, framePath string) error {
 	)
 }
 
+/* ---------------- 接缝冻帧裁剪：逐帧 SSIM 比较下一段开头帧与上一段尾帧 ---------------- */
+
+// ssimFreezeThreshold：开头帧与上一段尾帧的 SSIM 高于此值＝视觉几乎相同（模型还在重放条件尾帧），
+// 标记为应删帧；一旦降到阈值以下说明真实运动恢复，从该帧起保留。
+const ssimFreezeThreshold = 0.995
+
+// freezeScanMaxFrames：每个接缝最多比对这么多帧。冻帧通常远小于 1 秒，
+// 超出窗口仍“冻”的按创作内容处理，不再多删，避免误删整段静画面。
+const freezeScanMaxFrames = 30
+
+// 不同 ffmpeg 版本回显大小写不一（all:/All:），统一不敏感匹配
+var ssimAllPattern = regexp.MustCompile(`(?i)all:([0-9]+(?:\.[0-9]+)?)`)
+
+// frameSSIM 用 ffmpeg ssim 滤镜算两张图的灰度相似度，从 stderr 回显里读 all 值。
+// 两图尺寸不一致时 ssim 会直接报错，由调用方视为“无法判定”跳过裁剪。
+func frameSSIM(ctx context.Context, ffmpeg, imageA, imageB string) (float64, error) {
+	cmd := exec.CommandContext(ctx, ffmpeg, "-hide_banner", "-y",
+		"-i", imageA, "-i", imageB,
+		"-filter_complex", "[0:v]format=gray[g0];[1:v]format=gray[g1];[g0][g1]ssim",
+		"-f", "null", "-",
+	)
+	configureHiddenProcess(cmd)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = &stderr
+	if err := cmd.Run(); err != nil {
+		return 0, fmt.Errorf("SSIM 比对失败: %s", commandErrorText(stderr.String()))
+	}
+	matched := ssimAllPattern.FindStringSubmatch(stderr.String())
+	if matched == nil {
+		return 0, fmt.Errorf("没能从 ssim 输出里读到相似度: %s", commandErrorText(stderr.String()))
+	}
+	value, err := strconv.ParseFloat(matched[1], 64)
+	if err != nil {
+		return 0, fmt.Errorf("解析 SSIM 值失败: %w", err)
+	}
+	return value, nil
+}
+
+// countFrozenHeadFrames 逐帧比较待接片段开头与上一段尾帧，返回应删的开头帧数。
+// prebuiltTail 非空且存在时直接用它（渲染阶段存下的条件图，就是模型重放的那一帧），没有才从上一段抽取。
+func countFrozenHeadFrames(ctx context.Context, ffmpeg, prevClip, headClip, scanDir, prebuiltTail string) (int, error) {
+	if err := os.RemoveAll(scanDir); err != nil {
+		return 0, err
+	}
+	if err := os.MkdirAll(scanDir, 0o755); err != nil {
+		return 0, err
+	}
+	tailFrame := filepath.Join(scanDir, "tail.png")
+	if prebuiltTail != "" && fileExists(prebuiltTail) {
+		tailFrame = prebuiltTail
+	} else if err := extractLastFrame(ctx, prevClip, tailFrame); err != nil {
+		return 0, err
+	}
+	if err := runCommand(ctx, ffmpeg,
+		"-y", "-i", headClip, "-vsync", "0", "-frames:v", strconv.Itoa(freezeScanMaxFrames),
+		"-q:v", "2", filepath.Join(scanDir, "f%03d.png"),
+	); err != nil {
+		return 0, fmt.Errorf("抽取开头帧失败: %w", err)
+	}
+	frames, err := filepath.Glob(filepath.Join(scanDir, "f*.png"))
+	if err != nil || len(frames) == 0 {
+		return 0, errors.New("没有可比的开头帧")
+	}
+	discard := 0
+	for _, frame := range frames {
+		value, err := frameSSIM(ctx, ffmpeg, frame, tailFrame)
+		if err != nil {
+			return 0, err
+		}
+		if value <= ssimFreezeThreshold {
+			break // 真实运动恢复，这一帧起全部保留
+		}
+		discard++
+	}
+	return discard, nil
+}
+
+// trimHeadFrames 去掉片段开头 count 帧。重编码音视频同步裁掉同一时间偏移，
+// 保证字幕测时与对白不失同步；输入侧 -ss 配合重编码在 ffmpeg 里是帧精确的。
+func trimHeadFrames(ctx context.Context, ffmpeg, input, output string, count int, fps float64) error {
+	if fps <= 0 {
+		fps = 24
+	}
+	offset := float64(count) / fps
+	return runCommand(ctx, ffmpeg,
+		"-y", "-ss", fmt.Sprintf("%.5f", offset), "-i", input,
+		"-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+		"-c:a", "aac", "-movflags", "+faststart", output,
+	)
+}
+
+// composeClip 合成阶段参与拼接的一个片段。
+type composeClip struct {
+	SegmentID string
+	Path      string
+}
+
+// trimFrozenClipHeads 从第二段起逐接缝检测并裁掉冻帧重复帧，返回拼接清单、
+// 段 ID → 实际入片文件（字幕按裁剪后文件实测时长）与给用户看的说明。
+// 任一接缝判定失败只跳过该接缝（保持原有硬切行为），不阻断合成。
+func trimFrozenClipHeads(ctx context.Context, ffmpeg, workDir, outputDir string, clips []composeClip, defaultFps int) ([]string, map[string]string, []string) {
+	paths := make([]string, len(clips))
+	composed := make(map[string]string, len(clips))
+	for index, clip := range clips {
+		paths[index] = clip.Path
+		composed[clip.SegmentID] = clip.Path
+	}
+	warnings := make([]string, 0, 2)
+	if len(clips) < 2 {
+		return paths, composed, warnings
+	}
+
+	scanBase := filepath.Join(outputDir, "freeze-scan")
+	_ = os.RemoveAll(scanBase)
+	for index := 1; index < len(clips); index++ {
+		clip := clips[index]
+		select {
+		case <-ctx.Done():
+			warnings = append(warnings, "冻帧裁剪超时，剩余接缝按硬切拼接")
+			return paths, composed, warnings
+		default:
+		}
+
+		// 渲染阶段给本段抽过条件尾帧就直接用它比对，比“上一段的最后一帧”更贴合模型重放的源
+		prebuiltTail := filepath.Join(workDir, "clips", clip.SegmentID+"-tail.png")
+		discard, err := countFrozenHeadFrames(ctx, ffmpeg, clips[index-1].Path, clip.Path,
+			filepath.Join(scanBase, clip.SegmentID), prebuiltTail)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("第 %d 段冻帧检测失败，该接缝按硬切拼接: %v", index+1, err))
+			continue
+		}
+		if discard <= 0 {
+			continue
+		}
+
+		// 防止把整段都删空：比对的只是开头窗口，若窗口内全冻且快抵到全段时长，只保留尾部安全帧
+		info, probeErr := mediaProbe(ctx, clip.Path)
+		fps := info.FPS
+		if fps <= 0 {
+			if defaultFps > 0 {
+				fps = float64(defaultFps)
+			} else {
+				fps = 24
+			}
+		}
+		if probeErr == nil && info.Duration > 0 {
+			totalFrames := int(math.Round(info.Duration * fps))
+			if discard >= totalFrames-1 {
+				warnings = append(warnings, fmt.Sprintf("第 %d 段开头整段与上一段尾帧相同，为避免删空已按原样硬切", index+1))
+				continue
+			}
+		}
+
+		trimmed := filepath.Join(outputDir, fmt.Sprintf("trim-%s.mp4", clip.SegmentID))
+		if err := trimHeadFrames(ctx, ffmpeg, clip.Path, trimmed, discard, fps); err != nil {
+			warnings = append(warnings, fmt.Sprintf("第 %d 段冻帧裁剪失败，该接缝按硬切拼接: %v", index+1, err))
+			continue
+		}
+		paths[index] = trimmed
+		composed[clip.SegmentID] = trimmed
+		warnings = append(warnings, fmt.Sprintf(
+			"第 %d 段开头 %d 帧与上一段尾帧 SSIM>%.3f（还在冻帧），已删除，运动恢复后保留",
+			index+1, discard, ssimFreezeThreshold,
+		))
+	}
+	_ = os.RemoveAll(scanBase)
+	return paths, composed, warnings
+}
+
 // concatVideoClips 多段拼接：优先流拷贝，失败再统一重编码（避免分辨率/编码不一致）。
 func concatVideoClips(ctx context.Context, clips []string, output string) error {
 	ffmpeg, ok := ffmpegPath()
@@ -111,6 +281,7 @@ type mediaInfo struct {
 	Height   int
 	Duration float64
 	HasAudio bool
+	FPS      float64
 }
 
 // mediaProbe 读视频片段的画面尺寸、时长与有无音轨。字幕对齐和画幅兜底都依赖实测，
@@ -134,7 +305,7 @@ func mediaProbe(ctx context.Context, path string) (mediaInfo, error) {
 func probeWithFFprobe(ctx context.Context, ffprobe, path string) (mediaInfo, error) {
 	cmd := exec.CommandContext(ctx, ffprobe,
 		"-v", "error",
-		"-show_entries", "stream=codec_type,width,height,duration:format=duration",
+		"-show_entries", "stream=codec_type,width,height,duration,r_frame_rate:format=duration",
 		"-of", "json", path,
 	)
 	configureHiddenProcess(cmd)
@@ -150,6 +321,8 @@ func probeWithFFprobe(ctx context.Context, ffprobe, path string) (mediaInfo, err
 			Height    int    `json:"height"`
 			// ffprobe 的 JSON 把数值都输出为字符串，声明成 float64 会直接解析失败
 			Duration string `json:"duration"`
+			// 帧率是 "24/1" 这样的分数，删帧后算时间偏移要用
+			FrameRate string `json:"r_frame_rate"`
 		} `json:"streams"`
 		Format struct {
 			Duration string `json:"duration"`
@@ -167,6 +340,7 @@ func probeWithFFprobe(ctx context.Context, ffprobe, path string) (mediaInfo, err
 				if info.Duration <= 0 {
 					info.Duration, _ = strconv.ParseFloat(strings.TrimSpace(stream.Duration), 64)
 				}
+				info.FPS = parseFrameRate(stream.FrameRate)
 			}
 		case "audio":
 			info.HasAudio = true
@@ -185,7 +359,25 @@ var (
 	probeDurationPattern = regexp.MustCompile(`Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)`)
 	probeVideoPattern    = regexp.MustCompile(`Stream #\d+:\d+[^:]*:\s*Video:[^\n]*?(\d{2,5})x(\d{2,5})`)
 	probeAudioPattern    = regexp.MustCompile(`Stream #\d+:\d+[^:]*:\s*Audio:`)
+	probeFPSPattern      = regexp.MustCompile(`Video:[^\n]*?,\s*(\d+(?:\.\d+)?)\s*fps`)
 )
+
+// parseFrameRate 解析 ffprobe 的 r_frame_rate 分数（"24/1"）；异常时返回 0 交给上层兜底。
+func parseFrameRate(raw string) float64 {
+	parts := strings.SplitN(strings.TrimSpace(raw), "/", 2)
+	numerator, err := strconv.ParseFloat(parts[0], 64)
+	if err != nil || numerator <= 0 {
+		return 0
+	}
+	if len(parts) == 1 {
+		return numerator
+	}
+	denominator, err := strconv.ParseFloat(parts[1], 64)
+	if err != nil || denominator <= 0 {
+		return 0
+	}
+	return numerator / denominator
+}
 
 // probeWithFFmpeg 从 `ffmpeg -i` 的 stderr 回显里取元数据（没有流时 ffmpeg 也会先打完信息再报错）。
 func probeWithFFmpeg(ctx context.Context, path string) (mediaInfo, error) {
@@ -218,6 +410,9 @@ func parseFFmpegMetadata(text string) mediaInfo {
 		second, _ := strconv.ParseFloat(matched[3], 64)
 		info.Duration = hour*3600 + minute*60 + second
 	}
+	if matched := probeFPSPattern.FindStringSubmatch(text); matched != nil {
+		info.FPS, _ = strconv.ParseFloat(matched[1], 64)
+	}
 	info.HasAudio = probeAudioPattern.MatchString(text)
 	return info
 }
@@ -225,7 +420,8 @@ func parseFFmpegMetadata(text string) mediaInfo {
 // measuredSubtitleSpans 用片段真实时长重排字幕时间轴。
 // 拼接是硬切，第 N 段的起点就是它之前所有已入选片段实际时长之和；
 // 沿用计划时长会逐段累计偏移，到后半段字幕就和对白错开了。
-func measuredSubtitleSpans(ctx context.Context, plan *VideoPlan, renders []VideoRender) ([]SubtitleSpan, error) {
+// composedBySegment 是冻帧裁剪后实际入片的文件映射，测时必须跟着裁剪后的时长走。
+func measuredSubtitleSpans(ctx context.Context, plan *VideoPlan, renders []VideoRender, composedBySegment map[string]string) ([]SubtitleSpan, error) {
 	if plan == nil || len(plan.Segments) == 0 {
 		return nil, errors.New("缺少渲染计划，无法建字幕时间轴")
 	}
@@ -242,7 +438,11 @@ func measuredSubtitleSpans(ctx context.Context, plan *VideoPlan, renders []Video
 		if !ok {
 			continue // 失败/跳过的段不进成片，时间轴也不给它留位
 		}
-		info, err := mediaProbe(ctx, render.VideoURI)
+		probePath := render.VideoURI
+		if composed, ok := composedBySegment[segment.ID]; ok && fileExists(composed) {
+			probePath = composed
+		}
+		info, err := mediaProbe(ctx, probePath)
 		if err != nil {
 			return nil, err
 		}
@@ -560,14 +760,23 @@ func composeVideo(ctx context.Context, workDir, taskID string, cfg VideoRunConfi
 
 	// 字幕默认关闭：未开启时不准备字幕文件（时间轴要等片段就位才能实测，放到后面处理）
 
-	clips := make([]string, 0, len(run.Renders))
+	selected := make([]composeClip, 0, len(run.Renders))
 	for _, render := range run.Renders {
 		if render.Status == "succeeded" && fileExists(render.VideoURI) {
-			clips = append(clips, render.VideoURI)
+			selected = append(selected, composeClip{SegmentID: render.SegmentID, Path: render.VideoURI})
 		}
 	}
-	if len(clips) == 0 {
+	if len(selected) == 0 {
 		return output, warnings, errors.New("没有可合成的视频片段")
+	}
+	clips := make([]string, 0, len(selected))
+	for _, clip := range selected {
+		clips = append(clips, clip.Path)
+	}
+	// 段 ID → 实际入片文件；冻帧裁剪会替换开头冻帧较多的段，字幕测时要用裁剪后的文件
+	composedBySegment := make(map[string]string, len(selected))
+	for _, clip := range selected {
+		composedBySegment[clip.SegmentID] = clip.Path
 	}
 
 	ffmpeg, hasFFmpeg := ffmpegPath()
@@ -580,6 +789,14 @@ func composeVideo(ctx context.Context, workDir, taskID string, cfg VideoRunConfi
 
 	merged := clips[0]
 	if len(clips) > 1 {
+		// 尾帧延续下服务商常在下一段开头重放条件尾帧并冻住几帧；逐帧 SSIM 比对、删冻帧后再拼，接缝才不顿
+		if cfg.ContinuationMode == "last_frame" {
+			freezeCtx, cancelFreeze := context.WithTimeout(ctx, 20*time.Minute)
+			var freezeWarnings []string
+			clips, composedBySegment, freezeWarnings = trimFrozenClipHeads(freezeCtx, ffmpeg, workDir, outputDir, selected, cfg.Fps)
+			cancelFreeze()
+			warnings = append(warnings, freezeWarnings...)
+		}
 		merged = filepath.Join(outputDir, "merged.mp4")
 		concatCtx, cancel := context.WithTimeout(ctx, 45*time.Minute)
 		err := concatVideoClips(concatCtx, clips, merged)
@@ -619,7 +836,7 @@ func composeVideo(ctx context.Context, workDir, taskID string, cfg VideoRunConfi
 	}
 
 	if cfg.Subtitles {
-		spans, spanErr := measuredSubtitleSpans(ctx, run.Plan, run.Renders)
+		spans, spanErr := measuredSubtitleSpans(ctx, run.Plan, run.Renders, composedBySegment)
 		timingSource := "measured"
 		if spanErr != nil {
 			if run.Plan == nil {

@@ -6,8 +6,14 @@ import { reactive } from 'vue'
  */
 export const videoNav = reactive({
   focusTaskId: '',
+  /** 项目视图尾帧「用为新建首帧」的交接：新建任务页挂载时自动填入并清空 */
+  pendingFirstFramePath: '',
 })
 
 export function focusVideoTask(taskId: string) {
   videoNav.focusTaskId = taskId
+}
+
+export function handoffTailFrame(imagePath: string) {
+  videoNav.pendingFirstFramePath = imagePath
 }

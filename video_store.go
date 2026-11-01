@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const videoTaskColumns = `id, title, stage, status, error, config_json, context_json, created_at, updated_at, template_id`
+const videoTaskColumns = `id, title, stage, status, error, config_json, context_json, created_at, updated_at, template_id, project_id`
 
 func randomHex(size int) string {
 	buf := make([]byte, size)
@@ -34,7 +34,7 @@ func scanVideoTask(scanner interface{ Scan(dest ...any) error }) (VideoTask, err
 	var configJSON, contextJSON string
 	if err := scanner.Scan(
 		&task.ID, &task.Title, &task.Stage, &task.Status, &task.Error,
-		&configJSON, &contextJSON, &task.CreatedAt, &task.UpdatedAt, &task.TemplateID,
+		&configJSON, &contextJSON, &task.CreatedAt, &task.UpdatedAt, &task.TemplateID, &task.ProjectID,
 	); err != nil {
 		return task, err
 	}
@@ -133,12 +133,19 @@ func (a *App) CreateVideoTask(input VideoTaskInput) (VideoTask, error) {
 	}
 
 	now := time.Now().Format(time.RFC3339)
+	// 归属项目必须存在；选了个不存在的项目就当未归类，不给创建添堵
+	projectID := strings.TrimSpace(input.ProjectID)
+	if projectID != "" && !a.videoProjectExists(projectID) {
+		warnings = append(warnings, "归属项目不存在或已被删除，任务已按未归类创建")
+		projectID = ""
+	}
 	task := VideoTask{
 		ID:         newVideoTaskID(),
 		Title:      strings.TrimSpace(input.Title),
 		Stage:      VideoStageDraftScript,
 		Status:     VideoStatusDraft,
 		TemplateID: templateID,
+		ProjectID:  projectID,
 		Config:     cfg,
 		Run: VideoRunContext{
 			Adapter:       cfg.Adapter,
@@ -164,8 +171,8 @@ func (a *App) CreateVideoTask(input VideoTaskInput) (VideoTask, error) {
 	}
 
 	if _, err := a.db.Exec(
-		`INSERT INTO video_tasks (`+videoTaskColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		task.ID, task.Title, task.Stage, task.Status, task.Error, configJSON, contextJSON, task.CreatedAt, task.UpdatedAt, task.TemplateID,
+		`INSERT INTO video_tasks (`+videoTaskColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		task.ID, task.Title, task.Stage, task.Status, task.Error, configJSON, contextJSON, task.CreatedAt, task.UpdatedAt, task.TemplateID, task.ProjectID,
 	); err != nil {
 		return VideoTask{}, fmt.Errorf("创建视频任务失败: %w", err)
 	}

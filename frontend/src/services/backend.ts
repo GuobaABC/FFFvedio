@@ -7,8 +7,11 @@ import type {
   SiteProfile,
 } from '../types/crawl'
 import type {
+  TailFrameAsset,
   VideoEnvironment,
   VideoGateEdits,
+  VideoProject,
+  VideoSegmentRegen,
   VideoTask,
   VideoTaskInput,
 } from '../types/video'
@@ -36,6 +39,20 @@ interface AppBindings {
   RegenerateVideoMeta(id: string, platforms: string[], feedback: string): Promise<void>
   SaveVideoStageEdits(id: string, edits: VideoGateEdits): Promise<VideoTask>
   GetVideoEnvironment(): Promise<VideoEnvironment>
+
+  /* 逐段确认关卡 + 尾帧资产 */
+  ApproveVideoSegment(id: string): Promise<void>
+  RegenerateVideoSegment(id: string, edit: VideoSegmentRegen): Promise<void>
+  SuggestSegmentPrompt(id: string, segmentId: string, feedback: string): Promise<string>
+  ListTailFrameAssets(): Promise<TailFrameAsset[]>
+  DeleteTailFrameAsset(id: string): Promise<void>
+
+  /* 项目视图：任务归组 + 归属调整 */
+  ListVideoProjects(): Promise<VideoProject[]>
+  CreateVideoProject(name: string): Promise<VideoProject>
+  RenameVideoProject(id: string, name: string): Promise<void>
+  DeleteVideoProject(id: string): Promise<void>
+  MoveVideoTaskToProject(taskId: string, projectId: string): Promise<void>
 
   /* 视频模板（默认值来源，不绕过确认门） */
   ListVideoTemplates(): Promise<VideoTemplate[]>
@@ -98,6 +115,21 @@ export const backend = {
   saveVideoStageEdits: (id: string, edits: VideoGateEdits): Promise<VideoTask> =>
     bindings().SaveVideoStageEdits(id, edits),
   getVideoEnvironment: (): Promise<VideoEnvironment> => bindings().GetVideoEnvironment(),
+
+  approveVideoSegment: (id: string): Promise<void> => bindings().ApproveVideoSegment(id),
+  regenerateVideoSegment: (id: string, edit: VideoSegmentRegen): Promise<void> =>
+    bindings().RegenerateVideoSegment(id, edit),
+  suggestSegmentPrompt: (id: string, segmentId: string, feedback: string): Promise<string> =>
+    bindings().SuggestSegmentPrompt(id, segmentId, feedback),
+  listTailFrameAssets: (): Promise<TailFrameAsset[]> => bindings().ListTailFrameAssets(),
+  deleteTailFrameAsset: (id: string): Promise<void> => bindings().DeleteTailFrameAsset(id),
+
+  listVideoProjects: (): Promise<VideoProject[]> => bindings().ListVideoProjects(),
+  createVideoProject: (name: string): Promise<VideoProject> => bindings().CreateVideoProject(name),
+  renameVideoProject: (id: string, name: string): Promise<void> => bindings().RenameVideoProject(id, name),
+  deleteVideoProject: (id: string): Promise<void> => bindings().DeleteVideoProject(id),
+  moveVideoTaskToProject: (taskId: string, projectId: string): Promise<void> =>
+    bindings().MoveVideoTaskToProject(taskId, projectId),
 
   listVideoTemplates: (): Promise<VideoTemplate[]> => bindings().ListVideoTemplates(),
   getVideoTemplate: (id: string): Promise<VideoTemplate> => bindings().GetVideoTemplate(id),

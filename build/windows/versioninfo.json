@@ -22,12 +22,12 @@
     "Comments": "Fast Fast Fast",
     "CompanyName": "FFFVedioAgent",
     "FileDescription": "FFFVedioAgent 视频生成智能体",
-    "FileVersion": "0.0.1.0",
+    "FileVersion": "0.0.2.0",
     "InternalName": "FFFVedioAgent",
     "LegalCopyright": "Copyright (C) 2026 FFFVedioAgent",
     "OriginalFilename": "FFFVedioAgent.exe",
     "ProductName": "FFFVedioAgent",
-    "ProductVersion": "0.0.1.0"
+    "ProductVersion": "0.0.2.0"
   },
   "VarFileInfo": {
     "Translation": {

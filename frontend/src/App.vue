@@ -5,6 +5,7 @@ import ProviderSettings from './components/ProviderSettings.vue'
 import CrawlResults from './components/CrawlResults.vue'
 import CrawlTaskCreate from './components/CrawlTaskCreate.vue'
 import TemplateLibrary from './components/TemplateLibrary.vue'
+import VideoProjects from './components/VideoProjects.vue'
 import VideoResults from './components/VideoResults.vue'
 import VideoTaskCreate from './components/VideoTaskCreate.vue'
 import { focusCrawlTask, handoffCrawlItem } from './composables/crawlNav'
@@ -25,7 +26,7 @@ interface MainTab {
 }
 
 const projectName = 'FFFVedioAgent'
-const version = 'v0.0.1'
+const version = 'v0.0.2'
 
 /** 主选项卡：热点爬取（新建任务 → 执行 → 结果）+ 视频生成 + 系统设置 */
 const mainTabs: MainTab[] = [
@@ -43,6 +44,7 @@ const mainTabs: MainTab[] = [
     children: [
       { id: 'video-create', label: '新建任务', description: '' },
       { id: 'video-results', label: '视频生成结果', description: '' },
+      { id: 'video-projects', label: '项目视图', description: '' },
       { id: 'video-templates', label: '模板库', description: '' },
     ],
   },
@@ -114,6 +116,15 @@ function handleTaskCreated(taskId: string) {
   focusVideoTask(taskId)
   activeMainTabId.value = 'video'
   activeSubTabId.value = 'video-results'
+  if (!expandedMainTabIds.value.includes('video')) {
+    expandedMainTabIds.value = [...expandedMainTabIds.value, 'video']
+  }
+}
+
+/** 项目视图尾帧「用为新建首帧」：交接已在组件内完成，这里只切到「视频生成 → 新建任务」 */
+function handleProjectsToCreate() {
+  activeMainTabId.value = 'video'
+  activeSubTabId.value = 'video-create'
   if (!expandedMainTabIds.value.includes('video')) {
     expandedMainTabIds.value = [...expandedMainTabIds.value, 'video']
   }
@@ -211,6 +222,7 @@ onUnmounted(() => {
         <CrawlResults v-else-if="activeSubTab.id === 'crawl-results'" @to-video="handleCrawlToVideo" />
         <VideoTaskCreate v-else-if="activeSubTab.id === 'video-create'" @created="handleTaskCreated" />
         <VideoResults v-else-if="activeSubTab.id === 'video-results'" />
+        <VideoProjects v-else-if="activeSubTab.id === 'video-projects'" @to-create="handleProjectsToCreate" />
         <TemplateLibrary v-else-if="activeSubTab.id === 'video-templates'" @use-template="handleUseTemplate" />
         <ProviderSettings v-else-if="activeSubTab.id === 'providers'" />
         <div v-else class="panel__empty">

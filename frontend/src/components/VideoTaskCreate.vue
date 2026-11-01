@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 
 import { consumeCrawlDraft, type CrawlVideoDraft } from '../composables/crawlNav'
 import { consumePendingTemplate } from '../composables/templateNav'
+import { videoNav } from '../composables/videoNav'
 import { backend, errorText } from '../services/backend'
 import type { Provider } from '../types/provider'
 import {
@@ -22,7 +23,10 @@ import {
   VERTICAL_OPTIONS,
   VIDEO_PLATFORMS,
   createEmptyVideoConfig,
+  formatClock,
+  type TailFrameAsset,
   type VideoEnvironment,
+  type VideoProject,
   type VideoRunConfig,
 } from '../types/video'
 
@@ -36,11 +40,53 @@ const loadError = ref('')
 const providers = ref<Provider[]>([])
 const environment = ref<VideoEnvironment | null>(null)
 
+/* ---------------- 所属项目：任务归组，项目视图按它聚合 ---------------- */
+const projects = ref<VideoProject[]>([])
+const projectId = ref('')
+/** 项目视图「用为新建首帧」交接来的尾帧路径提示 */
+const tailHandoffHint = ref('')
+
 /** 从「热点爬取 → 爬取结果」带入的素材草稿（只消费一次） */
 const sourceDraft = ref<CrawlVideoDraft | null>(null)
 
 /** 角色参考图以「; 分隔的路径文本」编辑，提交时再转成 images 数组 */
 const characterImagesText = ref<string[]>([])
+
+/* ---------------- 尾帧资产：历史任务的尾帧可直接选作本任务首帧 ---------------- */
+const tailAssets = ref<TailFrameAsset[]>([])
+const showTailAssets = ref(false)
+const tailAssetsError = ref('')
+
+async function loadTailAssets() {
+  try {
+    tailAssets.value = await backend.listTailFrameAssets()
+    tailAssetsError.value = ''
+  } catch (error) {
+    tailAssets.value = []
+    tailAssetsError.value = errorText(error)
+  }
+}
+
+async function toggleTailAssetPicker() {
+  showTailAssets.value = !showTailAssets.value
+  if (showTailAssets.value) {
+    await loadTailAssets()
+  }
+}
+
+function useTailFrame(asset: TailFrameAsset) {
+  form.firstFrame = asset.imagePath
+  showTailAssets.value = false
+}
+
+async function removeTailAsset(assetId: string) {
+  try {
+    await backend.deleteTailFrameAsset(assetId)
+    await loadTailAssets()
+  } catch (error) {
+    tailAssetsError.value = errorText(error)
+  }
+}
 
 /* ---------------- 模板：只预填默认值，不绕过三道确认门 ---------------- */
 
@@ -427,10 +473,16 @@ onMounted(async () => {
     sourceDraft.value = draft
     form.topic = draft.topic
   }
+  // 项目视图尾帧「用为新建首帧」交接：填入首帧并提示来源（只消费一次）
+  if (videoNav.pendingFirstFramePath) {
+    form.firstFrame = videoNav.pendingFirstFramePath
+    tailHandoffHint.value = videoNav.pendingFirstFramePath
+    videoNav.pendingFirstFramePath = ''
+  }
   // 来自模板库的「用此模板新建任务」（只消费一次）
   void loadTemplates(consumePendingTemplate())
   try {
-    const [providerList, env] = await Promise.all([
+    const [providerList, env, projectList] = await Promise.all([
       backend.listProviders().catch((error) => {
         loadError.value = errorText(error)
         return [] as Provider[]
@@ -439,9 +491,11 @@ onMounted(async () => {
         loadError.value = errorText(error)
         return null
       }),
+      backend.listVideoProjects().catch(() => [] as VideoProject[]),
     ])
     providers.value = providerList
     environment.value = env
+    projects.value = projectList ?? []
   } catch (error) {
     loadError.value = errorText(error)
   }
@@ -534,7 +588,11 @@ async function submit() {
 
   submitting.value = true
   try {
-    const task = await backend.createVideoTask({ title: title.value.trim(), config })
+    const task = await backend.createVideoTask({
+      title: title.value.trim(),
+      projectId: projectId.value,
+      config,
+    })
     emit('created', task.id)
   } catch (error) {
     submitError.value = errorText(error)
@@ -687,6 +745,15 @@ async function submit() {
             <span class="ui-label">任务标题（可选）</span>
             <input v-model="title" class="ui-input" type="text" placeholder="留空则用主题自动生成" />
           </label>
+          <label class="ui-field">
+            <span class="ui-label">所属项目</span>
+            <select v-model="projectId" class="ui-select">
+              <option value="">未归类</option>
+              <option v-for="project in projects" :key="project.id" :value="project.id">
+                {{ project.name }}
+              </option>
+            </select>
+          </label>
           <div class="ui-field">
             <span class="ui-label">首帧图片（本地路径或 URL）</span>
             <span class="row">
@@ -698,7 +765,28 @@ async function submit() {
                 placeholder="C:\images\first.png 或 https://..."
               />
               <button class="ui-btn" type="button" @click="pickFirstFrame">选择…</button>
+              <button class="ui-btn ui-btn--ghost" type="button" @click="toggleTailAssetPicker">
+                {{ showTailAssets ? '收起尾帧库' : '从尾帧资产选择' }}
+              </button>
             </span>
+            <p v-if="tailHandoffHint" class="hint hint--warn">
+              已从项目视图的尾帧资产带入首帧：{{ tailHandoffHint }}
+            </p>
+            <div v-if="showTailAssets" class="tail-picker">
+              <p v-if="tailAssetsError" class="hint hint--warn">{{ tailAssetsError }}</p>
+              <p v-else-if="tailAssets.length === 0" class="hint">
+                尾帧资产库为空：在任务创建页或设置中开启「保留最后一段尾帧到资产库」后，完成的任务会在这里出现尾帧图。
+              </p>
+              <div v-for="asset in tailAssets" :key="asset.id" class="tail-item">
+                <img v-if="asset.mediaUrl" class="tail-item__img" :src="asset.mediaUrl" alt="尾帧" />
+                <div class="tail-item__info">
+                  <span class="tail-item__title">{{ asset.taskTitle || asset.taskId }}</span>
+                  <span class="tail-item__meta">{{ formatClock(asset.createdAt) }}</span>
+                </div>
+                <button class="ui-btn" type="button" @click="useTailFrame(asset)">用作首帧</button>
+                <button class="ui-btn ui-btn--ghost" type="button" @click="removeTailAsset(asset.id)">移除</button>
+              </div>
+            </div>
           </div>
         </div>
         <p class="hint">
@@ -767,6 +855,20 @@ async function submit() {
             </select>
           </label>
         </div>
+        <div class="chips chips--options">
+          <label class="check check--inline">
+            <input v-model="form.segmentReview" type="checkbox" />
+            逐段确认（每段生成后先预览确认，再生成下一段）
+          </label>
+          <label class="check check--inline">
+            <input v-model="form.keepLastFrame" type="checkbox" />
+            保留最后一段尾帧到资产库
+          </label>
+        </div>
+        <p class="hint">
+          逐段确认开启后，渲染阶段每生成一段就停住等你验收：不满意可修改提示词（或让 AI 重写）只重生成这一段；
+          关闭则一次串行生成全部片段。开启保留尾帧后，最后一段的尾帧会存入资产库，其他任务可选作首帧续写。
+        </p>
         <p class="hint">{{ adapterHint }}</p>
         <p class="hint">{{ aspectHint }}</p>
       </section>
@@ -1254,5 +1356,62 @@ async function submit() {
   .character {
     grid-template-columns: 1fr;
   }
+}
+
+.chips--options {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.chips--options .check--inline {
+  align-self: center;
+  padding-bottom: 0;
+}
+
+.tail-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.tail-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tail-item__img {
+  width: 96px;
+  height: 54px;
+  object-fit: cover;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: #000;
+}
+
+.tail-item__info {
+  display: flex;
+  flex-direction: column;
+  min-width: 120px;
+  flex: 1;
+}
+
+.tail-item__title {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.tail-item__meta {
+  font-size: 11px;
+  color: var(--color-text-muted);
 }
 </style>

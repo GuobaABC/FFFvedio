@@ -18,7 +18,9 @@ import {
   estimateSpeech,
   formatClock,
   formatSeconds,
+  type TailFrameAsset,
   type VideoPromptEdit,
+  type VideoSegment,
   type VideoShot,
   type VideoTask,
 } from '../types/video'
@@ -116,6 +118,7 @@ const templateName = computed(() => templateRun.value?.name || props.task.templa
 const canRun = computed(
   () =>
     !isRunning.value &&
+    !reviewPendingSegment.value &&
     (props.task.stage === 'DRAFT_SCRIPT' ||
       props.task.stage === 'RENDER_VIDEO' ||
       props.task.stage === 'COMPOSE' ||
@@ -299,6 +302,106 @@ function removeTask() {
   })
   confirmDelete.value = false
 }
+
+/* ---------------- 逐段确认关卡 ---------------- */
+const segPromptDraft = ref('')
+const segDialogueDraft = ref('')
+const segFeedbackDraft = ref('')
+
+/** 待确认的片段（开启逐段确认且本段新渲染成功） */
+const reviewPendingSegment = computed<VideoSegment | null>(() => {
+  const pendingId = run.value?.reviewPendingSegment ?? ''
+  if (!pendingId || props.task.stage !== 'RENDER_VIDEO') {
+    return null
+  }
+  return (plan.value?.segments ?? []).find((segment) => segment.id === pendingId) ?? null
+})
+
+/** 渲染失败的片段：同样支持改提示词后只重试这一段 */
+const failedSegment = computed<VideoSegment | null>(() => {
+  if (reviewPendingSegment.value || props.task.stage !== 'RENDER_VIDEO') {
+    return null
+  }
+  const failedRender = (run.value?.renders ?? []).find((render) => render.status === 'failed')
+  if (!failedRender) {
+    return null
+  }
+  return (plan.value?.segments ?? []).find((segment) => segment.id === failedRender.segmentId) ?? null
+})
+
+const reviewSegment = computed(() => reviewPendingSegment.value ?? failedSegment.value)
+const reviewIsLast = computed(
+  () => reviewSegment.value != null && reviewSegment.value.index >= (plan.value?.clipCount ?? 1) - 1,
+)
+
+/* 切换待审片段时才重置草稿，避免 2s 轮询覆盖用户正在输入的内容 */
+watch(
+  () => `${props.task.id}:${reviewSegment.value?.id ?? ''}`,
+  () => {
+    segPromptDraft.value = reviewSegment.value?.prompt ?? ''
+    segDialogueDraft.value = reviewSegment.value?.dialogue ?? ''
+    segFeedbackDraft.value = ''
+  },
+  { immediate: true },
+)
+
+function approveSegment() {
+  void guard('approve-segment', async () => {
+    await backend.approveVideoSegment(props.task.id)
+    actionInfo.value = reviewIsLast.value ? '片段已确认，进入合成阶段' : '片段已确认，开始生成下一段'
+  })
+}
+
+function regenerateSegment() {
+  const segment = reviewSegment.value
+  if (!segment) {
+    return
+  }
+  void guard('regen-segment', async () => {
+    await backend.regenerateVideoSegment(props.task.id, {
+      segmentId: segment.id,
+      visualPrompt: segPromptDraft.value.trim(),
+      dialogue: segDialogueDraft.value.trim(),
+    })
+    segFeedbackDraft.value = ''
+    actionInfo.value = '已按修改后的提示词重新生成该段'
+  })
+}
+
+function suggestSegmentPrompt() {
+  const segment = reviewSegment.value
+  if (!segment) {
+    return
+  }
+  void guard('ai-suggest', async () => {
+    const suggestion = await backend.suggestSegmentPrompt(
+      props.task.id,
+      segment.id,
+      segFeedbackDraft.value.trim(),
+    )
+    segPromptDraft.value = suggestion
+    actionInfo.value = 'AI 已按意见重写提示词，可直接重生成该段或继续微调'
+  })
+}
+
+/* ---------------- 尾帧资产（成片输出区展示） ---------------- */
+const tailAssets = ref<TailFrameAsset[]>([])
+const tailAsset = computed(() => tailAssets.value.find((item) => item.taskId === props.task.id) ?? null)
+
+watch(
+  () => `${props.task.id}:${props.task.stage}`,
+  async () => {
+    if (!props.task.config.keepLastFrame) {
+      return
+    }
+    try {
+      tailAssets.value = await backend.listTailFrameAssets()
+    } catch {
+      tailAssets.value = []
+    }
+  },
+  { immediate: true },
+)
 
 function openFolder() {
   void guard('folder', async () => {
@@ -579,8 +682,14 @@ function revealOutput() {
       <header class="block__head">
         <h4 class="block__title">分段渲染</h4>
         <span class="ui-chip">{{ renders.length }} 段</span>
+        <span v-if="reviewPendingSegment" class="ui-chip ui-chip--warn">
+          第 {{ reviewPendingSegment.index + 1 }} 段待确认
+        </span>
       </header>
       <p v-if="renders.length === 0" class="hint">尚未产生片段；确认提示词后开始逐段生成。</p>
+      <p v-if="reviewPendingSegment" class="ui-notice ui-notice--warn">
+        逐段确认已开启：第 {{ reviewPendingSegment.index + 1 }} 段已生成，确认后才开始生成下一段；效果不佳可修改提示词（或让 AI 重写）后只重生成这一段。
+      </p>
       <div v-for="row in renders" :key="row.render.segmentId" class="render">
         <header class="render__head">
           <span class="shot__name">
@@ -594,6 +703,49 @@ function revealOutput() {
         <p v-if="row.render.note" class="hint">{{ row.render.note }}</p>
         <video v-if="row.render.mediaUrl" class="video" :src="row.render.mediaUrl" controls preload="metadata"></video>
         <p v-else class="hint">模型返回：{{ row.render.videoUri || '无本地文件' }}</p>
+
+        <!-- 逐段确认面板：待确认或失败的片段 -->
+        <div v-if="reviewSegment && row.render.segmentId === reviewSegment.id" class="review">
+          <p class="review__title">
+            {{ reviewPendingSegment ? '确认本段效果，或修改提示词后重新生成' : '本段生成失败：可修改提示词后仅重试这一段' }}
+          </p>
+          <label class="ui-field">
+            <span class="ui-label">画面提示词</span>
+            <textarea v-model="segPromptDraft" class="ui-textarea" rows="4"></textarea>
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">台词（改动后字幕时间轴会在合成阶段重建）</span>
+            <textarea v-model="segDialogueDraft" class="ui-textarea" rows="2"></textarea>
+          </label>
+          <div class="feedback">
+            <label class="ui-field">
+              <span class="ui-label">哪里不满意？（供 AI 重写提示词参考）</span>
+              <input
+                v-model="segFeedbackDraft"
+                class="ui-input"
+                type="text"
+                placeholder="例：主体动作僵硬 / 光线太暗 / 镜头推进太快"
+              />
+            </label>
+            <button class="ui-btn" type="button" :disabled="busy !== ''" @click="suggestSegmentPrompt">
+              {{ busy === 'ai-suggest' ? 'AI 撰写中…' : 'AI 优化提示词' }}
+            </button>
+          </div>
+          <div class="actions">
+            <button
+              v-if="reviewPendingSegment"
+              class="ui-btn ui-btn--primary"
+              type="button"
+              :disabled="busy !== ''"
+              @click="approveSegment"
+            >
+              {{ busy === 'approve-segment' ? '提交中…' : reviewIsLast ? '确认，进入合成' : '确认，生成下一段' }}
+            </button>
+            <button class="ui-btn" type="button" :disabled="busy !== ''" @click="regenerateSegment">
+              {{ busy === 'regen-segment' ? '重渲中…' : reviewPendingSegment ? '改提示词并重生成本段' : '修改提示词并重试本段' }}
+            </button>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -617,6 +769,16 @@ function revealOutput() {
       <div class="actions">
         <button class="ui-btn" type="button" :disabled="busy !== ''" @click="revealOutput">在文件夹中定位成片</button>
         <button class="ui-btn" type="button" :disabled="busy !== ''" @click="openFolder">打开任务目录</button>
+      </div>
+      <div v-if="config.keepLastFrame" class="tail">
+        <template v-if="tailAsset">
+          <p class="hint">
+            尾帧已存入资产库（{{ formatClock(tailAsset.createdAt) }}），可在新建任务的「从尾帧资产选择」中用作首帧继续创作。
+          </p>
+          <img v-if="tailAsset.mediaUrl" class="tail__img" :src="tailAsset.mediaUrl" alt="尾帧" />
+          <p v-else class="hint hint--warn">尾帧文件已不在任务目录中，可能已被手动清理。</p>
+        </template>
+        <p v-else class="hint">本任务开启了保留尾帧，最后一段生成成功后会自动存入资产库。</p>
       </div>
     </section>
 
@@ -1109,6 +1271,36 @@ function revealOutput() {
 .video {
   width: 100%;
   max-height: 380px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: #000;
+}
+
+.review {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px dashed rgba(255, 180, 58, 0.55);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 180, 58, 0.05);
+}
+
+.review__title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-accent);
+}
+
+.tail {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tail__img {
+  max-width: 260px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   background: #000;

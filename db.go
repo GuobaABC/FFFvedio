@@ -156,6 +156,27 @@ CREATE TABLE IF NOT EXISTS crawl_audit (
 	created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_crawl_audit_task ON crawl_audit (task_id, id);
+
+-- 尾帧资产：任务最后一段的尾帧图片，供其他任务选作首帧；每任务保留一条（重生成后覆盖）
+CREATE TABLE IF NOT EXISTS tail_frame_assets (
+	id         TEXT PRIMARY KEY,
+	task_id    TEXT NOT NULL,
+	task_title TEXT NOT NULL DEFAULT '',
+	segment_id TEXT NOT NULL DEFAULT '',
+	image_path TEXT NOT NULL,
+	created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tail_frame_assets_task ON tail_frame_assets (task_id, created_at);
+
+-- 视频项目：任务归组容器，从项目里看任务与尾帧
+CREATE TABLE IF NOT EXISTS video_projects (
+	id         TEXT PRIMARY KEY,
+	name       TEXT NOT NULL,
+	note       TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_video_projects_created ON video_projects (created_at);
 `
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("初始化数据表失败: %w", err)
@@ -171,6 +192,15 @@ CREATE INDEX IF NOT EXISTS idx_crawl_audit_task ON crawl_audit (task_id, id);
 	if _, err := db.Exec(`ALTER TABLE providers ADD COLUMN dialect TEXT NOT NULL DEFAULT 'auto'`); err != nil &&
 		!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return fmt.Errorf("升级 providers 表失败: %w", err)
+	}
+
+	// 老库升级：video_tasks 追加 project_id（空串 = 未归类，不强制归属）
+	if _, err := db.Exec(`ALTER TABLE video_tasks ADD COLUMN project_id TEXT NOT NULL DEFAULT ''`); err != nil &&
+		!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return fmt.Errorf("升级 video_tasks 表失败: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_video_tasks_project ON video_tasks (project_id)`); err != nil {
+		return fmt.Errorf("创建项目索引失败: %w", err)
 	}
 
 	return seedBuiltinVideoTemplates(db)

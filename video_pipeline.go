@@ -23,6 +23,10 @@ func (a *App) RunVideoTask(id string) error {
 		return errors.New("当前处于人工确认关卡，请先确认或重新生成")
 	case VideoStageDone:
 		return errors.New("任务已完成；如需重做请使用「重新生成」")
+	case VideoStageRender:
+		if task.Run.ReviewPendingSegment != "" {
+			return errors.New("当前处于片段确认关卡，请先确认或重新生成当前片段")
+		}
 	}
 
 	if !a.beginVideoRun(id) {
@@ -152,6 +156,109 @@ func (a *App) RegenerateVideoMeta(id string, platforms []string, feedback string
 	go func() {
 		defer a.endVideoRun(id)
 		a.runVideoPipeline(id, VideoStageBuildMeta, feedback)
+	}()
+	return nil
+}
+
+// ApproveVideoSegment 确认当前待审核片段，继续生成下一段（最后一段确认后进入合成）。
+func (a *App) ApproveVideoSegment(id string) error {
+	task, err := a.videoTaskByID(id)
+	if err != nil {
+		return err
+	}
+	if a.isVideoTaskRunning(id) {
+		return errors.New("任务正在执行，请稍候")
+	}
+	if task.Stage != VideoStageRender || task.Run.ReviewPendingSegment == "" {
+		return errors.New("当前没有待确认的视频片段")
+	}
+
+	task.Run.ReviewPendingSegment = ""
+	task.Status = VideoStatusRunning
+	task.Error = ""
+	task.Run.Logs = append(task.Run.Logs, stageLog("片段已确认，继续生成下一段"))
+	task.UpdatedAt = time.Now().Format(time.RFC3339)
+
+	if !a.beginVideoRun(id) {
+		return errors.New("任务正在执行，请稍候")
+	}
+	if err := a.updateVideoTaskRecord(task); err != nil {
+		a.endVideoRun(id)
+		return err
+	}
+	go func() {
+		defer a.endVideoRun(id)
+		a.runVideoPipeline(id, VideoStageRender, "")
+	}()
+	return nil
+}
+
+// RegenerateVideoSegment 修改单段提示词/台词后只重渲该段：
+// 之前已成功的片段直接复用（断点续跑逻辑），之后的片段因尾帧链失效一并重渲。
+// 允许在“待确认”或“渲染失败停在 RENDER_VIDEO”两种状态下调用。
+func (a *App) RegenerateVideoSegment(id string, edit VideoSegmentRegen) error {
+	task, err := a.videoTaskByID(id)
+	if err != nil {
+		return err
+	}
+	if a.isVideoTaskRunning(id) {
+		return errors.New("任务正在执行，请稍候")
+	}
+	if task.Stage != VideoStageRender {
+		return errors.New("仅可在视频生成阶段重渲单段")
+	}
+	if task.Run.Plan == nil || len(task.Run.Plan.Segments) == 0 {
+		return errors.New("任务缺少渲染计划，请先确认提示词")
+	}
+
+	target := -1
+	for index, segment := range task.Run.Plan.Segments {
+		if segment.ID == strings.TrimSpace(edit.SegmentID) {
+			target = index
+			break
+		}
+	}
+	if target < 0 {
+		return errors.New("要重生成的片段不在渲染计划中")
+	}
+
+	if prompt := strings.TrimSpace(edit.VisualPrompt); prompt != "" {
+		task.Run.Plan.Segments[target].Prompt = prompt
+	}
+	task.Run.Plan.Segments[target].Dialogue = strings.TrimSpace(edit.Dialogue)
+
+	// 作废目标段及其后的渲染记录：尾帧延续下，下游片段依赖重渲后的画面
+	kept := make([]VideoRender, 0, target)
+	for _, render := range task.Run.Renders {
+		renderIndex := -1
+		for index, segment := range task.Run.Plan.Segments {
+			if segment.ID == render.SegmentID {
+				renderIndex = index
+				break
+			}
+		}
+		if renderIndex >= 0 && renderIndex < target {
+			kept = append(kept, render)
+		}
+	}
+	task.Run.Renders = kept
+	task.Run.Output = nil
+	task.Run.ReviewPendingSegment = ""
+	task.Status = VideoStatusRunning
+	task.Error = ""
+	task.Run.Logs = append(task.Run.Logs, stageLog(fmt.Sprintf("第 %d 段提示词已修改，重新生成该段", target+1)))
+	task.UpdatedAt = time.Now().Format(time.RFC3339)
+
+	if !a.beginVideoRun(id) {
+		return errors.New("任务正在执行，请稍候")
+	}
+	if err := a.updateVideoTaskRecord(task); err != nil {
+		a.endVideoRun(id)
+		return err
+	}
+	go func() {
+		defer a.endVideoRun(id)
+		a.runVideoPipeline(id, VideoStageRender, "")
 	}()
 	return nil
 }
@@ -455,8 +562,15 @@ func (a *App) runVideoPipeline(id, from, feedback string) {
 					runner.warn("发布元数据预生成失败，将在合成后重试: %v", err)
 				}
 			}
-			if err := runner.runRenderStage(); err != nil {
+			paused, err := runner.runRenderStage()
+			if err != nil {
 				runner.fail(err)
+				return
+			}
+			if paused {
+				// 逐段确认关卡：停住等用户确认/重生成，确认后从下一段继续
+				runner.task.Status = VideoStatusWaiting
+				_ = runner.save()
 				return
 			}
 			runner.task.Stage = VideoStageCompose
@@ -589,17 +703,18 @@ func (r *videoRunner) runPromptStage() error {
 }
 
 // runRenderStage Agent3：按段串行生成，支持尾帧延续与断点续跑。
-func (r *videoRunner) runRenderStage() error {
+// 逐段确认开启时，每段新渲染成功即返回 paused=true，由流水线置 waiting 停住等用户动作。
+func (r *videoRunner) runRenderStage() (bool, error) {
 	cfg := r.task.Config
 	adapterID, adapter, provider, warnings, err := r.app.resolveVideoAdapter(cfg)
 	if err != nil {
-		return err
+		return false, err
 	}
 	for _, warning := range warnings {
 		r.warn("%s", warning)
 	}
 	if adapter == nil {
-		return errors.New("未配置可用的视频生成模型：请在「系统设置 - 提供商」登记多模态生成模型，或在任务中选择「本地联调占位」")
+		return false, errors.New("未配置可用的视频生成模型：请在「系统设置 - 提供商」登记多模态生成模型，或在任务中选择「本地联调占位」")
 	}
 	caps := adapterCapabilities(adapter, provider.Model)
 	r.task.Run.Adapter = adapterID
@@ -608,7 +723,7 @@ func (r *videoRunner) runRenderStage() error {
 
 	if r.task.Run.Plan == nil || len(r.task.Run.Plan.Segments) == 0 {
 		if len(r.task.Run.Prompts) == 0 {
-			return errors.New("缺少提示词，无法生成视频")
+			return false, errors.New("缺少提示词，无法生成视频")
 		}
 		plan := buildVideoPlan(cfg, r.task.Run.Prompts, caps, adapterID)
 		r.task.Run.Plan = &plan
@@ -617,8 +732,11 @@ func (r *videoRunner) runRenderStage() error {
 
 	workDir, err := r.app.ensureTaskWorkDir(r.task.ID)
 	if err != nil {
-		return err
+		return false, err
 	}
+
+	// 进入渲染即清空上一轮的待确认标记：确认/重生成后重新评定，失败时不会残留
+	r.task.Run.ReviewPendingSegment = ""
 
 	// 断点续跑：已成功且文件仍在的片段直接复用
 	existing := make(map[string]VideoRender, len(r.task.Run.Renders))
@@ -627,6 +745,7 @@ func (r *videoRunner) runRenderStage() error {
 			existing[render.SegmentID] = render
 		}
 	}
+	taskReview := cfg.segmentReviewEnabled()
 	r.task.Run.Renders = nil
 	r.task.Run.Output = nil
 
@@ -635,6 +754,7 @@ func (r *videoRunner) runRenderStage() error {
 	previousClip := ""
 	// 服务商行为提示（如画幅被改成 adaptive）逐段重复，只进一次日志
 	adapterNotes := make(map[string]bool)
+	newlyRendered := 0
 
 	for _, segment := range segments {
 		if done, ok := existing[segment.ID]; ok {
@@ -689,7 +809,7 @@ func (r *videoRunner) runRenderStage() error {
 			renders[len(renders)-1] = render
 			r.task.Run.Renders = append([]VideoRender{}, renders...)
 			_ = r.save()
-			return fmt.Errorf("第 %d 段生成失败: %w", segment.Index+1, genErr)
+			return false, fmt.Errorf("第 %d 段生成失败: %w", segment.Index+1, genErr)
 		}
 
 		render.Status = "succeeded"
@@ -711,12 +831,38 @@ func (r *videoRunner) runRenderStage() error {
 		renders[len(renders)-1] = render
 		r.task.Run.Renders = append([]VideoRender{}, renders...)
 		previousClip = result.VideoURI
+		newlyRendered++
+
+		// 最后一段成功且开启保留尾帧：抽尾帧存入资产库（失败只警告，不阻断流程）
+		if cfg.KeepLastFrame && segment.Index == len(segments)-1 {
+			tailPath := filepath.Join(workDir, "clips", segment.ID+"-final-tail.png")
+			if err := extractLastFrame(r.ctx, result.VideoURI, tailPath); err != nil {
+				r.warn("保留尾帧失败: %v", err)
+			} else if err := r.app.replaceTailFrameAsset(r.task.ID, r.task.Title, segment.ID, tailPath); err != nil {
+				r.warn("尾帧资产登记失败: %v", err)
+			} else {
+				r.logf("尾帧已存入资产库：%s", tailPath)
+			}
+		}
+
+		// 逐段确认：本段新渲染完成即停住，等用户确认后再生成下一段
+		if taskReview {
+			r.task.Run.ReviewPendingSegment = segment.ID
+			r.task.Run.Renders = append([]VideoRender{}, renders...)
+			r.logf("第 %d/%d 段已生成，等待确认后继续", segment.Index+1, len(segments))
+			_ = r.save()
+			return true, nil
+		}
 		_ = r.save()
 	}
 
 	r.task.Run.Renders = renders
-	r.logf("视频生成完成：%d 段", len(renders))
-	return nil
+	if newlyRendered == 0 {
+		r.logf("全部片段已有产物，跳过渲染阶段")
+	} else {
+		r.logf("视频生成完成：%d 段", len(renders))
+	}
+	return false, nil
 }
 
 // runMetaStage Agent4：发布元数据（标题 / 标签 / 发布时段 / 封面），与视频解耦。

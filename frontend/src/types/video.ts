@@ -58,6 +58,10 @@ export interface VideoRunConfig {
   language: string
   /** 是否生成并烧录字幕；默认关闭，开启后才产出 SRT/ASS 并烧进成片 */
   subtitles: boolean
+  /** 逐段确认：每段生成后停住等用户确认/重生成，默认开启 */
+  segmentReview: boolean
+  /** 保留最后一段尾帧到资产库，供其他任务选作首帧 */
+  keepLastFrame: boolean
   videoParams: VideoParams
   subtitleStyle: VideoSubtitleStyle
   adapter: VideoAdapterId | string
@@ -184,6 +188,8 @@ export interface VideoRunContext {
   warnings: string[] | null
   logs: string[] | null
   feedback: string
+  /** 逐段确认关卡：等待用户确认的片段 ID（空 = 无待确认） */
+  reviewPendingSegment: string
 }
 
 export interface VideoTask {
@@ -194,6 +200,8 @@ export interface VideoTask {
   error: string
   /** 任务引用的模板 ID（空 = 未使用模板） */
   templateId: string
+  /** 归属项目 ID（空 = 未归类） */
+  projectId: string
   config: VideoRunConfig
   run: VideoRunContext
   createdAt: string
@@ -202,6 +210,7 @@ export interface VideoTask {
 
 export interface VideoTaskInput {
   title: string
+  projectId: string
   config: VideoRunConfig
 }
 
@@ -215,6 +224,38 @@ export interface VideoGateEdits {
   shots: VideoShot[]
   prompts: VideoPromptEdit[]
   meta?: VideoPublishEdit | null
+}
+
+/** 单段重生成入参：改该段提示词/台词后只重渲这一段及其后 */
+export interface VideoSegmentRegen {
+  segmentId: string
+  visualPrompt: string
+  dialogue: string
+}
+
+/** 尾帧资产：任务最后一段的尾帧，可在新任务里选作首帧 */
+export interface TailFrameAsset {
+  id: string
+  taskId: string
+  taskTitle: string
+  segmentId: string
+  /** 跟随来源任务的归属项目（任务被删后为空 = 未归类） */
+  projectId: string
+  imagePath: string
+  mediaUrl: string
+  createdAt: string
+}
+
+/** 项目：任务的归组容器，项目视图按它看任务与尾帧 */
+export interface VideoProject {
+  id: string
+  name: string
+  note: string
+  /** 以下统计仅列表查询时后端填充 */
+  taskCount: number
+  tailCount: number
+  createdAt: string
+  updatedAt: string
 }
 
 /* ---------------- Agent4 发布元数据（gate③） ---------------- */
@@ -397,6 +438,8 @@ export function createEmptyVideoConfig(): VideoRunConfig {
     speechRate: 4,
     language: 'zh-CN',
     subtitles: false,
+    segmentReview: true,
+    keepLastFrame: false,
     videoParams: {
       style: '写实电影感',
       camera: '',

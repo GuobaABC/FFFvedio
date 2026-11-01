@@ -598,3 +598,111 @@ func applyTemplatePromptExtras(visual string, shot VideoShot, caps VideoCapabili
 	}
 	return visual + "；" + strings.Join(extras, "；")
 }
+
+const segmentPromptSuggestSystemPrompt = `你是图像生视频（i2v）与文生视频的提示词工程师。用户对某一已生成片段不满意，需要你重写一段更能达成意图的画面提示词。
+只输出新的提示词正文，不要解释、引号、JSON 或 Markdown。
+硬性约束：
+1. 槽位顺序固定：[镜头/景别+运动] + [主体及其可辨识特征] + [物理可度量的动作] + [环境/道具/时间天气] + [光线方向/质感/色调] + [风格与氛围]；
+2. 第一句写镜头（景别、角度、运动、速度），并锁定画幅；
+3. 只描述“从首帧开始发生的变化”，不要重复首帧已有内容；
+4. 每段只允许一个连续动作，禁止 then/然后/接着 导致段内切镜；
+5. 画面内不得出现任何文字、字幕、水印、logo 或 UI 元素；
+6. 禁止空洞标签（cinematic、8K、高级感、masterpiece）；
+7. 针对用户给出不满点做定向重写，其余意图保持稳定。`
+
+// SuggestSegmentPrompt 结合用户反馈重写单段画面提示词：逐段确认关卡里的 AI 辅助。
+func (a *App) SuggestSegmentPrompt(taskID, segmentID, feedback string) (string, error) {
+	task, err := a.videoTaskByID(taskID)
+	if err != nil {
+		return "", err
+	}
+	if task.Run.Plan == nil || len(task.Run.Plan.Segments) == 0 {
+		return "", errors.New("任务还没有渲染计划：请先确认提示词生成渲染计划")
+	}
+	segmentID = strings.TrimSpace(segmentID)
+	target := VideoSegment{}
+	found := false
+	for _, segment := range task.Run.Plan.Segments {
+		if segment.ID == segmentID {
+			target = segment
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "", errors.New("要优化的片段不在渲染计划中")
+	}
+
+	sceneIntent, shotCamera, shotMood := "不限", "不限", "不限"
+	if task.Run.Script != nil {
+		for _, shot := range task.Run.Script.Shots {
+			if shot.ID == target.ShotID {
+				sceneIntent = firstNonEmpty(shot.SceneIntent, "不限")
+				shotCamera = firstNonEmpty(shot.Camera, "不限")
+				shotMood = firstNonEmpty(shot.Mood, "不限")
+				break
+			}
+		}
+	}
+
+	provider := a.pickTextProvider(task.Config)
+	if provider.ID == "" {
+		return "", errors.New("没有可用的文本模型：请先在「系统设置 - 提供商」登记文本模型，再使用 AI 优化提示词")
+	}
+
+	cfg := task.Config
+	userPrompt := fmt.Sprintf(`主题：%s
+画幅：%s；语言：%s；风格：%s；运镜偏好：%s；情绪偏好：%s
+片段：第 %d 段（%d 秒）
+镜头场景意图：%s；镜头运镜：%s；镜头情绪：%s
+当前提示词：
+%s
+台词（不要改写，也不要写进画面文字要求）：%s
+用户对该段生成效果的不满（请定向重写）：%s
+请输出重写后的画面提示词正文。`,
+		cfg.Topic, cfg.AspectRatio, cfg.Language,
+		firstNonEmpty(cfg.VideoParams.Style, "不限"),
+		firstNonEmpty(cfg.VideoParams.Camera, "不限"),
+		firstNonEmpty(cfg.VideoParams.Mood, "不限"),
+		target.Index+1, target.DurationS,
+		sceneIntent, shotCamera, shotMood,
+		target.Prompt,
+		firstNonEmpty(target.Dialogue, "无"),
+		firstNonEmpty(strings.TrimSpace(feedback), "效果不佳，请更具体、更可执行"),
+	)
+
+	raw, err := a.chatCompletion(context.Background(), provider, segmentPromptSuggestSystemPrompt, userPrompt)
+	if err != nil {
+		return "", fmt.Errorf("AI 生成提示词失败: %w", err)
+	}
+	suggestion := cleanPromptSuggestion(raw)
+	if suggestion == "" {
+		return "", errors.New("模型没有返回可用的提示词")
+	}
+	return suggestion, nil
+}
+
+// cleanPromptSuggestion 剥掉模型偶发的代码块与首尾引号（含嵌套包裹），并限制长度避免超长回馈。
+func cleanPromptSuggestion(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	for {
+		before := trimmed
+		if strings.HasPrefix(trimmed, "```") {
+			trimmed = strings.TrimPrefix(trimmed, "```json")
+			trimmed = strings.TrimPrefix(trimmed, "```")
+			if idx := strings.LastIndex(trimmed, "```"); idx >= 0 {
+				trimmed = trimmed[:idx]
+			}
+		}
+		trimmed = strings.TrimSpace(trimmed)
+		trimmed = strings.Trim(trimmed, "\"'“”‘’")
+		trimmed = strings.TrimSpace(trimmed)
+		if trimmed == before {
+			break
+		}
+	}
+	if runes := []rune(trimmed); len(runes) > 600 {
+		trimmed = string(runes[:600])
+	}
+	return trimmed
+}

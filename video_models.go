@@ -89,6 +89,8 @@ type VideoRunConfig struct {
 	SpeechRate       float64             `json:"speechRate"`       // 字/秒 或 词/秒
 	Language         string              `json:"language"`
 	Subtitles        bool                `json:"subtitles"` // 是否生成并烧录字幕（默认关闭）
+	SegmentReview    *bool               `json:"segmentReview"`
+	KeepLastFrame    bool                `json:"keepLastFrame"` // 最后一段尾帧存入资产库
 	VideoParams      VideoParams         `json:"videoParams"`
 	SubtitleStyle    VideoSubtitleStyle  `json:"subtitleStyle"`
 	Adapter          string              `json:"adapter"`        // auto|mock|dashscope|runway|veo|generic
@@ -99,6 +101,12 @@ type VideoRunConfig struct {
 	Region           string              `json:"region"`         // 受众时区，默认 Asia/Shanghai
 	Vertical         string              `json:"vertical"`       // 垂类：美食/游戏/母婴/知识…
 	TemplateRef      *VideoTemplateRef   `json:"templateRef"`    // 选中的模板（只预填默认值，不绕过 gate）
+}
+
+// segmentReviewEnabled 逐段确认默认开启（与 LocalFallback 同样的 *bool 缺省语义），
+// 取消勾选后恢复“一次串行渲染全部片段”的全自动模式。
+func (cfg VideoRunConfig) segmentReviewEnabled() bool {
+	return cfg.SegmentReview == nil || *cfg.SegmentReview
 }
 
 // VideoShot Agent1 的分镜数组元素。
@@ -205,20 +213,51 @@ type VideoOutput struct {
 
 // VideoRunContext 贯穿全链路的 RunContext（§7）。
 type VideoRunContext struct {
-	Adapter       string            `json:"adapter"`
-	Script        *VideoScript      `json:"script"`
-	Prompts       []VideoPromptItem `json:"prompts"`
-	Plan          *VideoPlan        `json:"plan"`
-	Subtitles     *VideoSubtitles   `json:"subtitles"`
-	Renders       []VideoRender     `json:"renders"`
-	Output        *VideoOutput      `json:"output"`
-	PublishMeta   *PublishMeta      `json:"publishMeta"`
-	Template      *VideoTemplateRun `json:"template"`      // 任务锁定的模板快照（可复现、可审计）
-	ConfigSources map[string]string `json:"configSources"` // 每个字段的来源：template / override / default
-	Gates         map[string]string `json:"gates"`
-	Warnings      []string          `json:"warnings"`
-	Logs          []string          `json:"logs"`
-	Feedback      string            `json:"feedback"`
+	Adapter              string            `json:"adapter"`
+	Script               *VideoScript      `json:"script"`
+	Prompts              []VideoPromptItem `json:"prompts"`
+	Plan                 *VideoPlan        `json:"plan"`
+	Subtitles            *VideoSubtitles   `json:"subtitles"`
+	Renders              []VideoRender     `json:"renders"`
+	Output               *VideoOutput      `json:"output"`
+	PublishMeta          *PublishMeta      `json:"publishMeta"`
+	Template             *VideoTemplateRun `json:"template"`      // 任务锁定的模板快照（可复现、可审计）
+	ConfigSources        map[string]string `json:"configSources"` // 每个字段的来源：template / override / default
+	Gates                map[string]string `json:"gates"`
+	Warnings             []string          `json:"warnings"`
+	Logs                 []string          `json:"logs"`
+	Feedback             string            `json:"feedback"`
+	ReviewPendingSegment string            `json:"reviewPendingSegment"` // 逐段确认关卡：等待用户确认的片段 ID
+}
+
+// VideoSegmentRegen 单段重生成的入参：修改该段提示词/台词后只重渲这一段的下游。
+type VideoSegmentRegen struct {
+	SegmentID    string `json:"segmentId"`
+	VisualPrompt string `json:"visualPrompt"`
+	Dialogue     string `json:"dialogue"`
+}
+
+// TailFrameAsset 尾帧资产：任务最后一段的尾帧，供其他任务作为首帧续写。
+type TailFrameAsset struct {
+	ID        string `json:"id"`
+	TaskID    string `json:"taskId"`
+	TaskTitle string `json:"taskTitle"`
+	SegmentID string `json:"segmentId"`
+	ProjectID string `json:"projectId"` // 跟随来源任务的归属项目；任务被删后归未归类
+	ImagePath string `json:"imagePath"`
+	MediaURL  string `json:"mediaUrl"`
+	CreatedAt string `json:"createdAt"`
+}
+
+// VideoProject 项目：任务的归组容器，项目视图按它看任务与尾帧。
+type VideoProject struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Note      string `json:"note"`
+	TaskCount int    `json:"taskCount"` // 以下两个统计字段仅列表查询时填充
+	TailCount int    `json:"tailCount"`
+	CreatedAt string `json:"createdAt"`
+	UpdatedAt string `json:"updatedAt"`
 }
 
 // VideoTask 以任务为视图的核心实体。
@@ -229,6 +268,7 @@ type VideoTask struct {
 	Status     string          `json:"status"`
 	Error      string          `json:"error"`
 	TemplateID string          `json:"templateId"`
+	ProjectID  string          `json:"projectId"`
 	Config     VideoRunConfig  `json:"config"`
 	Run        VideoRunContext `json:"run"`
 	CreatedAt  string          `json:"createdAt"`
@@ -237,8 +277,9 @@ type VideoTask struct {
 
 // VideoTaskInput 新建任务入参。
 type VideoTaskInput struct {
-	Title  string         `json:"title"`
-	Config VideoRunConfig `json:"config"`
+	Title     string         `json:"title"`
+	ProjectID string         `json:"projectId"`
+	Config    VideoRunConfig `json:"config"`
 }
 
 // VideoPromptEdit 确认门②的局部修改（只改提示词与台词，不动分镜结构）。
@@ -483,6 +524,10 @@ func normalizeVideoConfig(cfg VideoRunConfig) (VideoRunConfig, []string, error) 
 	cfg.Platforms = normalizePlatforms(cfg.Platforms)
 	cfg.Region = normalizeRegion(cfg.Region)
 	cfg.Vertical = strings.TrimSpace(cfg.Vertical)
+	if cfg.SegmentReview == nil {
+		enabled := true
+		cfg.SegmentReview = &enabled
+	}
 	if cfg.LocalFallback == nil {
 		enabled := true
 		cfg.LocalFallback = &enabled
