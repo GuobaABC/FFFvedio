@@ -612,6 +612,129 @@ func bindSpeakers(script VideoScript, cfg VideoRunConfig) (VideoScript, []string
 	return script, warnings
 }
 
+// 手动分段的通用可生成区间与段数上限：越界先夹取并告警，
+// 更细的模型档位对齐（如 5/10 秒档）交给 buildVideoPlan 按适配器能力处理。
+const (
+	manualShotMinS     = 4.0
+	manualShotMaxS     = 15.0
+	manualShotMaxNum   = 12
+	defaultManualShotS = 6.0
+)
+
+// buildManualScript 手动分段模式：不调用 Agent1，直接把用户逐段填写的内容整理成分镜。
+// 与 normalizeScript 的区别是段时长保真：不按目标时长缩放，总时长反过来由各段之和决定。
+func buildManualScript(cfg VideoRunConfig) (VideoScript, []string, error) {
+	shots, warnings, err := normalizeManualShots(cfg)
+	if err != nil {
+		return VideoScript{}, warnings, err
+	}
+	script := VideoScript{
+		Logline:  firstNonEmpty(strings.TrimSpace(cfg.Topic), "手动分段"),
+		Language: normalizeLanguage(cfg.Language),
+		Source:   "manual",
+		Shots:    shots,
+	}
+	script, speakerWarnings := bindSpeakers(script, cfg)
+	return script, append(warnings, speakerWarnings...), nil
+}
+
+// normalizeManualShots 把手填分段整理成可渲染的分镜：
+// 段时长保真（只夹到通用可生成区间），时间轴按填写顺序累加，未知角色剔除并告警。
+func normalizeManualShots(cfg VideoRunConfig) ([]VideoShot, []string, error) {
+	if len(cfg.ManualShots) > manualShotMaxNum {
+		return nil, nil, fmt.Errorf("手动分段最多 %d 段（当前 %d 段）", manualShotMaxNum, len(cfg.ManualShots))
+	}
+	warnings := make([]string, 0, 4)
+	shots := make([]VideoShot, 0, len(cfg.ManualShots))
+	cursor := 0.0
+	for index, raw := range cfg.ManualShots {
+		label := fmt.Sprintf("第 %d 段", index+1)
+		scene := strings.TrimSpace(raw.SceneIntent)
+		dialogue := strings.TrimSpace(raw.Dialogue)
+		// 边填边加段时常见的空行：跳过并说清楚，不至于让整个任务起不来
+		if scene == "" && dialogue == "" && len(nonEmptyStrings(raw.Roles)) == 0 {
+			warnings = append(warnings, label+"还是空的，已跳过")
+			continue
+		}
+		if scene == "" {
+			return nil, warnings, fmt.Errorf("%s 写了台词或角色，但没写画面内容；画面是分段的必填项", label)
+		}
+		duration := raw.DurationS
+		if duration <= 0 {
+			duration = defaultManualShotS
+		}
+		if duration < manualShotMinS {
+			warnings = append(warnings, fmt.Sprintf("%s 时长 %.1fs 低于单段下限 %.0fs，已按 %.0fs 生成", label, duration, manualShotMinS, manualShotMinS))
+			duration = manualShotMinS
+		}
+		if duration > manualShotMaxS {
+			warnings = append(warnings, fmt.Sprintf("%s 时长 %.1fs 超出单段上限 %.0fs，已按 %.0fs 生成（更长的段会在渲染计划里自动拆成多段）", label, duration, manualShotMaxS, manualShotMaxS))
+			duration = manualShotMaxS
+		}
+		roles, roleWarnings := manualShotRoles(cfg, raw.Roles, label)
+		warnings = append(warnings, roleWarnings...)
+		shots = append(shots, VideoShot{
+			ID:          fmt.Sprintf("s%d", len(shots)+1),
+			TimeRange:   [2]float64{round2(cursor), round2(cursor + duration)},
+			DurationS:   round2(duration),
+			Roles:       roles,
+			SceneIntent: scene,
+			Dialogue:    dialogue,
+			Speaker:     strings.TrimSpace(raw.Speaker),
+			Camera:      strings.TrimSpace(raw.Camera),
+			Mood:        strings.TrimSpace(raw.Mood),
+			AudioCue:    strings.TrimSpace(raw.AudioCue),
+		})
+		cursor += duration
+	}
+	if len(shots) == 0 {
+		return nil, warnings, errors.New("手动分段模式至少需要一段有效内容（填了画面内容才算一段）")
+	}
+	return shots, warnings, nil
+}
+
+// manualShotRoles 只留下真实存在的角色：手填时打错名字不该被悄悄送进渲染。
+func manualShotRoles(cfg VideoRunConfig, roles []string, label string) ([]string, []string) {
+	out := make([]string, 0, len(roles))
+	warnings := make([]string, 0, 2)
+	seen := make(map[string]bool, len(roles))
+	for _, raw := range roles {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		roleID, ok := matchSpeakerRole(cfg, raw)
+		if !ok {
+			warnings = append(warnings, fmt.Sprintf("%s 的角色「%s」不在角色表里，已忽略（先在角色参考图里登记它）", label, raw))
+			continue
+		}
+		if seen[roleID] {
+			continue
+		}
+		seen[roleID] = true
+		out = append(out, roleID)
+	}
+	return out, warnings
+}
+
+func manualTotalSeconds(shots []VideoShot) float64 {
+	total := 0.0
+	for _, shot := range shots {
+		total += shot.DurationS
+	}
+	return round2(total)
+}
+
+func nonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
 // normalizeScript 把任意来源的分镜整理成"时长之和等于总时长、时间轴连续"的稳定结构。
 func normalizeScript(script VideoScript, cfg VideoRunConfig, templates ...*VideoTemplateRun) VideoScript {
 	tpl := firstTemplateRun(templates)

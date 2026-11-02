@@ -16,6 +16,9 @@ export type VideoStage =
 
 export type VideoStatus = 'draft' | 'running' | 'waiting' | 'done' | 'failed'
 
+/** 分镜来源：AI 自动生成 / 用户手动分段 */
+export type ScriptMode = 'auto' | 'manual'
+
 export type VideoAdapterId = 'auto' | 'dashscope' | 'runway' | 'veo' | 'generic' | 'mock'
 
 export type ContinuationMode = 'last_frame' | 'overlap' | 'none'
@@ -51,6 +54,10 @@ export interface VideoParams {
 
 export interface VideoRunConfig {
   topic: string
+  /** 分镜来源：auto = Agent1 自动生成；manual = 用户逐段填写（跳过 Agent1） */
+  scriptMode?: ScriptMode
+  /** 手动分段：scriptMode=manual 时直接当分镜用，段数与段时长以填写为准 */
+  manualShots?: VideoShot[]
   firstFrame: string
   characterRefs: VideoCharacterRef[]
   durationS: number
@@ -453,6 +460,8 @@ export const SUBTITLE_ALIGNMENTS: { value: number; label: string }[] = [
 export function createEmptyVideoConfig(): VideoRunConfig {
   return {
     topic: '',
+    scriptMode: 'auto',
+    manualShots: [],
     firstFrame: '',
     characterRefs: [],
     durationS: 10,
@@ -496,6 +505,26 @@ export function createEmptyVideoConfig(): VideoRunConfig {
 
 export function isEnglish(config: VideoRunConfig): boolean {
   return config.language.toLowerCase().startsWith('en')
+}
+
+/** 手动分段的单段时长边界，与 Go 侧 manualShotMinS / manualShotMaxS 保持一致 */
+export const MANUAL_SHOT_MIN_S = 4
+export const MANUAL_SHOT_MAX_S = 15
+
+/** 新建一段手动分段：默认 6 秒、空内容，段号按当前段数顺延 */
+export function createManualShot(index: number): VideoShot {
+  return {
+    id: `s${index + 1}`,
+    timeRange: [0, 0],
+    roles: [],
+    sceneIntent: '',
+    dialogue: '',
+    speaker: '',
+    camera: '',
+    mood: '',
+    audioCue: '',
+    durationS: 6,
+  }
 }
 
 /** 台词时长估算，与 Go 侧 estimateSpeechSeconds 口径一致（前端只用于确认门展示） */

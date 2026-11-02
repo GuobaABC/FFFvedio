@@ -104,7 +104,11 @@ type VideoParams struct {
 
 // VideoRunConfig 输入契约（§1）：一次给全、入口归一化。
 type VideoRunConfig struct {
-	Topic            string              `json:"topic"`
+	Topic string `json:"topic"`
+	// ScriptMode 分镜来源：auto（Agent1 自动生成）/ manual（用户逐段填写）
+	ScriptMode string `json:"scriptMode"`
+	// ManualShots 手动分段：scriptMode=manual 时直接当分镜用，段数与段时长以用户输入为准
+	ManualShots      []VideoShot         `json:"manualShots"`
 	FirstFrame       string              `json:"firstFrame"` // 本地路径或 URL
 	CharacterRefs    []VideoCharacterRef `json:"characterRefs"`
 	DurationS        int                 `json:"durationS"`
@@ -141,6 +145,25 @@ func (cfg VideoRunConfig) segmentReviewEnabled() bool {
 // 不再拿本地模板顶替——参数写了“不要兜底”就得真的不兜底。
 func (cfg VideoRunConfig) localFallbackEnabled() bool {
 	return cfg.LocalFallback == nil || *cfg.LocalFallback
+}
+
+// 分镜来源：auto 由 Agent1 生成，manual 直接用用户逐段填写的内容。
+// 手动模式只接管 Agent1，提示词、确认关卡、字幕、渲染、合成全链路完全复用。
+const (
+	VideoScriptModeAuto   = "auto"
+	VideoScriptModeManual = "manual"
+)
+
+// manualScriptEnabled 是否走到手动分段分支。
+func (cfg VideoRunConfig) manualScriptEnabled() bool {
+	return strings.EqualFold(strings.TrimSpace(cfg.ScriptMode), VideoScriptModeManual)
+}
+
+func normalizeVideoScriptMode(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), VideoScriptModeManual) {
+		return VideoScriptModeManual
+	}
+	return VideoScriptModeAuto
 }
 
 // strictFirstFrameEnabled 严格首帧默认开启：用户既然给了首帧/尾帧，新视频就得从这张画面起。
@@ -650,6 +673,21 @@ func normalizeVideoConfig(cfg VideoRunConfig) (VideoRunConfig, []string, error) 
 		refs = append(refs, ref)
 	}
 	cfg.CharacterRefs = refs
+
+	// 分镜来源：手动分段就地归一（段时长保真），目标时长以各段之和为准
+	cfg.ScriptMode = normalizeVideoScriptMode(cfg.ScriptMode)
+	if cfg.manualScriptEnabled() {
+		shots, shotWarnings, shotErr := normalizeManualShots(cfg)
+		if shotErr != nil {
+			return cfg, warnings, shotErr
+		}
+		cfg.ManualShots = shots
+		cfg.DurationS = int(math.Round(manualTotalSeconds(shots)))
+		warnings = append(warnings, shotWarnings...)
+	} else {
+		// 自动模式不保留手填分段，免得以后被误当成权威来源
+		cfg.ManualShots = nil
+	}
 
 	return cfg, warnings, nil
 }

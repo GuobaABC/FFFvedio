@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"time"
@@ -282,7 +283,24 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		if task.Run.Script == nil {
 			return task, errors.New("任务缺少分镜产物，请先重新生成")
 		}
-		task.Run.Script.Shots = normalizeScriptShots(edits.Shots, float64(task.Config.DurationS))
+		if task.Config.manualScriptEnabled() {
+			// 手动分段：关卡里改的段时长保真，不按目标时长缩放，总时长跟着分段之和走
+			manualCfg := task.Config
+			manualCfg.ManualShots = edits.Shots
+			shots, shotWarnings, shotErr := normalizeManualShots(manualCfg)
+			if shotErr != nil {
+				return task, shotErr
+			}
+			bound, speakerWarnings := bindSpeakers(VideoScript{Shots: shots}, manualCfg)
+			task.Run.Script.Shots = bound.Shots
+			task.Config.ManualShots = bound.Shots
+			task.Config.DurationS = int(math.Round(manualTotalSeconds(bound.Shots)))
+			for _, warning := range append(shotWarnings, speakerWarnings...) {
+				task.Run.Warnings = append(task.Run.Warnings, warning)
+			}
+		} else {
+			task.Run.Script.Shots = normalizeScriptShots(edits.Shots, float64(task.Config.DurationS))
+		}
 		// 剧本改动 → Agent2 全部 + 渲染 + 合成失效
 		task.Run.Prompts = nil
 		task.Run.Plan = nil
@@ -650,14 +668,27 @@ func (a *App) runVideoPipeline(id, from, feedback string) {
 	}
 }
 
-// runScriptStage Agent1：剧本/分镜。
+// runScriptStage 分镜阶段：默认交给 Agent1；手动分段模式直接用用户填的段，不调模型。
 func (r *videoRunner) runScriptStage() error {
 	if tpl := r.task.Run.Template; tpl != nil {
 		r.logf("按模板「%s」v%s 执行：%d 个字段来自模板，%d 个字段本次改过", tpl.Name, tpl.Version, len(tpl.Sources), len(tpl.Overrides))
 	}
-	script, warnings := r.app.generateScript(r.usageCtx(UsagePurposeScript), r.task.Config, r.consumeFeedback(VideoStageDraftScript), r.task.Run.Template)
-	// 把真正带进模型输入的用户参数写进日志：参数有没有生效，用户要能一眼验证
-	r.logf("Agent1 输入参数：%s", userParamDigest(r.task.Config))
+
+	var script VideoScript
+	var warnings []string
+	manual := r.task.Config.manualScriptEnabled()
+	if manual {
+		built, notes, err := buildManualScript(r.task.Config)
+		if err != nil {
+			return err
+		}
+		script, warnings = built, notes
+		r.logf("手动分段模式：沿用你填写的 %d 段（合计 %.1fs），跳过 Agent1", len(script.Shots), manualTotalSeconds(script.Shots))
+	} else {
+		script, warnings = r.app.generateScript(r.usageCtx(UsagePurposeScript), r.task.Config, r.consumeFeedback(VideoStageDraftScript), r.task.Run.Template)
+		// 把真正带进模型输入的用户参数写进日志：参数有没有生效，用户要能一眼验证
+		r.logf("Agent1 输入参数：%s", userParamDigest(r.task.Config))
+	}
 	for _, warning := range warnings {
 		r.warn("%s", warning)
 	}
@@ -676,7 +707,11 @@ func (r *videoRunner) runScriptStage() error {
 	r.task.Run.Gates[VideoGateScript] = videoGatePending
 	r.task.Run.Gates[VideoGatePrompt] = videoGatePending
 	r.task.Run.Gates[VideoGateMeta] = videoGatePending
-	r.logf("Agent1 完成：%d 段分镜（来源 %s）", len(script.Shots), script.Source)
+	if manual {
+		r.logf("手动分段完成：%d 段分镜，总时长 %.1fs（可在关卡①里再改）", len(script.Shots), manualTotalSeconds(script.Shots))
+	} else {
+		r.logf("Agent1 完成：%d 段分镜（来源 %s）", len(script.Shots), script.Source)
+	}
 	return nil
 }
 

@@ -18,12 +18,16 @@ import {
 } from '../types/template'
 import {
   CONTINUATION_LABELS,
+  MANUAL_SHOT_MAX_S,
+  MANUAL_SHOT_MIN_S,
   REGION_OPTIONS,
   SUBTITLE_ALIGNMENTS,
   VERTICAL_OPTIONS,
   VIDEO_PLATFORMS,
   createEmptyVideoConfig,
+  createManualShot,
   formatClock,
+  type ScriptMode,
   type TailFrameAsset,
   type VideoEnvironment,
   type VideoProject,
@@ -613,6 +617,69 @@ function togglePlatform(id: string) {
   form.platforms.push(id)
 }
 
+/* ---------------- 分镜来源：AI 自动生成 vs 手动分段 ---------------- */
+const scriptMode = computed<ScriptMode>({
+  get: () => (form.scriptMode === 'manual' ? 'manual' : 'auto'),
+  set: (value) => {
+    form.scriptMode = value
+    // 切到手动时先给一段空模板，用户不用先点「添加一段」
+    if (value === 'manual' && manualShots.value.length === 0) {
+      addManualShot()
+    }
+  },
+})
+
+const manualShots = computed(() => form.manualShots ?? [])
+const manualTotalS = computed(
+  () => Math.round(manualShots.value.reduce((sum, shot) => sum + (Number(shot.durationS) || 0), 0) * 10) / 10,
+)
+
+/** 说话人候选：旁白 + 已登记的角色（没登记角色时只能选旁白） */
+const speakerOptions = computed(() => [
+  { value: '', label: '自动（本段唯一角色→他，否则旁白）' },
+  { value: 'narration', label: '旁白（画外音）' },
+  ...form.characterRefs
+    .filter((ref) => ref.roleId)
+    .map((ref) => ({ value: ref.roleId, label: ref.name || ref.roleId })),
+])
+
+function addManualShot() {
+  if (!form.manualShots) {
+    form.manualShots = []
+  }
+  form.manualShots.push(createManualShot(form.manualShots.length))
+}
+
+function removeManualShot(index: number) {
+  form.manualShots?.splice(index, 1)
+}
+
+function moveManualShot(index: number, delta: number) {
+  const shots = form.manualShots
+  if (!shots) {
+    return
+  }
+  const target = index + delta
+  if (target < 0 || target >= shots.length) {
+    return
+  }
+  const [moved] = shots.splice(index, 1)
+  shots.splice(target, 0, moved)
+}
+
+function toggleManualShotRole(index: number, roleId: string) {
+  const shot = form.manualShots?.[index]
+  if (!shot) {
+    return
+  }
+  const at = shot.roles.indexOf(roleId)
+  if (at >= 0) {
+    shot.roles.splice(at, 1)
+    return
+  }
+  shot.roles.push(roleId)
+}
+
 async function submit() {
   submitError.value = ''
   if (!form.topic.trim()) {
@@ -620,9 +687,25 @@ async function submit() {
     return
   }
 
+  // 手动分段：画面内容是必填项，先在前端挡一遍，别等到后端报错
+  if (scriptMode.value === 'manual') {
+    const shots = form.manualShots ?? []
+    if (shots.length === 0) {
+      submitError.value = '手动分段至少要填一段'
+      return
+    }
+    const missing = shots.findIndex((shot) => !shot.sceneIntent.trim())
+    if (missing >= 0) {
+      submitError.value = `第 ${missing + 1} 段还没写画面内容（分段必填）`
+      return
+    }
+  }
+
   const config: VideoRunConfig = {
     ...form,
     topic: form.topic.trim(),
+    // 手动分段：目标时长跟着分段之和走，不再另外填
+    durationS: scriptMode.value === 'manual' ? Math.max(1, Math.round(manualTotalS.value)) : form.durationS,
     templateRef: buildTemplateRef(),
     characterRefs: form.characterRefs
       .map((ref, index) => {
@@ -894,7 +977,14 @@ async function submit() {
         <div class="grid grid--3">
           <label class="ui-field">
             <span class="ui-label">目标时长（秒）</span>
-            <input v-model.number="form.durationS" class="ui-input" type="number" min="2" max="600" />
+            <input
+              v-model.number="form.durationS"
+              class="ui-input"
+              type="number"
+              min="2"
+              max="600"
+              :disabled="scriptMode === 'manual'"
+            />
           </label>
           <label class="ui-field">
             <span class="ui-label">帧率 fps</span>
@@ -928,6 +1018,9 @@ async function submit() {
             </select>
           </label>
         </div>
+        <p v-if="scriptMode === 'manual'" class="hint hint--warn">
+          手动分段模式下这个目标时长不生效：总时长以第 4 节各段之和（{{ manualTotalS }}s）为准，切回自动模式时再用这里的值。
+        </p>
         <div class="chips chips--options">
           <label class="check check--inline">
             <input v-model="form.segmentReview" type="checkbox" />
@@ -955,7 +1048,127 @@ async function submit() {
       </section>
 
       <section class="ui-card block">
-        <h3 class="ui-h3">4. 模型与提供商</h3>
+        <div class="block__head">
+          <h3 class="ui-h3">4. 分镜来源</h3>
+          <span class="ui-chip">
+            {{ scriptMode === 'manual' ? `${manualShots.length} 段 · 合计 ${manualTotalS}s` : 'AI 自动生成' }}
+          </span>
+        </div>
+        <div class="chips chips--options">
+          <label class="check check--inline">
+            <input v-model="scriptMode" type="radio" value="auto" />
+            AI 自动生成分镜（Agent1 按主题、风格与角色切段）
+          </label>
+          <label class="check check--inline">
+            <input v-model="scriptMode" type="radio" value="manual" />
+            手动分段（自己填段数、时长与台词，跳过 Agent1）
+          </label>
+        </div>
+        <p v-if="scriptMode === 'auto'" class="hint">
+          自动模式：Agent1 按目标时长（{{ form.durationS }} 秒）规划段数与节奏，关卡①里可再改。
+        </p>
+        <p v-else class="hint">
+          手动模式：你填的 {{ manualShots.length }} 段直接当最终分镜，Agent1 不再改结构；目标时长改为按各段之和（{{ manualTotalS }}s）回写，
+          段时长保真、不按总时长缩放。每段 {{ MANUAL_SHOT_MIN_S }}–{{ MANUAL_SHOT_MAX_S }} 秒（越界会被夹到边界并告警），最多 12 段；
+          模型档位对不齐时由渲染阶段的切分逻辑兜底。
+        </p>
+        <template v-if="scriptMode === 'manual'">
+          <div class="block__head">
+            <span class="hint">画面内容是必填项；角色只表示「本段出场」，要说话请在「说话人」里选。</span>
+            <button class="ui-btn" type="button" @click="addManualShot">+ 添加一段</button>
+          </div>
+          <div v-for="(shot, index) in manualShots" :key="index" class="manual">
+            <div class="manual__head">
+              <span class="manual__no">第 {{ index + 1 }} 段</span>
+              <label class="manual__dur">
+                <span class="ui-label">时长（秒）</span>
+                <input
+                  v-model.number="shot.durationS"
+                  class="ui-input"
+                  type="number"
+                  :min="MANUAL_SHOT_MIN_S"
+                  :max="MANUAL_SHOT_MAX_S"
+                  step="1"
+                />
+              </label>
+              <span class="row">
+                <button
+                  class="ui-btn ui-btn--ghost"
+                  type="button"
+                  :disabled="index === 0"
+                  @click="moveManualShot(index, -1)"
+                >上移</button>
+                <button
+                  class="ui-btn ui-btn--ghost"
+                  type="button"
+                  :disabled="index === manualShots.length - 1"
+                  @click="moveManualShot(index, 1)"
+                >下移</button>
+                <button class="ui-btn ui-btn--ghost" type="button" @click="removeManualShot(index)">删除</button>
+              </span>
+            </div>
+            <label class="ui-field">
+              <span class="ui-label">画面内容 *</span>
+              <textarea
+                v-model="shot.sceneIntent"
+                class="ui-textarea"
+                rows="2"
+                placeholder="例：清晨窗边，橘座伸爪推开窗帘，光斑落在木桌上"
+              ></textarea>
+            </label>
+            <div class="grid grid--2">
+              <label class="ui-field">
+                <span class="ui-label">台词（可空）</span>
+                <textarea v-model="shot.dialogue" class="ui-textarea" rows="2" placeholder="例：今天也要好好喝一杯"></textarea>
+              </label>
+              <label class="ui-field">
+                <span class="ui-label">说话人</span>
+                <select v-model="shot.speaker" class="ui-select">
+                  <option v-for="option in speakerOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+                </select>
+              </label>
+            </div>
+            <div class="ui-field">
+              <span class="ui-label">本段出场角色（勾了就算出场：参考图与提示词会带上）</span>
+              <div v-if="form.characterRefs.length > 0" class="chips chips--options">
+                <label
+                  v-for="ref in form.characterRefs.filter((item) => item.roleId)"
+                  :key="ref.roleId"
+                  class="check check--inline"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="shot.roles.includes(ref.roleId)"
+                    @change="toggleManualShotRole(index, ref.roleId)"
+                  />
+                  {{ ref.name || ref.roleId }}
+                </label>
+              </div>
+              <p v-else class="hint">还没登记角色：到上面「2. 角色参考图」加一个，这里就能勾了。</p>
+            </div>
+            <div class="grid grid--3">
+              <label class="ui-field">
+                <span class="ui-label">运镜（可空）</span>
+                <input v-model="shot.camera" class="ui-input" type="text" placeholder="缓慢推近 / 环绕主体" />
+              </label>
+              <label class="ui-field">
+                <span class="ui-label">情绪（可空）</span>
+                <input v-model="shot.mood" class="ui-input" type="text" placeholder="温暖 / 期待" />
+              </label>
+              <label class="ui-field">
+                <span class="ui-label">环境音（可空）</span>
+                <input v-model="shot.audioCue" class="ui-input" type="text" placeholder="咖啡机蒸汽声" />
+              </label>
+            </div>
+          </div>
+          <p class="hint">
+            只填台词不选说话人时：本段唯一角色自动当说话人，否则按旁白处理。台词与角色都填了却缺画面内容，会在后端创建任务时直接报错。
+          </p>
+        </template>
+      </section>
+
+      <section class="ui-card block">
+        <h3 class="ui-h3">5. 模型与提供商</h3>
         <div class="grid grid--3">
           <label class="ui-field">
             <span class="ui-label">视频适配器</span>
@@ -993,7 +1206,7 @@ async function submit() {
       </section>
 
       <section class="ui-card block">
-        <h3 class="ui-h3">5. 画面参数</h3>
+        <h3 class="ui-h3">6. 画面参数</h3>
         <div class="grid grid--3">
           <label class="ui-field">
             <span class="ui-label">风格</span>
@@ -1024,7 +1237,7 @@ async function submit() {
 
       <section class="ui-card block">
         <div class="block__head">
-          <h3 class="ui-h3">6. 字幕（默认不生成）</h3>
+          <h3 class="ui-h3">7. 字幕（默认不生成）</h3>
           <label class="check check--inline">
             <input v-model="form.subtitles" type="checkbox" />
             生成字幕并烧录
@@ -1106,7 +1319,7 @@ async function submit() {
 
       <section class="ui-card block">
         <div class="block__head">
-          <h3 class="ui-h3">7. 发布平台（Agent4 发布元数据）</h3>
+          <h3 class="ui-h3">8. 发布平台（Agent4 发布元数据）</h3>
           <span class="ui-chip">{{ form.platforms.length }} 个平台</span>
         </div>
         <div class="platforms">
@@ -1235,6 +1448,40 @@ async function submit() {
   grid-template-columns: minmax(120px, 0.6fr) minmax(220px, 2fr) auto auto auto;
   gap: 8px;
   align-items: center;
+}
+
+/* 手动分段：一段一张卡片，段头放时长与排序 */
+.manual {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  margin-top: 10px;
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.manual__head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.manual__no {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-accent);
+}
+
+.manual__dur {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.manual__dur .ui-input {
+  width: 88px;
 }
 
 .platforms {

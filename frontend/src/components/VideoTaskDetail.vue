@@ -11,6 +11,8 @@ import {
 } from '../types/template'
 import {
   CONTINUATION_LABELS,
+  MANUAL_SHOT_MAX_S,
+  MANUAL_SHOT_MIN_S,
   STAGE_LABELS,
   STATUS_LABELS,
   VIDEO_PLATFORMS,
@@ -158,8 +160,19 @@ const runActionLabel = computed(() => {
   return '继续执行'
 })
 
+/* 分镜来源：手动分段（跳过 Agent1）/ AI 自动生成 */
+const scriptMode = computed(() => (config.value.scriptMode === 'manual' ? 'manual' : 'auto'))
+const scriptSourceLabel = computed(() => {
+  if (scriptMode.value === 'manual') {
+    const count = run.value?.script?.shots?.length ?? config.value.manualShots?.length ?? 0
+    return `手动分段（你填的 ${count} 段，未调 Agent1）`
+  }
+  return run.value?.script?.source === 'llm' ? '文本模型（Agent1）' : '本地规则'
+})
+
 const summaryRows = computed(() => [
   { label: '主题', value: config.value.topic },
+  { label: '分镜来源', value: scriptSourceLabel.value },
   { label: '时长 / 帧率', value: `${formatSeconds(config.value.durationS)} · ${config.value.fps}fps` },
   { label: '画幅', value: config.value.aspectRatio },
   { label: '衔接方式', value: CONTINUATION_LABELS[config.value.continuationMode] ?? config.value.continuationMode },
@@ -570,7 +583,12 @@ function revealOutput() {
         </span>
       </header>
       <p class="hint">
-        剧本来源：{{ run?.script?.source === 'llm' ? '文本模型（Agent1）' : '本地规则' }}；修改分镜会让提示词、字幕与渲染全部失效并重算。
+        剧本来源：{{ scriptSourceLabel }}；修改分镜会让提示词、字幕与渲染全部失效并重算。
+      </p>
+      <p v-if="scriptMode === 'manual'" class="hint hint--warn">
+        手动分段：这里的 {{ shotDrafts.length }} 段就是最终分镜。保存时每段时长保真，只把
+        {{ MANUAL_SHOT_MIN_S }}–{{ MANUAL_SHOT_MAX_S }} 秒之外的段夹到边界并告警；目标时长按各段之和回写，
+        模型档位对不齐时由渲染阶段的切分逻辑兜底。
       </p>
       <p v-if="run?.script?.logline" class="logline">{{ run.script.logline }}</p>
 
@@ -610,7 +628,9 @@ function revealOutput() {
             />
           </label>
           <label class="ui-field">
-            <span class="ui-label">镜头时长（秒，保存后按总时长等比归一）</span>
+            <span class="ui-label">
+              镜头时长（秒，{{ scriptMode === 'manual' ? '直接采用，总时长按各段之和回写' : '保存后按总时长等比归一' }}）
+            </span>
             <input
               v-model.number="shot.durationS"
               class="ui-input"
@@ -643,7 +663,10 @@ function revealOutput() {
           {{ busy === 'approve' ? '提交中…' : '确认分镜，生成提示词' }}
         </button>
       </div>
-      <div class="feedback">
+      <div v-if="scriptMode === 'manual'" class="hint">
+        手动分段模式下不提供「按意见重写」：段结构是你定的，要改就直接改上面的表单再保存；想交回 Agent1 需新建自动模式任务。
+      </div>
+      <div v-else class="feedback">
         <label class="ui-field">
           <span class="ui-label">重新生成意见（可选）</span>
           <input

@@ -3,13 +3,13 @@
     "FileVersion": {
       "Major": 0,
       "Minor": 0,
-      "Patch": 6,
+      "Patch": 7,
       "Build": 0
     },
     "ProductVersion": {
       "Major": 0,
       "Minor": 0,
-      "Patch": 6,
+      "Patch": 7,
       "Build": 0
     },
     "FileFlagsMask": "3f",
@@ -22,12 +22,12 @@
     "Comments": "Fast Fast Fast",
     "CompanyName": "FFFVedioAgent",
     "FileDescription": "FFFVedioAgent 视频生成智能体",
-    "FileVersion": "0.0.6.0",
+    "FileVersion": "0.0.7.0",
     "InternalName": "FFFVedioAgent",
     "LegalCopyright": "Copyright (C) 2026 FFFVedioAgent",
     "OriginalFilename": "FFFVedioAgent.exe",
     "ProductName": "FFFVedioAgent",
-    "ProductVersion": "0.0.6.0"
+    "ProductVersion": "0.0.7.0"
   },
   "VarFileInfo": {
     "Translation": {

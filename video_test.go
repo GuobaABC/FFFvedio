@@ -1354,3 +1354,201 @@ func TestLegacyBuildPromptStageAlias(t *testing.T) {
 		t.Fatalf("当前阶段名不该被改写：%q", got)
 	}
 }
+
+// 手动分段模式：只用户填的段，跳过 Agent1；段时长保真，总时长按各段之和回写。
+func TestManualScriptModeSkipsAgent1(t *testing.T) {
+	withTempVideoRoot(t)
+	app := newTestApp(t)
+
+	created, err := app.CreateVideoTask(VideoTaskInput{Config: VideoRunConfig{
+		Topic:      "手冲咖啡手拉手",
+		Adapter:    "mock",
+		DurationS:  30,
+		ScriptMode: VideoScriptModeManual,
+		ManualShots: []VideoShot{
+			{SceneIntent: "清晨窗边，橘座推开窗帘", DurationS: 5, Roles: []string{"橘座"}},
+			{SceneIntent: "咖啡机蒸汽升起", DurationS: 7, Dialogue: "今天也要好好喝一杯", Speaker: VideoSpeakerNarration},
+		},
+		CharacterRefs: []VideoCharacterRef{{RoleID: "cat", Name: "橘座"}},
+	}})
+	if err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	task, err := app.videoTaskByID(created.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	if task.Config.DurationS != 12 {
+		t.Fatalf("目标时长要按各段之和回写，得到 %d", task.Config.DurationS)
+	}
+	if task.Config.ScriptMode != VideoScriptModeManual || len(task.Config.ManualShots) != 2 {
+		t.Fatalf("手动分段配置没落库: mode=%s shots=%d", task.Config.ScriptMode, len(task.Config.ManualShots))
+	}
+
+	runner := &videoRunner{app: app, task: &task, ctx: context.Background()}
+	if err := runner.runScriptStage(); err != nil {
+		t.Fatalf("剧本阶段失败: %v", err)
+	}
+	if task.Run.Script == nil || task.Run.Script.Source != "manual" {
+		t.Fatalf("手动分段的来源要标 manual：%+v", task.Run.Script)
+	}
+	if len(task.Run.Script.Shots) != 2 {
+		t.Fatalf("段数应与填写一致，得到 %d", len(task.Run.Script.Shots))
+	}
+	if got := task.Run.Script.Shots[0].DurationS; got != 5 {
+		t.Fatalf("第 1 段时长要保真，得到 %.2f", got)
+	}
+	if got := task.Run.Script.Shots[1]; got.DurationS != 7 || got.TimeRange != [2]float64{5, 12} {
+		t.Fatalf("第 2 段要保真且时间轴累加，得到 %.2fs %v", got.DurationS, got.TimeRange)
+	}
+	if got := task.Run.Script.Shots[0].Roles; len(got) != 1 || got[0] != "cat" {
+		t.Fatalf("角色名要归一成 role_id，得到 %v", got)
+	}
+	logs := strings.Join(task.Run.Logs, "\n")
+	if !strings.Contains(logs, "跳过 Agent1") {
+		t.Fatalf("日志要说明跳过 Agent1：%v", task.Run.Logs)
+	}
+	if strings.Contains(logs, "Agent1 输入参数") {
+		t.Fatalf("手动模式不该把参数送去 Agent1：%v", task.Run.Logs)
+	}
+}
+
+// 段时长低于下限 / 高于上限时夹到边界并告警，总时长随夹取后的值回写。
+func TestManualShotsClampOutOfRangeDuration(t *testing.T) {
+	cfg, warnings, err := normalizeVideoConfig(VideoRunConfig{
+		Topic:      "夹取",
+		ScriptMode: VideoScriptModeManual,
+		ManualShots: []VideoShot{
+			{SceneIntent: "第一段", DurationS: 2},
+			{SceneIntent: "第二段", DurationS: 40},
+		},
+	})
+	if err != nil {
+		t.Fatalf("归一失败: %v", err)
+	}
+	if got := cfg.ManualShots[0].DurationS; got != manualShotMinS {
+		t.Fatalf("低于下限要夹到 %.0fs，得到 %.2f", manualShotMinS, got)
+	}
+	if got := cfg.ManualShots[1].DurationS; got != manualShotMaxS {
+		t.Fatalf("高于上限要夹到 %.0fs，得到 %.2f", manualShotMaxS, got)
+	}
+	if want := int(manualShotMinS + manualShotMaxS); cfg.DurationS != want {
+		t.Fatalf("总时长按夹取后的段之和回写，想要 %d 得到 %d", want, cfg.DurationS)
+	}
+	joined := strings.Join(warnings, "\n")
+	if !strings.Contains(joined, "低于单段下限") || !strings.Contains(joined, "超出单段上限") {
+		t.Fatalf("夹取要留下告警：%v", warnings)
+	}
+}
+
+// 手填角色对不上角色表时剔除并告警；重复勾选只留一份。
+func TestManualShotRolesDroppedWhenUnknown(t *testing.T) {
+	cfg, warnings, err := normalizeVideoConfig(VideoRunConfig{
+		Topic:         "角色校验",
+		ScriptMode:    VideoScriptModeManual,
+		CharacterRefs: []VideoCharacterRef{{RoleID: "cat", Name: "橘座"}},
+		ManualShots: []VideoShot{
+			{SceneIntent: "橘座跳上桌子", DurationS: 6, Roles: []string{"橘座", "幽灵", "cat"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("归一失败: %v", err)
+	}
+	if got := cfg.ManualShots[0].Roles; len(got) != 1 || got[0] != "cat" {
+		t.Fatalf("未知角色要剔除、已知角色去重成 role_id，得到 %v", got)
+	}
+	if !strings.Contains(strings.Join(warnings, "\n"), "不在角色表里") {
+		t.Fatalf("剔除未知角色要告警：%v", warnings)
+	}
+}
+
+// 有台词却没画面内容直接报错；整段空白则跳过并告警。
+func TestManualShotMissingSceneRejected(t *testing.T) {
+	if _, _, err := normalizeVideoConfig(VideoRunConfig{
+		Topic:       "缺画面",
+		ScriptMode:  VideoScriptModeManual,
+		ManualShots: []VideoShot{{Dialogue: "我有台词", DurationS: 6}},
+	}); err == nil || !strings.Contains(err.Error(), "没写画面内容") {
+		t.Fatalf("缺画面内容要报错，得到 %v", err)
+	}
+
+	cfg, warnings, err := normalizeVideoConfig(VideoRunConfig{
+		Topic:      "空段",
+		ScriptMode: VideoScriptModeManual,
+		ManualShots: []VideoShot{
+			{},
+			{SceneIntent: "只有这一段有内容", DurationS: 6},
+		},
+	})
+	if err != nil {
+		t.Fatalf("空段应被跳过而不是报错: %v", err)
+	}
+	if len(cfg.ManualShots) != 1 {
+		t.Fatalf("空段要被跳过，应剩 1 段，得到 %d", len(cfg.ManualShots))
+	}
+	if !strings.Contains(strings.Join(warnings, "\n"), "还是空的") {
+		t.Fatalf("跳过空段要告警：%v", warnings)
+	}
+}
+
+// 自动模式不保留手填分段，免得它以后被当成权威来源。
+func TestAutoModeDropsManualShots(t *testing.T) {
+	cfg, _, err := normalizeVideoConfig(VideoRunConfig{
+		Topic:       "自动模式",
+		DurationS:   8,
+		ScriptMode:  VideoScriptModeAuto,
+		ManualShots: []VideoShot{{SceneIntent: "残留分段", DurationS: 4}},
+	})
+	if err != nil {
+		t.Fatalf("归一失败: %v", err)
+	}
+	if len(cfg.ManualShots) != 0 {
+		t.Fatalf("自动模式要清空手填分段，得到 %+v", cfg.ManualShots)
+	}
+}
+
+// 关卡①保存手动分段：段时长照填的不变，总时长跟着各段之和走（不按原总时长等比缩放）。
+func TestSaveManualShotsKeepsDurationAtGate(t *testing.T) {
+	withTempVideoRoot(t)
+	app := newTestApp(t)
+
+	created, err := app.CreateVideoTask(VideoTaskInput{Config: VideoRunConfig{
+		Topic:       "关卡①手动",
+		Adapter:     "mock",
+		ScriptMode:  VideoScriptModeManual,
+		ManualShots: []VideoShot{{SceneIntent: "开场", DurationS: 6}},
+	}})
+	if err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	task, err := app.videoTaskByID(created.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	task.Stage = VideoStageConfirmScript
+	task.Status = VideoStatusWaiting
+	task.Run.Script = &VideoScript{Source: "manual", Shots: []VideoShot{{ID: "s1", TimeRange: [2]float64{0, 6}, DurationS: 6, SceneIntent: "开场"}}}
+	if err := app.updateVideoTaskRecord(task); err != nil {
+		t.Fatalf("写入任务失败: %v", err)
+	}
+
+	saved, err := app.SaveVideoStageEdits(created.ID, VideoGateEdits{Shots: []VideoShot{
+		{ID: "s1", SceneIntent: "开场", DurationS: 5},
+		{ID: "s2", SceneIntent: "收尾", DurationS: 9},
+	}})
+	if err != nil {
+		t.Fatalf("保存手动分段失败: %v", err)
+	}
+	if len(saved.Run.Script.Shots) != 2 {
+		t.Fatalf("段数要跟着改动：%d", len(saved.Run.Script.Shots))
+	}
+	if got := saved.Run.Script.Shots[1]; got.DurationS != 9 || got.TimeRange != [2]float64{5, 14} {
+		t.Fatalf("关卡①的手动段时长要保真，得到 %.2fs %v", got.DurationS, got.TimeRange)
+	}
+	if saved.Config.DurationS != 14 {
+		t.Fatalf("总时长要按各段之和回写，得到 %d", saved.Config.DurationS)
+	}
+	if len(saved.Config.ManualShots) != 2 {
+		t.Fatalf("关卡①改完的分段要回写到配置：%+v", saved.Config.ManualShots)
+	}
+}
