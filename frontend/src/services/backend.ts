@@ -13,6 +13,7 @@ import type {
   VideoGateEdits,
   VideoProject,
   VideoSegmentRegen,
+  VideoSubtitleEdit,
   VideoTask,
   VideoTaskInput,
 } from '../types/video'
@@ -42,6 +43,7 @@ interface AppBindings {
   RegenerateVideoStage(id: string, feedback: string): Promise<void>
   RegenerateVideoMeta(id: string, platforms: string[], feedback: string): Promise<void>
   SaveVideoStageEdits(id: string, edits: VideoGateEdits): Promise<VideoTask>
+  SaveVideoSubtitles(id: string, edit: VideoSubtitleEdit): Promise<VideoTask>
   GetVideoEnvironment(): Promise<VideoEnvironment>
 
   /* 逐段确认关卡 + 尾帧资产 */
@@ -120,6 +122,8 @@ export const backend = {
     bindings().RegenerateVideoMeta(id, platforms, feedback),
   saveVideoStageEdits: (id: string, edits: VideoGateEdits): Promise<VideoTask> =>
     bindings().SaveVideoStageEdits(id, edits),
+  saveVideoSubtitles: (id: string, edit: VideoSubtitleEdit): Promise<VideoTask> =>
+    bindings().SaveVideoSubtitles(id, edit),
   getVideoEnvironment: (): Promise<VideoEnvironment> => bindings().GetVideoEnvironment(),
 
   approveVideoSegment: (id: string): Promise<void> => bindings().ApproveVideoSegment(id),

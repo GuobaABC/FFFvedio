@@ -155,6 +155,12 @@ function errorLabel(code: string): string {
       <span v-if="task.run.finishedAt">· 完成 {{ formatCrawlClock(task.run.finishedAt) }}</span>
     </p>
 
+    <!-- 任务级的选题备注与标签：建任务时填了就得在这里看得到，标签还会跟着条目入库 -->
+    <p v-if="task.config?.note || task.config?.tags?.length" class="detail__brief">
+      <span v-if="task.config.note">备注：{{ task.config.note }}</span>
+      <span v-for="tag in task.config?.tags ?? []" :key="tag" class="ui-chip">#{{ tag }}</span>
+    </p>
+
     <p v-if="actionError" class="ui-notice ui-notice--error">{{ actionError }}</p>
     <p v-if="task.error" class="ui-notice ui-notice--error">{{ task.error }}</p>
     <p v-for="warning in warnings" :key="warning" class="ui-notice ui-notice--warn">{{ warning }}</p>
@@ -263,6 +269,7 @@ function errorLabel(code: string): string {
               </span>
               <span v-if="item.optional.author" class="ui-chip">作者 {{ item.optional.author }}</span>
               <span v-if="item.meta.siteProfile" class="ui-chip ui-chip--ok">站点规则命中</span>
+              <span v-for="tag in item.optional?.tags ?? []" :key="tag" class="ui-chip">#{{ tag }}</span>
             </div>
             <p class="item__url mono">{{ item.canonicalUrl }}</p>
             <div class="item__actions">
@@ -328,6 +335,16 @@ function errorLabel(code: string): string {
   flex-wrap: wrap;
   font-size: 11px;
   color: var(--color-text-muted);
+}
+
+.detail__brief {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--color-text);
+  margin: -6px 0 0;
 }
 
 .mono {

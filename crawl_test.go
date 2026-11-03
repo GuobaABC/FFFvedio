@@ -258,6 +258,10 @@ func TestCrawlTaskLifecycleWithLocalSite(t *testing.T) {
 	if item.Title != "凌晨四点的城市" || item.Meta.ExtractTier != CrawlTierStructured {
 		t.Fatalf("抽取结果不符预期: %+v", item)
 	}
+	// 任务上填的「选题池标签」得真的跟着条目走，否则这个输入框就是摆设
+	if tags := strings.Join(item.Optional.Tags, ","); !strings.Contains(tags, "选题池A") {
+		t.Fatalf("选题池标签未写入条目: %+v", item.Optional.Tags)
+	}
 	if stored.Run.Stats.Stored != 1 || stored.Run.Stats.TierHits[CrawlTierStructured] != 1 {
 		t.Fatalf("统计不符预期: %+v", stored.Run.Stats)
 	}
@@ -288,6 +292,9 @@ func TestCrawlTaskLifecycleWithLocalSite(t *testing.T) {
 	items, err := app.ListCrawlItems(20)
 	if err != nil || len(items) != 1 {
 		t.Fatalf("素材库应有 1 条: %v %+v", err, items)
+	}
+	if tags := strings.Join(items[0].Optional.Tags, ","); !strings.Contains(tags, "选题池A") {
+		t.Fatalf("素材库条目应带着选题池标签: %+v", items[0].Optional.Tags)
 	}
 
 	if err := app.DeleteCrawlTask(task.ID); err != nil {
@@ -342,5 +349,43 @@ func TestCrawlTaskCreateRejectsInputWithoutURL(t *testing.T) {
 	app := newTestApp(t)
 	if _, err := app.CreateCrawlTask(CrawlTaskInput{Config: CrawlRunConfig{Input: "只有文字没有链接"}}); err == nil {
 		t.Fatal("没有链接时创建任务应报错")
+	}
+}
+
+// 抓取策略上的勾选得真的作数：勾掉 L3 不能因为选了文本模型就被顶回开启，
+// 关掉 robots 得留下提醒，间隔/超时没填那么回落默认档。
+func TestNormalizeCrawlConfigKeepsUserChoices(t *testing.T) {
+	cfg, warnings, err := normalizeCrawlConfig(CrawlRunConfig{
+		Input:          "https://www.bilibili.com/video/BV1xx411c7mD",
+		TextProviderID: " provider-1 ",
+		UseLLM:         false,
+	})
+	if err != nil {
+		t.Fatalf("归一化失败: %v", err)
+	}
+	if cfg.UseLLM {
+		t.Fatal("勾掉 L3 后不该被文本模型顶回开启")
+	}
+	if cfg.TextProviderID != "provider-1" {
+		t.Fatalf("文本模型 ID 应去空格: %q", cfg.TextProviderID)
+	}
+	if cfg.IntervalMS != defaultCrawlIntervalMS || cfg.TimeoutS != defaultCrawlTimeoutS {
+		t.Fatalf("间隔/超时应回落默认档: %d / %d", cfg.IntervalMS, cfg.TimeoutS)
+	}
+	joined := strings.Join(warnings, "\n")
+	if !strings.Contains(joined, "已关闭 L3") {
+		t.Fatalf("应提示 L3 已按用户勾选关闭: %v", warnings)
+	}
+	if !strings.Contains(joined, "robots.txt") {
+		t.Fatalf("未勾选 robots 应给出警告: %v", warnings)
+	}
+
+	// 勾上 L3 且不填模型 ID：交给流水线自动挑选，不改用户意图
+	on, _, err := normalizeCrawlConfig(CrawlRunConfig{
+		Input:  "https://www.bilibili.com/video/BV1xx411c7mD",
+		UseLLM: true,
+	})
+	if err != nil || !on.UseLLM {
+		t.Fatalf("勾选 L3 应保持开启: %v %+v", err, on)
 	}
 }

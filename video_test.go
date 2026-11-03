@@ -1263,7 +1263,7 @@ func TestPromptEditorCanRebindSpeaker(t *testing.T) {
 	}
 }
 
-// 字幕要等 gate②（确认提示词）之后才落：台词还可能被改，提前铺轴等于白做一遍。
+// 字幕要等视频生成之后才落：时间轴必须对得上真实片段，提前铺轴等于拿预算时长骗人。
 func TestSubtitleGeneratedOnlyAfterPromptConfirm(t *testing.T) {
 	withTempVideoRoot(t)
 	app := newTestApp(t)
@@ -1289,8 +1289,8 @@ func TestSubtitleGeneratedOnlyAfterPromptConfirm(t *testing.T) {
 	if task.Run.Subtitles != nil {
 		t.Fatalf("提示词阶段不该生成字幕：%+v", task.Run.Subtitles)
 	}
-	if logs := strings.Join(task.Run.Logs, "\n"); !strings.Contains(logs, "字幕将在确认提示词后生成") {
-		t.Fatalf("日志要说明字幕延后到确认之后：%v", task.Run.Logs)
+	if logs := strings.Join(task.Run.Logs, "\n"); !strings.Contains(logs, "字幕将在视频生成后铺轴") {
+		t.Fatalf("日志要说明字幕延后到视频生成之后：%v", task.Run.Logs)
 	}
 
 	if err := runner.runSubtitleStage(); err != nil {
@@ -1307,7 +1307,7 @@ func TestSubtitleGeneratedOnlyAfterPromptConfirm(t *testing.T) {
 	}
 }
 
-// 关卡②改台词只作废旧字幕，不等确认不再生成：字幕时机固定在 gate② 之后。
+// 关卡②改台词只作废旧字幕与旧画布，不提前重铺：字幕等真实片段出来。
 func TestPromptStageEditClearsSubtitlesInsteadOfRebuilding(t *testing.T) {
 	withTempVideoRoot(t)
 	app := newTestApp(t)
@@ -1340,8 +1340,8 @@ func TestPromptStageEditClearsSubtitlesInsteadOfRebuilding(t *testing.T) {
 	if saved.Run.Subtitles != nil {
 		t.Fatalf("关卡②不该提前生成字幕：%+v", saved.Run.Subtitles)
 	}
-	if logs := strings.Join(saved.Run.Logs, "\n"); !strings.Contains(logs, "字幕将在确认后重新生成") {
-		t.Fatalf("日志要说明字幕等确认后重生：%v", saved.Run.Logs)
+	if logs := strings.Join(saved.Run.Logs, "\n"); !strings.Contains(logs, "字幕将在视频生成后重铺") {
+		t.Fatalf("日志要说明字幕等视频出来后重生：%v", saved.Run.Logs)
 	}
 }
 
@@ -1550,5 +1550,314 @@ func TestSaveManualShotsKeepsDurationAtGate(t *testing.T) {
 	}
 	if len(saved.Config.ManualShots) != 2 {
 		t.Fatalf("关卡①改完的分段要回写到配置：%+v", saved.Config.ManualShots)
+	}
+}
+
+// 自动模式下关卡①改段长也必须保真：早先按目标总时长等比缩放，改了等于没改。
+func TestAutoModeShotEditKeepsSegmentDurations(t *testing.T) {
+	withTempVideoRoot(t)
+	app := newTestApp(t)
+
+	created, err := app.CreateVideoTask(VideoTaskInput{Config: VideoRunConfig{
+		Topic: "自动关卡改段长", DurationS: 8, Adapter: "mock",
+	}})
+	if err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	task, err := app.videoTaskByID(created.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	task.Stage = VideoStageConfirmScript
+	task.Status = VideoStatusWaiting
+	task.Run.Script = &VideoScript{Shots: []VideoShot{{ID: "s1", TimeRange: [2]float64{0, 8}, DurationS: 8, SceneIntent: "开场"}}}
+	if err := app.updateVideoTaskRecord(task); err != nil {
+		t.Fatalf("写入任务失败: %v", err)
+	}
+
+	saved, err := app.SaveVideoStageEdits(created.ID, VideoGateEdits{Shots: []VideoShot{
+		{ID: "s1", SceneIntent: "开场", DurationS: 3},
+		{ID: "s2", SceneIntent: "收尾", DurationS: 7},
+	}})
+	if err != nil {
+		t.Fatalf("保存分镜失败: %v", err)
+	}
+	if got := saved.Run.Script.Shots[0]; got.DurationS != 3 || got.TimeRange != [2]float64{0, 3} {
+		t.Fatalf("段时长要按用户填的保留，得到 %.2fs %v", got.DurationS, got.TimeRange)
+	}
+	if got := saved.Run.Script.Shots[1]; got.DurationS != 7 || got.TimeRange != [2]float64{3, 10} {
+		t.Fatalf("第二段时长/时间轴错误，得到 %.2fs %v", got.DurationS, got.TimeRange)
+	}
+	if saved.Config.DurationS != 10 {
+		t.Fatalf("总时长按各段之和回写，得到 %d", saved.Config.DurationS)
+	}
+	if saved.Run.Compose != nil {
+		t.Fatal("分镜改动后合成预处理缓存应作废")
+	}
+	if logs := strings.Join(saved.Run.Logs, "\n"); !strings.Contains(logs, "总时长调为 10s") {
+		t.Fatalf("日志要说清总时长已改：%v", saved.Run.Logs)
+	}
+}
+
+// 用户提交的 cue：空文本丢弃、时长夹到最短、越界贴回片尾、非法布局值归零/夹住，最后按时间重排编号。
+func TestNormalizeSubtitleCuesClampsUserEdits(t *testing.T) {
+	cues, notes := normalizeSubtitleCues([]VideoSubtitleCue{
+		{Start: 5, End: 5.1, Text: "太短要拉长"},
+		{Start: 0, End: 2, Text: "   "},
+		{Start: 9.8, End: 20, Text: "超出成片", Anchor: 12, MarginVPct: 200, FontSizePct: 99},
+		{Start: 1, End: 2, Text: "排在前面", Anchor: 4},
+	}, 10)
+	if len(cues) != 3 {
+		t.Fatalf("空文本应被丢弃：%+v", cues)
+	}
+	if cues[0].Text != "排在前面" || cues[1].Text != "太短要拉长" || cues[2].Text != "超出成片" {
+		t.Fatalf("cue 应按起始时间排序：%+v", cues)
+	}
+	for index, cue := range cues {
+		if cue.Index != index+1 {
+			t.Fatalf("编号应重排为连续序号：%+v", cues)
+		}
+	}
+	if cues[1].End-cues[1].Start < subtitleCueMinS-1e-9 {
+		t.Fatalf("过短的 cue 应拉到最短停留：%.2f-%.2f", cues[1].Start, cues[1].End)
+	}
+	if cues[2].Start != 9.6 || cues[2].End != 10 {
+		t.Fatalf("超出成片的 cue 应贴到片尾：%.2f-%.2f", cues[2].Start, cues[2].End)
+	}
+	if cues[2].Anchor != 0 || cues[0].Anchor != 4 {
+		t.Fatalf("只有 1-9 的锚点能保留：%+v", cues)
+	}
+	if cues[2].MarginVPct != 90 || cues[2].FontSizePct != 30 {
+		t.Fatalf("留白与字号应夹到上限：%+v", cues[2])
+	}
+	if strings.Join(notes, "\n") == "" {
+		t.Fatal("越界与夹取要留下告警")
+	}
+}
+
+// 逐条位置/字号落到 ASS 里：	an 覆盖对齐、Dialogue 的 MarginV 承载留白、\fs 覆盖字号。
+func TestRenderASSAppliesPerCueLayout(t *testing.T) {
+	cfg, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "逐条字幕布局", Subtitles: true})
+	if err != nil {
+		t.Fatalf("归一失败: %v", err)
+	}
+	cues := []VideoSubtitleCue{
+		{Index: 1, Start: 0, End: 1, Text: "沿用全局"},
+		{Index: 2, Start: 1, End: 2, Text: "右上大字", Anchor: 9, MarginVPct: 20, FontSizePct: 8},
+	}
+	ass := renderASS(cues, cfg, 1080, 1920)
+	// 全局样式：留白 5% × 1920 = 96
+	if !strings.Contains(ass, ",,0,0,96,,沿用全局") {
+		t.Fatalf("未改布局的 cue 应沿用全局样式：%s", ass)
+	}
+	// 逐条：留白 20% × 1920 = 384，字号 8% × 1920 ≈ 154
+	if !strings.Contains(ass, `\an9`) || !strings.Contains(ass, `\fs154`) {
+		t.Fatalf("逐条锚点/字号未写进 override：%s", ass)
+	}
+	if !strings.Contains(ass, ",,0,0,384,,") {
+		t.Fatalf("逐条垂直留白未写进 Dialogue MarginV：%s", ass)
+	}
+}
+
+// 字幕阶段排在视频之后：产出时间轴后停在 CONFIRM_SUBS 等用户，确认后才进合成。
+func TestSubtitleStageStopsAtConfirmGate(t *testing.T) {
+	withTempVideoRoot(t)
+	app := newTestApp(t)
+
+	created, err := app.CreateVideoTask(VideoTaskInput{Config: VideoRunConfig{
+		Topic: "字幕关卡流转", DurationS: 6, Adapter: "mock", Subtitles: true,
+	}})
+	if err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	task, err := app.videoTaskByID(created.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	task.Stage = VideoStageBuildSubs
+	task.Run.Script = &VideoScript{Shots: []VideoShot{{ID: "s1", DurationS: 6, Dialogue: "第一句话。第二句话。"}}}
+	task.Run.Prompts = []VideoPromptItem{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: "第一句话。第二句话。", Start: 0, End: 6}}
+	plan := buildVideoPlan(task.Config, task.Run.Prompts, defaultVideoCapabilities(), "mock")
+	task.Run.Plan = &plan
+	if err := app.updateVideoTaskRecord(task); err != nil {
+		t.Fatalf("写入任务失败: %v", err)
+	}
+
+	// 没有真实片段：铺轴退回预算时间轴，但流程仍要停在字幕关卡
+	app.runVideoPipeline(created.ID, VideoStageBuildSubs, "")
+	gated, err := app.videoTaskByID(created.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	if gated.Stage != VideoStageConfirmSubs || gated.Status != VideoStatusWaiting {
+		t.Fatalf("字幕生成后应停在确认关卡：%s/%s", gated.Stage, gated.Status)
+	}
+	if gated.Run.Subtitles == nil || len(gated.Run.Subtitles.Cues) == 0 {
+		t.Fatalf("字幕关卡要有可编辑的 cue：%+v", gated.Run.Subtitles)
+	}
+	if gated.Run.Subtitles.Confirmed {
+		t.Fatal("用户还没确认，不该标成已确认")
+	}
+	if gated.Run.Gates[VideoGateSubs] != videoGatePending {
+		t.Fatalf("字幕关卡状态应为 pending：%v", gated.Run.Gates)
+	}
+	if err := app.RunVideoTask(created.ID); err == nil || !strings.Contains(err.Error(), "人工确认关卡") {
+		t.Fatalf("停在字幕关卡时不能直接继续执行: %v", err)
+	}
+
+	if err := app.ApproveVideoGate(created.ID); err != nil {
+		t.Fatalf("确认字幕失败: %v", err)
+	}
+	advanced := waitForVideoTask(t, app, created.ID, func(item VideoTask) bool {
+		return item.Stage != VideoStageConfirmSubs
+	}, "确认后应进入合成")
+	if advanced.Run.Subtitles == nil || !advanced.Run.Subtitles.Confirmed {
+		t.Fatalf("确认后 cue 要钉成最终版：%+v", advanced.Run.Subtitles)
+	}
+	if advanced.Run.Gates[VideoGateSubs] != videoGateApproved {
+		t.Fatalf("字幕关卡应为 approved：%v", advanced.Run.Gates)
+	}
+	if logs := strings.Join(advanced.Run.Logs, "\n"); !strings.Contains(logs, "字幕已确认") {
+		t.Fatalf("日志要留下确认记录：%v", advanced.Run.Logs)
+	}
+}
+
+// 字幕关卡里改的时间/文本/位置必须烧进成片：合成阶段不得重排或覆盖用户的 cue。
+func TestConfirmedSubtitlesSurviveCompose(t *testing.T) {
+	ffmpeg := bundledFFmpeg(t)
+	withTempVideoRoot(t)
+	app := newTestApp(t)
+
+	clip := filepath.Join(t.TempDir(), "01-a.mp4")
+	makeTestClip(t, ffmpeg, clip, "1920x1080", 2)
+
+	created, err := app.CreateVideoTask(VideoTaskInput{Config: VideoRunConfig{
+		Topic: "字幕不被覆盖", DurationS: 2, Adapter: "mock", Subtitles: true, AspectRatio: "16:9",
+	}})
+	if err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	task, err := app.videoTaskByID(created.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	task.Stage = VideoStageConfirmSubs
+	task.Status = VideoStatusWaiting
+	task.Run.Plan = &VideoPlan{Segments: []VideoSegment{{ID: "a", ShotID: "s1", Index: 0, DurationS: 2, Dialogue: "模型写的台词"}}}
+	task.Run.Renders = []VideoRender{{SegmentID: "a", VideoURI: clip, Status: "succeeded"}}
+	task.Run.Subtitles = &VideoSubtitles{
+		TimingSource: "measured",
+		Cues:         []VideoSubtitleCue{{Index: 1, Start: 0, End: 2, Text: "模型写的台词"}},
+	}
+	if err := app.updateVideoTaskRecord(task); err != nil {
+		t.Fatalf("写入任务失败: %v", err)
+	}
+
+	saved, err := app.SaveVideoSubtitles(created.ID, VideoSubtitleEdit{Cues: []VideoSubtitleCue{
+		{Start: 0.3, End: 1.6, Text: "我自己写的一句", Anchor: 8, MarginVPct: 25, FontSizePct: 9},
+	}})
+	if err != nil {
+		t.Fatalf("保存字幕失败: %v", err)
+	}
+	if !saved.Run.Subtitles.Confirmed || saved.Run.Subtitles.EditedAt == "" {
+		t.Fatalf("保存后应标记已确认：%+v", saved.Run.Subtitles)
+	}
+	if len(saved.Run.Subtitles.Cues) != 1 || saved.Run.Subtitles.Cues[0].Text != "我自己写的一句" {
+		t.Fatalf("cue 要按用户版本落库：%+v", saved.Run.Subtitles.Cues)
+	}
+	assData, err := os.ReadFile(saved.Run.Subtitles.ASSPath)
+	if err != nil {
+		t.Fatalf("读取 ASS 失败: %v", err)
+	}
+	if !strings.Contains(string(assData), `\an8`) || !strings.Contains(string(assData), "我自己写的一句") {
+		t.Fatalf("逐条位置/文本未写进 ASS：%s", assData)
+	}
+
+	workDir, err := app.ensureTaskWorkDir(created.ID)
+	if err != nil {
+		t.Fatalf("创建任务目录失败: %v", err)
+	}
+	run := saved.Run
+	output, _, err := composeVideo(context.Background(), workDir, created.ID, saved.Config, &run)
+	if err != nil {
+		t.Fatalf("合成失败: %v", err)
+	}
+	if len(run.Subtitles.Cues) != 1 || run.Subtitles.Cues[0].Text != "我自己写的一句" {
+		t.Fatalf("合成阶段重排了用户字幕：%+v", run.Subtitles.Cues)
+	}
+	if cue := run.Subtitles.Cues[0]; cue.Start != 0.3 || cue.End != 1.6 || cue.Anchor != 8 || cue.MarginVPct != 25 || cue.FontSizePct != 9 {
+		t.Fatalf("用户的逐条布局被覆盖：%+v", cue)
+	}
+	if run.Subtitles.TimingSource != "measured" {
+		t.Fatalf("时间轴来源要保留用户那一份：%s", run.Subtitles.TimingSource)
+	}
+	if !output.BurnSubtitles {
+		t.Fatalf("已确认字幕应烧进成片：%+v", output)
+	}
+}
+
+// 删空所有字幕也不能被合成“好意地”补回来：成片宁可没字幕。
+func TestRemovingAllSubtitlesStaysRemoved(t *testing.T) {
+	ffmpeg := bundledFFmpeg(t)
+	withTempVideoRoot(t)
+	app := newTestApp(t)
+
+	clip := filepath.Join(t.TempDir(), "01-a.mp4")
+	makeTestClip(t, ffmpeg, clip, "1920x1080", 2)
+
+	created, err := app.CreateVideoTask(VideoTaskInput{Config: VideoRunConfig{
+		Topic: "删空字幕", DurationS: 2, Adapter: "mock", Subtitles: true, AspectRatio: "16:9",
+	}})
+	if err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	task, err := app.videoTaskByID(created.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	task.Stage = VideoStageConfirmSubs
+	task.Status = VideoStatusWaiting
+	task.Run.Plan = &VideoPlan{Segments: []VideoSegment{{ID: "a", ShotID: "s1", Index: 0, DurationS: 2, Dialogue: "旧字幕"}}}
+	task.Run.Renders = []VideoRender{{SegmentID: "a", VideoURI: clip, Status: "succeeded"}}
+	task.Run.Subtitles = &VideoSubtitles{
+		TimingSource: "measured",
+		Cues:         []VideoSubtitleCue{{Index: 1, Start: 0, End: 2, Text: "旧字幕"}},
+	}
+	if err := app.updateVideoTaskRecord(task); err != nil {
+		t.Fatalf("写入任务失败: %v", err)
+	}
+
+	saved, err := app.SaveVideoSubtitles(created.ID, VideoSubtitleEdit{Cues: []VideoSubtitleCue{}})
+	if err != nil {
+		t.Fatalf("保存空字幕失败: %v", err)
+	}
+	if len(saved.Run.Subtitles.Cues) != 0 || !saved.Run.Subtitles.Confirmed {
+		t.Fatalf("删空后要保留空列表：%+v", saved.Run.Subtitles)
+	}
+	assData, err := os.ReadFile(saved.Run.Subtitles.ASSPath)
+	if err != nil {
+		t.Fatalf("读取 ASS 失败: %v", err)
+	}
+	if strings.Contains(string(assData), "Dialogue:") {
+		t.Fatalf("空字幕不该还有 Dialogue：%s", assData)
+	}
+
+	workDir, err := app.ensureTaskWorkDir(created.ID)
+	if err != nil {
+		t.Fatalf("创建任务目录失败: %v", err)
+	}
+	run := saved.Run
+	output, _, composeErr := composeVideo(context.Background(), workDir, created.ID, saved.Config, &run)
+	if composeErr != nil {
+		t.Fatalf("合成失败: %v", composeErr)
+	}
+	if len(run.Subtitles.Cues) != 0 {
+		t.Fatalf("合成阶段把删掉的字幕补回来了：%+v", run.Subtitles.Cues)
+	}
+	if output.BurnSubtitles {
+		t.Fatal("没有字幕时不应报告已烧录")
+	}
+	if !strings.Contains(output.Note, "移除全部字幕") {
+		t.Fatalf("要告诉用户字幕是按他的设置删空的：%q", output.Note)
 	}
 }

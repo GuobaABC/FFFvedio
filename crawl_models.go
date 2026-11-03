@@ -82,11 +82,12 @@ type CrawlRunConfig struct {
 	Note  string   `json:"note"`
 	// MaxUrls 单任务最多收录多少条 URL
 	MaxUrls int `json:"maxUrls"`
-	// UseLLM 新域名首爬时启用 L3 零样本抽取，并把结果反推成站点规则（L4）
+	// UseLLM 新域名首爬时启用 L3 零样本抽取，并把结果反推成站点规则（L4）；
+	// 表单默认勾选，勾掉后即使指定了文本模型也不调用模型
 	UseLLM bool `json:"useLlm"`
 	// TextProviderID 指定 L3/L4 使用的文本模型；为空则自动挑选
 	TextProviderID string `json:"textProviderId"`
-	// RespectRobots 遵守 robots.txt（默认 true）
+	// RespectRobots 遵守 robots.txt（表单默认勾选；取消勾选后不检查，归一化会给出警告）
 	RespectRobots bool `json:"respectRobots"`
 	// IntervalMS 同 host 抓取间隔，默认 1.5s
 	IntervalMS int `json:"intervalMs"`
@@ -257,8 +258,9 @@ func normalizeCrawlConfig(cfg CrawlRunConfig) (CrawlRunConfig, []string, error) 
 	if cfg.MaxUrls > maxCrawlMaxUrls {
 		cfg.MaxUrls = maxCrawlMaxUrls
 	}
-	// 默认开启：协议默认就把 robots 与文本模型兜底打开，用户可显式关闭
-	cfg.UseLLM = cfg.UseLLM || cfg.TextProviderID != ""
+	// L3 零样本抽取以用户勾选为准：选了文本模型不等于想跑 L3，
+	// 勾掉了又被模型顶回开启，这个复选框就是个摆设。
+	cfg.TextProviderID = strings.TrimSpace(cfg.TextProviderID)
 	if cfg.IntervalMS <= 0 {
 		cfg.IntervalMS = defaultCrawlIntervalMS
 	}
@@ -271,6 +273,9 @@ func normalizeCrawlConfig(cfg CrawlRunConfig) (CrawlRunConfig, []string, error) 
 	warnings := make([]string, 0, 2)
 	if !cfg.RespectRobots {
 		warnings = append(warnings, "已关闭 robots.txt 检查：仅在你确认目标站允许抓取时使用")
+	}
+	if !cfg.UseLLM && cfg.TextProviderID != "" {
+		warnings = append(warnings, "已关闭 L3 零样本抽取：新域名只走 L0/L1/L2，指定的文本模型不会被调用")
 	}
 	return cfg, warnings, nil
 }
@@ -294,6 +299,32 @@ func normalizeCrawlTags(list []string) []string {
 		}
 	}
 	return out
+}
+
+// mergeCrawlTaskTags 把任务上填的「选题池标签」并进条目抽到的标签：用户标的排前面，
+// 去重后随条目入库，素材库与「去生成」才带得走这几个标签。
+func mergeCrawlTaskTags(taskTags, itemTags []string) []string {
+	merged := make([]string, 0, len(taskTags)+len(itemTags))
+	merged = append(merged, taskTags...)
+	merged = append(merged, itemTags...)
+	return normalizeCrawlTags(merged)
+}
+
+// crawlTagsCarried 任务上填的标签是否已经都在条目里了：都在就不必再写一次库。
+func crawlTagsCarried(taskTags, itemTags []string) bool {
+	for _, tag := range normalizeCrawlTags(taskTags) {
+		found := false
+		for _, existing := range itemTags {
+			if existing == tag {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func newCrawlTaskID() string {

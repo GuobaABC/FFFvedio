@@ -15,6 +15,7 @@ import {
   MANUAL_SHOT_MIN_S,
   STAGE_LABELS,
   STATUS_LABELS,
+  SUBTITLE_ALIGNMENTS,
   VIDEO_PLATFORMS,
   VIDEO_STAGES,
   estimateSpeech,
@@ -24,6 +25,7 @@ import {
   type VideoPromptEdit,
   type VideoSegment,
   type VideoShot,
+  type VideoSubtitleCue,
   type VideoTask,
 } from '../types/video'
 
@@ -36,6 +38,8 @@ const emit = defineEmits<{
 /* 关卡编辑草稿：进入关卡时从 RunContext 复制一份，保存时才回写后端 */
 const shotDrafts = ref<VideoShot[]>([])
 const promptDrafts = ref<VideoPromptEdit[]>([])
+/* 字幕关卡草稿：逐条改时间/文本/位置/字号，支持增删 */
+const subtitleDrafts = ref<VideoSubtitleCue[]>([])
 const feedback = ref('')
 const busy = ref('')
 const actionError = ref('')
@@ -60,8 +64,21 @@ function cloneShots(source: VideoShot[]): VideoShot[] {
   }))
 }
 
+function cloneCues(source: VideoSubtitleCue[]): VideoSubtitleCue[] {
+  return source.map((cue, index) => ({
+    index: cue.index ?? index + 1,
+    start: cue.start ?? 0,
+    end: cue.end ?? 0,
+    text: cue.text ?? '',
+    anchor: cue.anchor ?? 0,
+    marginVpct: cue.marginVpct ?? 0,
+    fontSizePct: cue.fontSizePct ?? 0,
+  }))
+}
+
 function syncDrafts() {
   shotDrafts.value = cloneShots(props.task.run?.script?.shots ?? [])
+  subtitleDrafts.value = cloneCues(props.task.run?.subtitles?.cues ?? [])
   promptDrafts.value = (props.task.run?.prompts ?? []).map((item) => ({
     shotId: item.shotId,
     visualPrompt: item.visualPrompt,
@@ -107,6 +124,7 @@ const isRunning = computed(() => props.task.status === 'running')
 const stageIndex = computed(() => VIDEO_STAGES.findIndex((item) => item.id === props.task.stage))
 const canEditShots = computed(() => props.task.stage === 'CONFIRM_SCRIPT' && !isRunning.value)
 const canEditPrompts = computed(() => props.task.stage === 'CONFIRM_PROMPT' && !isRunning.value)
+const canEditSubtitles = computed(() => props.task.stage === 'CONFIRM_SUBS' && !isRunning.value)
 const canEditMeta = computed(() => props.task.stage === 'CONFIRM_META' && !isRunning.value)
 
 const plan = computed(() => run.value?.plan ?? null)
@@ -124,6 +142,7 @@ const logs = computed(() => run.value?.logs ?? [])
 
 const gate1State = computed(() => run.value?.gates?.gate1 ?? 'pending')
 const gate2State = computed(() => run.value?.gates?.gate2 ?? 'pending')
+const gateSubsState = computed(() => run.value?.gates?.gate_subs ?? 'pending')
 const gate3State = computed(() => run.value?.gates?.gate3 ?? 'pending')
 const publishMeta = computed(() => run.value?.publishMeta ?? null)
 
@@ -298,6 +317,62 @@ function savePrompts() {
   void guard('save-prompts', async () => {
     await backend.saveVideoStageEdits(props.task.id, { shots: [], prompts: promptDrafts.value })
     actionInfo.value = '提示词已保存，渲染计划已重算'
+  })
+}
+
+/* ---------------- 字幕关卡 ---------------- */
+/** 逐条布局可选项：0 表示沿用全局字幕样式 */
+const subtitleAnchorOptions = computed(() => [
+  { value: 0, label: `沿用全局（${SUBTITLE_ALIGNMENTS.find((item) => item.value === (config.value.subtitleStyle?.alignment ?? 2))?.label ?? '中下'}）` },
+  ...SUBTITLE_ALIGNMENTS,
+])
+
+/** 时间上限：成片实际长度与现有 cue 中的最大值，避免新增字幕一上来就被后端夹回来 */
+const subtitleMaxTime = computed(() => {
+  const fromCues = subtitleDrafts.value.reduce((max, cue) => Math.max(max, cue.end ?? 0), 0)
+  return Math.max(config.value.durationS ?? 0, plan.value?.totalS ?? 0, fromCues)
+})
+
+/** 字幕预览用的画布：已拼好并归一画幅的成片底版（未烧字幕），调位置就对着它 */
+const subtitleCanvasUrl = computed(() => run.value?.compose?.canvasUrl || output.value?.mediaUrl || '')
+
+/** 把锚点值翻译成人看得懂的位置（0 = 沿用全局样式） */
+function subtitleAnchorLabel(anchor?: number): string {
+  if (!anchor) return '沿用全局位置'
+  return SUBTITLE_ALIGNMENTS.find((item) => item.value === anchor)?.label ?? `锚点 ${anchor}`
+}
+
+/** 逐条布局摘要：只列用户改过的项，没改就不噪音 */
+function cueLayoutNote(cue: VideoSubtitleCue): string {
+  const parts: string[] = []
+  if (cue.anchor) parts.push(subtitleAnchorLabel(cue.anchor))
+  if (cue.marginVpct) parts.push(`留白 ${cue.marginVpct}%`)
+  if (cue.fontSizePct) parts.push(`字号 ${cue.fontSizePct}%`)
+  return parts.length > 0 ? ` · ${parts.join(' / ')}` : ''
+}
+
+function addSubtitleCue() {
+  const last = subtitleDrafts.value[subtitleDrafts.value.length - 1]
+  const start = last ? Math.round((last.end + 0.2) * 10) / 10 : 0
+  subtitleDrafts.value.push({
+    index: subtitleDrafts.value.length + 1,
+    start,
+    end: Math.min(start + 2.5, subtitleMaxTime.value || start + 2.5),
+    text: '',
+    anchor: 0,
+    marginVpct: 0,
+    fontSizePct: 0,
+  })
+}
+
+function removeSubtitleCue(index: number) {
+  subtitleDrafts.value.splice(index, 1)
+}
+
+function saveSubtitles() {
+  void guard('save-subs', async () => {
+    await backend.saveVideoSubtitles(props.task.id, { cues: subtitleDrafts.value })
+    actionInfo.value = '字幕已保存（后端已按这份时间轴重写字幕文件）'
   })
 }
 
@@ -629,7 +704,7 @@ function revealOutput() {
           </label>
           <label class="ui-field">
             <span class="ui-label">
-              镜头时长（秒，{{ scriptMode === 'manual' ? '直接采用，总时长按各段之和回写' : '保存后按总时长等比归一' }}）
+              镜头时长（秒，直接采用，总时长按各段之和回写）
             </span>
             <input
               v-model.number="shot.durationS"
@@ -755,6 +830,131 @@ function revealOutput() {
       </div>
     </section>
 
+    <!-- 字幕确认关卡：排在视频生成之后，调完才进合成 -->
+    <section v-if="task.stage === 'CONFIRM_SUBS'" class="block">
+      <header class="block__head">
+        <h4 class="block__title">字幕确认（视频已生成）</h4>
+        <span class="ui-chip" :class="gateSubsState === 'approved' ? 'ui-chip--ok' : 'ui-chip--warn'">
+          {{ gateSubsState === 'approved' ? '已确认' : '待确认' }}
+        </span>
+        <span class="ui-chip">{{ subtitleDrafts.length }} 条</span>
+        <span v-if="run?.subtitles" class="ui-chip">时间轴来源：{{ timingSourceLabel(run.subtitles.timingSource) }}</span>
+      </header>
+      <p class="hint">
+        时间轴已按真实片段与音频活动铺好。这里可以逐条改时间、文本、位置与字号，也能新增或删除；
+        保存/确认后合成阶段只负责烧录，不会再自动重排你调好的字幕。
+      </p>
+      <p v-if="run?.subtitles?.editedAt" class="hint">
+        上次修改：{{ formatClock(run.subtitles.editedAt) }}
+      </p>
+      <video v-if="subtitleCanvasUrl" class="video" :src="subtitleCanvasUrl" controls preload="metadata"></video>
+
+      <div v-for="(cue, index) in subtitleDrafts" :key="`cue-${index}`" class="shot">
+        <header class="shot__head">
+          <span class="shot__name">字幕 {{ index + 1 }}</span>
+          <span class="ui-chip">{{ formatSeconds(cue.start) }} → {{ formatSeconds(cue.end) }}</span>
+          <span class="ui-chip" :class="cue.end - cue.start < 0.4 ? 'ui-chip--error' : ''">
+            停留 {{ (Math.max(0, cue.end - cue.start)).toFixed(1) }}s
+          </span>
+          <span class="ui-chip">{{ subtitleAnchorLabel(cue.anchor) }}</span>
+        </header>
+        <div class="grid grid--2">
+          <label class="ui-field">
+            <span class="ui-label">起始（秒）</span>
+            <input
+              v-model.number="cue.start"
+              class="ui-input"
+              type="number"
+              min="0"
+              :max="subtitleMaxTime"
+              step="0.1"
+              :disabled="!canEditSubtitles"
+            />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">结束（秒，最短 0.4s）</span>
+            <input
+              v-model.number="cue.end"
+              class="ui-input"
+              type="number"
+              min="0"
+              :max="subtitleMaxTime"
+              step="0.1"
+              :disabled="!canEditSubtitles"
+            />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">位置（屏幕九宫格）</span>
+            <select v-model.number="cue.anchor" class="ui-input" :disabled="!canEditSubtitles">
+              <option v-for="option in subtitleAnchorOptions" :key="option.value" :value="option.value">
+                {{ option.label }}
+              </option>
+            </select>
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">垂直留白（占画面高度 %，0 = 沿用全局 {{ config.subtitleStyle.marginVpct }}%）</span>
+            <input
+              v-model.number="cue.marginVpct"
+              class="ui-input"
+              type="number"
+              min="0"
+              max="90"
+              step="0.5"
+              :disabled="!canEditSubtitles"
+            />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">字号（占画面高度 %，0 = 沿用全局 {{ config.subtitleStyle.fontSizePct }}%）</span>
+            <input
+              v-model.number="cue.fontSizePct"
+              class="ui-input"
+              type="number"
+              min="0"
+              max="30"
+              step="0.1"
+              :disabled="!canEditSubtitles"
+            />
+          </label>
+          <label class="ui-field">
+            <span class="ui-label">删除</span>
+            <button class="ui-btn ui-btn--danger" type="button" :disabled="!canEditSubtitles" @click="removeSubtitleCue(index)">
+              删除这条字幕
+            </button>
+          </label>
+        </div>
+        <label class="ui-field">
+          <span class="ui-label">字幕文本（留空则本条不写入）</span>
+          <textarea v-model="cue.text" class="ui-textarea" rows="2" :disabled="!canEditSubtitles"></textarea>
+        </label>
+      </div>
+
+      <div class="actions">
+        <button class="ui-btn" type="button" :disabled="busy !== '' || !canEditSubtitles" @click="addSubtitleCue">
+          添加字幕
+        </button>
+        <button class="ui-btn" type="button" :disabled="busy !== '' || !canEditSubtitles" @click="saveSubtitles">
+          {{ busy === 'save-subs' ? '保存中…' : '保存字幕修改' }}
+        </button>
+        <button class="ui-btn ui-btn--primary" type="button" :disabled="busy !== ''" @click="approveGate">
+          {{ busy === 'approve' ? '提交中…' : '确认字幕，开始合成' }}
+        </button>
+      </div>
+      <div class="feedback">
+        <label class="ui-field">
+          <span class="ui-label">重新生成意见（可选）</span>
+          <input
+            v-model="feedback"
+            class="ui-input"
+            type="text"
+            placeholder="例：字幕整体往下移一点；第一条出得太早"
+          />
+        </label>
+        <button class="ui-btn" type="button" :disabled="busy !== ''" @click="regenerate">
+          {{ busy === 'regenerate' ? '重算中…' : '按真实片段重铺时间轴' }}
+        </button>
+      </div>
+    </section>
+
     <!-- 分段渲染 -->
     <section v-if="renders.length > 0 || task.stage === 'RENDER_VIDEO' || task.stage === 'COMPOSE' || task.stage === 'DONE'" class="block">
       <header class="block__head">
@@ -792,7 +992,7 @@ function revealOutput() {
             <textarea v-model="segPromptDraft" class="ui-textarea" rows="4"></textarea>
           </label>
           <label class="ui-field">
-            <span class="ui-label">台词（改动后字幕时间轴会在合成阶段重建）</span>
+            <span class="ui-label">台词（改动后该段重渲，字幕时间轴在视频生成后重铺）</span>
             <textarea v-model="segDialogueDraft" class="ui-textarea" rows="2"></textarea>
           </label>
           <div class="feedback">
@@ -999,6 +1199,13 @@ function revealOutput() {
         <span v-if="run?.subtitles" class="ui-chip">
           时间轴来源：{{ timingSourceLabel(run.subtitles.timingSource) }}
         </span>
+        <span
+          v-if="run?.subtitles"
+          class="ui-chip"
+          :class="run.subtitles.confirmed ? 'ui-chip--ok' : 'ui-chip--warn'"
+        >
+          {{ run.subtitles.confirmed ? '已确认：合成不再重排' : '待确认' }}
+        </span>
       </header>
       <div v-if="plan" class="segments">
         <div v-for="segment in plan.segments" :key="segment.id" class="segment">
@@ -1016,7 +1223,7 @@ function revealOutput() {
         字幕文件：{{ run.subtitles.srtPath || '—' }}
       </p>
       <p v-else-if="plan && config.subtitles" class="hint">
-        字幕将在确认提示词后生成：先按台词与分镜预算时间轴铺轴，合成时再按各片段实测时长重排。
+        字幕将在视频生成后铺轴：拿拼接好的成片画布按片段实测时长与音频活动对齐，可在字幕关卡逐条改时间/位置/字号。
       </p>
       <p v-else-if="plan" class="hint">
         本次未生成字幕（默认关闭）：成片不含字幕；需要时在新建任务勾选「生成字幕并烧录」。
@@ -1026,7 +1233,9 @@ function revealOutput() {
       </p>
       <div v-if="subtitleCues.length > 0" class="cues">
         <div v-for="cue in subtitleCues" :key="cue.index" class="cue">
-          <span class="cue__time">{{ formatSeconds(cue.start) }} → {{ formatSeconds(cue.end) }}</span>
+          <span class="cue__time">
+            {{ formatSeconds(cue.start) }} → {{ formatSeconds(cue.end) }}{{ cueLayoutNote(cue) }}
+          </span>
           <span class="cue__text">{{ cue.text }}</span>
         </div>
       </div>

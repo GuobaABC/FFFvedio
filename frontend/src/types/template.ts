@@ -140,7 +140,6 @@ export const TEMPLATE_FIELD_LABELS: Record<string, string> = {
   'videoParams.style': '风格',
   'videoParams.camera': '运镜',
   'videoParams.mood': '情绪',
-  'videoParams.extraPrompt': '额外提示',
   'subtitleStyle.fontName': '字幕字体',
   'subtitleStyle.fontSizePct': '字幕字号',
   'subtitleStyle.primaryColor': '字幕主色',

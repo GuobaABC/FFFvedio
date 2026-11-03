@@ -14,7 +14,7 @@ import (
 // 应用元信息，与 wails.json 中的 info 保持一致
 const (
 	appName    = "FFFVedioAgent"
-	appVersion = "v0.0.7"
+	appVersion = "v0.0.8"
 )
 
 // 前端构建产物由 Wails 内嵌到可执行文件中，

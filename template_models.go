@@ -40,7 +40,6 @@ const (
 	templateFieldStyle        = "videoParams.style"
 	templateFieldCamera       = "videoParams.camera"
 	templateFieldMood         = "videoParams.mood"
-	templateFieldExtraPrompt  = "videoParams.extraPrompt"
 	templateFieldFontName     = "subtitleStyle.fontName"
 	templateFieldFontSize     = "subtitleStyle.fontSizePct"
 	templateFieldPrimaryColor = "subtitleStyle.primaryColor"

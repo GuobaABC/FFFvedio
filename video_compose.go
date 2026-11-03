@@ -851,6 +851,7 @@ func renderSRT(cues []VideoSubtitleCue) string {
 }
 
 // renderASS PlayRes 与视频分辨率一致，字号随分辨率线性缩放（§6.3）。
+// 逐条字幕可覆盖对齐锚点（\an）、垂直留白（Dialogue MarginV）与字号（\fs）。
 func renderASS(cues []VideoSubtitleCue, cfg VideoRunConfig, width, height int) string {
 	style := cfg.SubtitleStyle
 	fontSize := math.Max(10, style.FontSizePct/100*float64(height))
@@ -877,18 +878,24 @@ func renderASS(cues []VideoSubtitleCue, cfg VideoRunConfig, width, height int) s
 	builder.WriteString("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
 	for _, cue := range cues {
 		text := strings.ReplaceAll(cue.Text, "\n", `\N`)
-		builder.WriteString(fmt.Sprintf("Dialogue: 0,%s,%s,Default,,0,0,0,,%s\n", assTime(cue.Start), assTime(cue.End), text))
+		// 逐条位置：没写锚点就沿用全局样式；写了就用 Dialogue 的 MarginV 字段推到底部/顶部对应距离
+		cueMarginV := marginV
+		overrides := ""
+		if cue.Anchor >= 1 && cue.Anchor <= 9 {
+			overrides += fmt.Sprintf(`\an%d`, cue.Anchor)
+		}
+		if cue.MarginVPct > 0 {
+			cueMarginV = math.Max(0, cue.MarginVPct/100*float64(height))
+		}
+		if cue.FontSizePct > 0 {
+			overrides += fmt.Sprintf(`\fs%.0f`, math.Max(10, cue.FontSizePct/100*float64(height)))
+		}
+		if overrides != "" {
+			text = "{" + overrides + "}" + text
+		}
+		builder.WriteString(fmt.Sprintf("Dialogue: 0,%s,%s,Default,,0,0,%.0f,,%s\n", assTime(cue.Start), assTime(cue.End), cueMarginV, text))
 	}
 	return builder.String()
-}
-
-// prepareSubtitleFiles 渲染前产出 SRT 与 ASS（§4.3），时间轴基于预算的分镜时长。
-func prepareSubtitleFiles(workDir, taskID string, cfg VideoRunConfig, plan *VideoPlan) (*VideoSubtitles, error) {
-	if plan == nil {
-		return nil, errors.New("缺少渲染计划，无法生成字幕时间轴")
-	}
-	width, height := aspectResolution(cfg.AspectRatio)
-	return writeSubtitleFiles(workDir, taskID, cfg, buildSubtitleCues(*plan, cfg), "estimate", "", width, height)
 }
 
 // subtitleTimingTable 字幕/时间对应表：cue 与对齐依据留档，供下载、复查与重渲染。
@@ -1052,16 +1059,46 @@ func renderFinalWithAssets(ctx context.Context, ffmpeg, input, output, assPath, 
 }
 
 // composeVideo 合成阶段（§6）：拼接 → 混流 → 烧录字幕 → 成片。
-func composeVideo(ctx context.Context, workDir, taskID string, cfg VideoRunConfig, run *VideoRunContext) (VideoOutput, []string, error) {
-	warnings := make([]string, 0, 3)
-	output := VideoOutput{FinishedAt: time.Now().Format(time.RFC3339)}
+// composePrepUsable 判断缓存的预处理产物是否还能用：画布与每个入片文件都必须存在，
+// 且段集合与当前成功片段一致（重渲过某段就得重新拼）。
+func composePrepUsable(prep *VideoComposePrep, renders []VideoRender) bool {
+	if prep == nil || !prep.HasFFmpeg || prep.CanvasPath == "" || len(prep.ComposedBySegment) == 0 {
+		return false
+	}
+	if !fileExists(prep.CanvasPath) {
+		return false
+	}
+	for _, path := range prep.ComposedBySegment {
+		if !fileExists(path) {
+			return false
+		}
+	}
+	current := make(map[string]bool, len(renders))
+	for _, render := range renders {
+		if render.Status == "succeeded" && fileExists(render.VideoURI) {
+			current[render.SegmentID] = true
+		}
+	}
+	if len(current) != len(prep.ComposedBySegment) {
+		return false
+	}
+	for id := range current {
+		if _, ok := prep.ComposedBySegment[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
 
+// prepareComposeCanvas 合成前的剪辑预处理：选段 → 冻帧裁剪 → 拼接 → 画幅归一。
+// 字幕阶段先调用它拿到真实画布（时间轴与用户预览都要对得上），合成阶段复用同一份结果：
+// 既省掉一次重编码，也保证用户调好的字幕不会被重新切过的片段带偏。
+func prepareComposeCanvas(ctx context.Context, workDir, taskID string, cfg VideoRunConfig, run *VideoRunContext) (*VideoComposePrep, []string, error) {
+	warnings := make([]string, 0, 3)
 	outputDir := filepath.Join(workDir, "output")
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		return output, warnings, fmt.Errorf("创建输出目录失败: %w", err)
+		return nil, warnings, fmt.Errorf("创建输出目录失败: %w", err)
 	}
-
-	// 字幕默认关闭：未开启时不准备字幕文件（时间轴要等片段就位才能实测，放到后面处理）
 
 	selected := make([]composeClip, 0, len(run.Renders))
 	for _, render := range run.Renders {
@@ -1070,27 +1107,31 @@ func composeVideo(ctx context.Context, workDir, taskID string, cfg VideoRunConfi
 		}
 	}
 	if len(selected) == 0 {
-		return output, warnings, errors.New("没有可合成的视频片段")
+		return nil, warnings, errors.New("没有可合成的视频片段")
+	}
+	prep := &VideoComposePrep{
+		ComposedBySegment: make(map[string]string, len(selected)),
+		SegmentIDs:        make([]string, 0, len(selected)),
+		UpdatedAt:         time.Now().Format(time.RFC3339),
 	}
 	clips := make([]string, 0, len(selected))
 	for _, clip := range selected {
 		clips = append(clips, clip.Path)
-	}
-	// 段 ID → 实际入片文件；冻帧裁剪会替换开头冻帧较多的段，字幕测时要用裁剪后的文件
-	composedBySegment := make(map[string]string, len(selected))
-	for _, clip := range selected {
-		composedBySegment[clip.SegmentID] = clip.Path
+		prep.ComposedBySegment[clip.SegmentID] = clip.Path
+		prep.SegmentIDs = append(prep.SegmentIDs, clip.SegmentID)
 	}
 
 	ffmpeg, hasFFmpeg := ffmpegPath()
 	if !hasFFmpeg {
-		output.MergedPath = clips[0]
-		output.Note = "未检测到 ffmpeg：已保留分段视频，跳过拼接与字幕烧录"
-		warnings = append(warnings, output.Note)
-		return output, warnings, nil
+		prep.MergedPath = clips[0]
+		prep.CanvasPath = clips[0]
+		warnings = append(warnings, "未检测到 ffmpeg：已保留分段视频，跳过拼接与字幕烧录")
+		return prep, warnings, nil
 	}
+	prep.HasFFmpeg = true
 
 	merged := clips[0]
+	composedBySegment := prep.ComposedBySegment
 	if len(clips) > 1 {
 		// 尾帧延续下服务商常在下一段开头重放条件尾帧并冻住几帧；逐帧 SSIM 比对、删冻帧后再拼，接缝才不顿
 		if cfg.ContinuationMode == "last_frame" {
@@ -1105,11 +1146,12 @@ func composeVideo(ctx context.Context, workDir, taskID string, cfg VideoRunConfi
 		err := concatVideoClips(concatCtx, clips, merged)
 		cancel()
 		if err != nil {
-			return output, warnings, fmt.Errorf("拼接视频失败: %w", err)
+			return nil, warnings, fmt.Errorf("拼接视频失败: %w", err)
 		}
 		warnings = append(warnings, "多段拼接使用硬切（concat）；尾帧延续已在生成阶段完成")
 	}
-	output.MergedPath = merged
+	prep.MergedPath = merged
+	prep.ComposedBySegment = composedBySegment
 
 	// 画幅兜底：服务商可能按素材自身比例出片（方舟首帧任务尤其如此），
 	// 不在这里归一，用户选 9:16 拿到的就永远是 16:9。
@@ -1137,61 +1179,114 @@ func composeVideo(ctx context.Context, workDir, taskID string, cfg VideoRunConfi
 			warnings = append(warnings, fmt.Sprintf("画幅已符合任务设定：%s（%dx%d）", cfg.AspectRatio, canvasWidth, canvasHeight))
 		}
 	}
+	prep.CanvasPath = canvas
+	prep.CanvasWidth = canvasWidth
+	prep.CanvasHeight = canvasHeight
+	if rel := relativeUnderWorkDir(workDir, canvas); rel != "" {
+		prep.CanvasUrl = videoMediaURL(taskID, rel)
+	}
+	return prep, warnings, nil
+}
+
+// measureSubtitleCues 建字幕时间轴的唯一入口：先用片段实测时长，再尝试声学对齐。
+// 测不出时退回预算时间轴（estimate），保证“有台词就有字幕”。
+func measureSubtitleCues(ctx context.Context, workDir string, cfg VideoRunConfig, run *VideoRunContext, canvas string) ([]VideoSubtitleCue, string, string, []string) {
+	warnings := make([]string, 0, 2)
+	composed := map[string]string{}
+	if run.Compose != nil {
+		composed = run.Compose.ComposedBySegment
+	}
+	spans, spanErr := measuredSubtitleSpans(ctx, run.Plan, run.Renders, composed)
+	if spanErr != nil {
+		if run.Plan == nil {
+			return nil, "", "", append(warnings, "生成字幕时间轴失败: "+spanErr.Error())
+		}
+		return buildSubtitleCuesFromSpans(cfg, plannedSubtitleSpans(*run.Plan)), "estimate", "",
+			append(warnings, "无法按片段实测时长建时间轴，已沿用预算时间轴: "+spanErr.Error())
+	}
+	cues := buildSubtitleCuesFromSpans(cfg, spans)
+	ffmpeg, hasFFmpeg := ffmpegPath()
+	if !hasFFmpeg || canvas == "" {
+		return cues, "measured", "", warnings
+	}
+	// 声学对齐：成片画布提取音频 → 说话区间检测 → 台词只铺在真有声音的地方
+	aligned, ok, message := alignCuesToSpeechActivity(ctx, ffmpeg, workDir, canvas, cfg, spans)
+	if ok {
+		return aligned, "aligned", canvas,
+			append(warnings, fmt.Sprintf("字幕已按音频活动对齐：%s，共 %d 条", message, len(aligned)))
+	}
+	return cues, "measured", "", append(warnings, "字幕声学对齐未生效，按片段测时轴: "+message)
+}
+
+// subtitleCanvasSize 字幕 ASS 的 PlayRes：优先用已经算好的成片画布，退而按任务画幅推算。
+// 时间轴与预览都必须对得上这一块画布，否则用户调好的位置烧出来会偏。
+func subtitleCanvasSize(cfg VideoRunConfig, prep *VideoComposePrep) (int, int) {
+	if prep != nil && prep.CanvasWidth > 0 && prep.CanvasHeight > 0 {
+		return prep.CanvasWidth, prep.CanvasHeight
+	}
+	return aspectResolution(cfg.AspectRatio)
+}
+
+func composeVideo(ctx context.Context, workDir, taskID string, cfg VideoRunConfig, run *VideoRunContext) (VideoOutput, []string, error) {
+	warnings := make([]string, 0, 3)
+	output := VideoOutput{FinishedAt: time.Now().Format(time.RFC3339)}
+
+	// 预处理（选段/裁剪/拼接/画幅）优先复用字幕阶段已经算好的结果，避免二次重编码
+	prep := run.Compose
+	if !composePrepUsable(prep, run.Renders) {
+		built, prepWarnings, err := prepareComposeCanvas(ctx, workDir, taskID, cfg, run)
+		warnings = append(warnings, prepWarnings...)
+		if err != nil {
+			return output, warnings, err
+		}
+		prep = built
+		run.Compose = prep
+	}
+	if !prep.HasFFmpeg {
+		output.MergedPath = prep.MergedPath
+		output.Note = "未检测到 ffmpeg：已保留分段视频，跳过拼接与字幕烧录"
+		return output, warnings, nil
+	}
+	output.MergedPath = prep.MergedPath
+	canvas := prep.CanvasPath
+	ffmpeg, _ := ffmpegPath()
 
 	if cfg.Subtitles {
-		spans, spanErr := measuredSubtitleSpans(ctx, run.Plan, run.Renders, composedBySegment)
-		timingSource := "measured"
-		var cues []VideoSubtitleCue
-		audioSource := ""
-		if spanErr != nil {
-			if run.Plan == nil {
-				warnings = append(warnings, "生成字幕文件失败: "+spanErr.Error())
-			} else {
-				cues = buildSubtitleCuesFromSpans(cfg, plannedSubtitleSpans(*run.Plan))
-				timingSource = "estimate"
-				warnings = append(warnings, "无法按片段实测时长对齐字幕，已沿用预算时间轴: "+spanErr.Error())
-			}
-		} else {
-			cues = buildSubtitleCuesFromSpans(cfg, spans)
-			// 声学对齐：成片画布提取音频 → 说话区间检测 → 台词只铺在真有声音的地方
-			if aligned, ok, message := alignCuesToSpeechActivity(ctx, ffmpeg, workDir, canvas, cfg, spans); ok {
-				cues = aligned
-				timingSource = "aligned"
-				audioSource = canvas
-				warnings = append(warnings, fmt.Sprintf("字幕已按音频活动对齐：%s，共 %d 条", message, len(cues)))
-			} else {
-				warnings = append(warnings, "字幕声学对齐未生效，按片段测时轴: "+message)
-			}
-		}
-		if len(cues) > 0 {
-			subtitleWidth, subtitleHeight := canvasWidth, canvasHeight
-			if subtitleWidth <= 0 || subtitleHeight <= 0 {
-				subtitleWidth, subtitleHeight = aspectResolution(cfg.AspectRatio)
-			}
-			subtitles, err := writeSubtitleFiles(workDir, taskID, cfg, cues, timingSource, audioSource, subtitleWidth, subtitleHeight)
+		subtitleWidth, subtitleHeight := subtitleCanvasSize(cfg, prep)
+		if run.Subtitles != nil && run.Subtitles.Confirmed {
+			// 用户在字幕关卡确认过：时间轴与位置以用户为准（包括删成 0 条），这里只按最终画布重写文件
+			subtitles, err := writeSubtitleFiles(workDir, taskID, cfg, run.Subtitles.Cues,
+				firstNonEmpty(run.Subtitles.TimingSource, "measured"), "", subtitleWidth, subtitleHeight)
 			if err != nil {
 				warnings = append(warnings, "生成字幕文件失败: "+err.Error())
 			} else {
+				subtitles.Confirmed = true
+				subtitles.EditedAt = run.Subtitles.EditedAt
 				run.Subtitles = subtitles
-				if timingSource == "measured" {
-					warnings = append(warnings, fmt.Sprintf(
-						"字幕时间轴已按 %d 个片段的实际时长重排（共 %d 条）",
-						len(spans), len(subtitles.Cues),
-					))
+				warnings = append(warnings, fmt.Sprintf("按已确认的字幕烧录：%d 条（不再自动重排时间轴）", len(subtitles.Cues)))
+			}
+		} else {
+			cues, timingSource, audioSource, measureWarnings := measureSubtitleCues(ctx, workDir, cfg, run, canvas)
+			warnings = append(warnings, measureWarnings...)
+			if len(cues) > 0 {
+				subtitles, err := writeSubtitleFiles(workDir, taskID, cfg, cues, timingSource, audioSource, subtitleWidth, subtitleHeight)
+				if err != nil {
+					warnings = append(warnings, "生成字幕文件失败: "+err.Error())
+				} else {
+					run.Subtitles = subtitles
 				}
 			}
 		}
 	}
 
-	final := filepath.Join(outputDir, "final.mp4")
+	final := filepath.Join(filepath.Join(workDir, "output"), "final.mp4")
 	finalCtx, cancelFinal := context.WithTimeout(ctx, 45*time.Minute)
 	rendered, burned, finalWarnings := finalizeVideo(finalCtx, ffmpeg, canvas, final, run)
 	cancelFinal()
 	warnings = append(warnings, finalWarnings...)
 
 	if !rendered {
-		copyErr := runCommand(ctx, ffmpeg, "-y", "-i", canvas, "-c", "copy", "-movflags", "+faststart", final)
-		if copyErr != nil {
+		if copyErr := runCommand(ctx, ffmpeg, "-y", "-i", canvas, "-c", "copy", "-movflags", "+faststart", final); copyErr != nil {
 			reencodeErr := runCommand(ctx, ffmpeg,
 				"-y", "-i", canvas,
 				"-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p",
@@ -1208,7 +1303,9 @@ func composeVideo(ctx context.Context, workDir, taskID string, cfg VideoRunConfi
 	output.BurnSubtitles = burned
 	output.MediaURL = videoMediaURL(taskID, "output/final.mp4")
 	if !burned {
-		if cfg.Subtitles {
+		if run.Subtitles != nil && run.Subtitles.Confirmed && len(run.Subtitles.Cues) == 0 {
+			output.Note = "已按你的设置移除全部字幕"
+		} else if cfg.Subtitles {
 			output.Note = "成片未烧录字幕（字幕文件已生成）"
 		} else {
 			output.Note = "字幕已关闭：成片不含字幕，需要时可在新建任务时勾选「生成字幕」"

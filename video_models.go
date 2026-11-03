@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -14,14 +15,16 @@ import (
 // 视频生成流水线的阶段（与《视频生成工具·架构与最佳实践设计》§2 一致，
 // 并在合成之后接入 Agent4 发布元数据与 gate③）。
 // 人工确认关卡本身也是一个阶段，处于该阶段时任务状态为 waiting。
-// 字幕排在 gate② 之后：台词要等用户在提示词关卡改完定稿，再铺字幕时间轴。
+// 字幕排在视频生成之后：先拿到真实片段（甚至已拼接的画布），再铺时间轴并让用户逐条调位置；
+// 确认后合成阶段只负责烧录，不再重排时间轴，否则用户的编辑会被覆盖。
 const (
 	VideoStageDraftScript   = "DRAFT_SCRIPT"
 	VideoStageConfirmScript = "CONFIRM_SCRIPT"
 	VideoStageBuildPrompt   = "BUILD_PROMPT"
 	VideoStageConfirmPrompt = "CONFIRM_PROMPT"
-	VideoStageBuildSubs     = "BUILD_SUBS"
 	VideoStageRender        = "RENDER_VIDEO"
+	VideoStageBuildSubs     = "BUILD_SUBS"
+	VideoStageConfirmSubs   = "CONFIRM_SUBS"
 	VideoStageCompose       = "COMPOSE"
 	VideoStageBuildMeta     = "BUILD_PUBLISH_META"
 	VideoStageConfirmMeta   = "CONFIRM_META"
@@ -51,10 +54,11 @@ const (
 	VideoStatusFailed  = "failed"
 )
 
-// 三道确认关卡：分镜 → 提示词 → 发布元数据
+// 确认关卡：分镜 → 提示词 → 字幕 → 发布元数据（字幕关卡只在开了字幕时出现）
 const (
 	VideoGateScript = "gate1"
 	VideoGatePrompt = "gate2"
+	VideoGateSubs   = "gate_subs"
 	VideoGateMeta   = "gate3"
 )
 
@@ -243,14 +247,22 @@ type VideoPlan struct {
 }
 
 // VideoSubtitleCue 时间轴字幕行。
+// 位置与字号支持逐条覆盖：字幕确认关卡里用户可以为某一句单独挪位置、放大字号（ASS numpad 1-9）。
 type VideoSubtitleCue struct {
 	Index int     `json:"index"`
 	Start float64 `json:"start"`
 	End   float64 `json:"end"`
 	Text  string  `json:"text"`
+	// Anchor ≤0 表示沿用全局样式的对齐；其余为 ASS numpad 编码（1 左下 … 9 右上）
+	Anchor int `json:"anchor,omitempty"`
+	// MarginVPct 距对齐边的垂直偏移（画面高度百分比），≤0 表示沿用全局样式
+	MarginVPct float64 `json:"marginVpct,omitempty"`
+	// FontSizePct 字号（画面高度百分比），≤0 表示沿用全局样式
+	FontSizePct float64 `json:"fontSizePct,omitempty"`
 }
 
 // VideoSubtitles 字幕产物（SRT + ASS）。
+// Confirmed 标记用户是否在字幕关卡里确认过：确认后合成阶段只烧录，不再按测时重排。
 type VideoSubtitles struct {
 	SRTPath         string             `json:"srtPath"`
 	ASSPath         string             `json:"assPath"`
@@ -260,6 +272,9 @@ type VideoSubtitles struct {
 	TimingTableURL  string             `json:"timingTableUrl"`
 	TimingSource    string             `json:"timingSource"` // estimate|measured|tts|aligned
 	Cues            []VideoSubtitleCue `json:"cues"`
+	// Confirmed 用户在 CONFIRM_SUBS 里确认过时间轴与位置，合成时以它为准
+	Confirmed bool   `json:"confirmed"`
+	EditedAt  string `json:"editedAt,omitempty"`
 }
 
 // VideoRender 单段渲染记录（可断点续跑）。
@@ -288,6 +303,21 @@ type VideoOutput struct {
 	FinishedAt    string `json:"finishedAt"`
 }
 
+// VideoComposePrep 合成前的剪辑预处理产物：选段 → 冻帧裁剪 → 拼接 → 画幅归一。
+// 字幕阶段（BUILD_SUBS）先把它算出来，字幕时间轴才能按真实成片测量；
+// 合成阶段直接复用，避免二次裁切/二次拼接，也避免用户调好的字幕被重排。
+type VideoComposePrep struct {
+	MergedPath        string            `json:"mergedPath"` // 拼接后（未归一画幅）的素材
+	CanvasPath        string            `json:"canvasPath"` // 归一画幅后的画布，字幕预览与烧录都用它
+	CanvasUrl         string            `json:"canvasUrl"`  // 前端预览地址
+	CanvasWidth       int               `json:"canvasWidth"`
+	CanvasHeight      int               `json:"canvasHeight"`
+	ComposedBySegment map[string]string `json:"composedBySegment"` // 段 ID → 实际入片文件（冻帧裁剪后的）
+	SegmentIDs        []string          `json:"segmentIds"`        // 参与合成的段，用于判断缓存是否过期
+	HasFFmpeg         bool              `json:"hasFFmpeg"`
+	UpdatedAt         string            `json:"updatedAt"`
+}
+
 // VideoRunContext 贯穿全链路的 RunContext（§7）。
 type VideoRunContext struct {
 	Adapter              string            `json:"adapter"`
@@ -296,6 +326,7 @@ type VideoRunContext struct {
 	Plan                 *VideoPlan        `json:"plan"`
 	Subtitles            *VideoSubtitles   `json:"subtitles"`
 	Renders              []VideoRender     `json:"renders"`
+	Compose              *VideoComposePrep `json:"compose"`
 	Output               *VideoOutput      `json:"output"`
 	PublishMeta          *PublishMeta      `json:"publishMeta"`
 	Template             *VideoTemplateRun `json:"template"`      // 任务锁定的模板快照（可复现、可审计）
@@ -367,11 +398,18 @@ type VideoPromptEdit struct {
 	Speaker      string `json:"speaker"` // 留空表示不改台词归属
 }
 
+// VideoSubtitleEdit 字幕关卡的整表提交：时间轴、文本、位置、字号由用户在这一步定稿。
+// 整表覆盖而不是逐条 diff：字幕条数少，用户增删一条也该重排 index，整体提交最不容易出错。
+type VideoSubtitleEdit struct {
+	Cues []VideoSubtitleCue `json:"cues"`
+}
+
 // VideoGateEdits 确认关卡提交的局部修改；按阶段决定生效分支。
 type VideoGateEdits struct {
-	Shots   []VideoShot       `json:"shots"`
-	Prompts []VideoPromptEdit `json:"prompts"`
-	Meta    *VideoPublishEdit `json:"meta"`
+	Shots     []VideoShot        `json:"shots"`
+	Prompts   []VideoPromptEdit  `json:"prompts"`
+	Meta      *VideoPublishEdit  `json:"meta"`
+	Subtitles *VideoSubtitleEdit `json:"subtitles"`
 }
 
 // VideoAdapterInfo 适配器能力声明，供前端展示档位/上限/成本。
@@ -405,6 +443,9 @@ func ensureVideoGates(run *VideoRunContext) {
 	}
 	if _, ok := run.Gates[VideoGatePrompt]; !ok {
 		run.Gates[VideoGatePrompt] = videoGatePending
+	}
+	if _, ok := run.Gates[VideoGateSubs]; !ok {
+		run.Gates[VideoGateSubs] = videoGatePending
 	}
 	if _, ok := run.Gates[VideoGateMeta]; !ok {
 		run.Gates[VideoGateMeta] = videoGatePending
@@ -881,9 +922,53 @@ func plannedSubtitleSpans(plan VideoPlan) []SubtitleSpan {
 	return spans
 }
 
-// buildSubtitleCues 渲染前按预算时间轴生成字幕（估算值，供确认门预览与 SRT 下载）。
+// buildSubtitleCues 按预算时间轴铺字幕（无实测数据时的兜底）。
 func buildSubtitleCues(plan VideoPlan, cfg VideoRunConfig) []VideoSubtitleCue {
 	return buildSubtitleCuesFromSpans(cfg, plannedSubtitleSpans(plan))
+}
+
+// subtitleCueMinS 单条字幕最短停留：更短的话人眼根本来不及读。
+const subtitleCueMinS = 0.4
+
+// normalizeSubtitleCues 字幕关卡提交的整表整理：去空行、夹取到成片范围内、重排序号。
+// 用户改时间就按用户的时间走（不重排到台词上），但越出成片或倒流的条目会被夹取并告警。
+func normalizeSubtitleCues(cues []VideoSubtitleCue, total float64) ([]VideoSubtitleCue, []string) {
+	warnings := make([]string, 0, 2)
+	if len(cues) > 200 {
+		cues = cues[:200]
+		warnings = append(warnings, "字幕最多 200 条，超出的部分已丢弃")
+	}
+	out := make([]VideoSubtitleCue, 0, len(cues))
+	for _, cue := range cues {
+		cue.Text = strings.TrimSpace(strings.ReplaceAll(cue.Text, "\r\n", "\n"))
+		if cue.Text == "" {
+			continue
+		}
+		start := round2(math.Max(0, cue.Start))
+		end := round2(cue.End)
+		if end-start < subtitleCueMinS {
+			end = round2(start + subtitleCueMinS)
+		}
+		if total > 0 && start > total-subtitleCueMinS {
+			start = round2(math.Max(0, total-subtitleCueMinS))
+			end = round2(total)
+			warnings = append(warnings, fmt.Sprintf("有字幕的起始时间超出成片长度（%.1fs），已贴到片尾", total))
+		}
+		if total > 0 && end > total {
+			end = round2(total)
+		}
+		if cue.Anchor < 1 || cue.Anchor > 9 {
+			cue.Anchor = 0
+		}
+		cue.MarginVPct = clampFloat(round2(cue.MarginVPct), 0, 90)
+		cue.FontSizePct = clampFloat(round2(cue.FontSizePct), 0, 30)
+		out = append(out, VideoSubtitleCue{Start: start, End: end, Text: cue.Text, Anchor: cue.Anchor, MarginVPct: cue.MarginVPct, FontSizePct: cue.FontSizePct})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Start < out[j].Start })
+	for index := range out {
+		out[index].Index = index + 1
+	}
+	return out, warnings
 }
 
 // buildSubtitleCuesFromSpans 把台词铺进每一段的真实时间窗：

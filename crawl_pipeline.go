@@ -291,6 +291,14 @@ func (r *crawlRunner) processURL(ctx context.Context, fetcher *crawlFetcher, pro
 	// 2. 缓存：30 天内抓过就直返（§12 第 8 条），短链展开后的 ID 一致
 	if !force {
 		if item, ok := r.app.cachedCrawlItem(result.ItemID, defaultCrawlCacheHours*time.Hour); ok {
+			// 命中缓存也要把本任务新补的选题标签带上，不然素材库里的条目永远缺这一块
+			if !crawlTagsCarried(r.task.Config.Tags, item.Optional.Tags) {
+				item.Optional.Tags = mergeCrawlTaskTags(r.task.Config.Tags, item.Optional.Tags)
+				item.UpdatedAt = time.Now().Format(time.RFC3339)
+				if err := r.app.saveCrawlItem(item); err != nil {
+					r.warn("选题标签写回条目失败: %s", err.Error())
+				}
+			}
 			result.State = CrawlStateCached
 			result.Tier = item.Meta.ExtractTier
 			result.Confidence = item.Meta.Confidence
@@ -422,7 +430,7 @@ func (r *crawlRunner) processURL(ctx context.Context, fetcher *crawlFetcher, pro
 			Author:      candidate.Author,
 			PublishedAt: candidate.PublishedAt,
 			DurationSec: candidate.DurationS,
-			Tags:        candidate.Tags,
+			Tags:        mergeCrawlTaskTags(r.task.Config.Tags, candidate.Tags),
 		},
 		Meta: VideoItemMeta{
 			ExtractedAt: now,

@@ -20,7 +20,7 @@ func (a *App) RunVideoTask(id string) error {
 		return errors.New("任务正在执行，请稍候")
 	}
 	switch task.Stage {
-	case VideoStageConfirmScript, VideoStageConfirmPrompt, VideoStageConfirmMeta:
+	case VideoStageConfirmScript, VideoStageConfirmPrompt, VideoStageConfirmSubs, VideoStageConfirmMeta:
 		return errors.New("当前处于人工确认关卡，请先确认或重新生成")
 	case VideoStageDone:
 		return errors.New("任务已完成；如需重做请使用「重新生成」")
@@ -67,8 +67,24 @@ func (a *App) ApproveVideoGate(id string) error {
 	case VideoStageConfirmScript:
 		next = VideoStageBuildPrompt
 	case VideoStageConfirmPrompt:
-		// 提示词确认后再落字幕：台词定稿才铺时间轴，改台词不用返工字幕
-		next = VideoStageBuildSubs
+		// 提示词确认后就烧额度出片：字幕排在视频之后，拿真实片段铺轴才对得上画面
+		next = VideoStageRender
+	case VideoStageConfirmSubs:
+		// 字幕确认后合成只负责烧录：把用户调好的时间轴钉成最终版，不再回测重排
+		ensureVideoGates(&task.Run)
+		if task.Run.Subtitles != nil {
+			task.Run.Subtitles.Confirmed = true
+			if task.Run.Subtitles.EditedAt == "" {
+				task.Run.Subtitles.EditedAt = time.Now().Format(time.RFC3339)
+			}
+		}
+		task.Run.Gates[VideoGateSubs] = videoGateApproved
+		task.Run.Logs = append(task.Run.Logs, stageLog("字幕已确认，合成阶段按这份时间轴烧录"))
+		task.UpdatedAt = time.Now().Format(time.RFC3339)
+		if err := a.updateVideoTaskRecord(task); err != nil {
+			return err
+		}
+		next = VideoStageCompose
 	default:
 		return errors.New("当前阶段没有待确认的关卡")
 	}
@@ -99,6 +115,8 @@ func (a *App) RegenerateVideoStage(id, feedback string) error {
 		from = VideoStageDraftScript
 	case VideoStageConfirmPrompt:
 		from = VideoStageBuildPrompt
+	case VideoStageConfirmSubs:
+		from = VideoStageBuildSubs
 	case VideoStageRender, VideoStageCompose, VideoStageDone:
 		from = VideoStageRender
 	case VideoStageConfirmMeta:
@@ -245,6 +263,7 @@ func (a *App) RegenerateVideoSegment(id string, edit VideoSegmentRegen) error {
 	}
 	task.Run.Renders = kept
 	task.Run.Output = nil
+	task.Run.Compose = nil
 	task.Run.ReviewPendingSegment = ""
 	task.Status = VideoStatusRunning
 	task.Error = ""
@@ -299,7 +318,14 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 				task.Run.Warnings = append(task.Run.Warnings, warning)
 			}
 		} else {
-			task.Run.Script.Shots = normalizeScriptShots(edits.Shots, float64(task.Config.DurationS))
+			shots := normalizeScriptShots(edits.Shots, float64(task.Config.DurationS))
+			task.Run.Script.Shots = shots
+			// 段时长以你填的为准，总时长跟着分段之和走：
+			// 早先按目标时长等比缩放，关卡里改段长会被缩回去，看起来就是「改了没生效」
+			if total := manualTotalSeconds(shots); total > 0 {
+				task.Config.DurationS = int(math.Round(total))
+				task.Run.Logs = append(task.Run.Logs, stageLog(fmt.Sprintf("分镜时长已按你的修改保留，总时长调为 %ds", task.Config.DurationS)))
+			}
 		}
 		// 剧本改动 → Agent2 全部 + 渲染 + 合成失效
 		task.Run.Prompts = nil
@@ -307,6 +333,7 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		task.Run.Subtitles = nil
 		task.Run.Renders = nil
 		task.Run.Output = nil
+		task.Run.Compose = nil
 		// 分镜改动 → Agent4 的标签/标题来源也变了
 		task.Run.PublishMeta = nil
 		task.Run.Gates[VideoGateScript] = videoGatePending
@@ -330,10 +357,11 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		plan := buildVideoPlan(task.Config, task.Run.Prompts, caps, task.Run.Adapter)
 		task.Run.Plan = &plan
 
-		// 字幕在 gate② 之后才生成：这里只作废旧字幕，确认后由 BUILD_SUBS 按新台词重铺
+		// 字幕在视频生成之后才铺轴：这里只作废旧字幕
 		task.Run.Subtitles = nil
+		task.Run.Compose = nil
 
-		// 提示词/台词改动 → 渲染 + 合成失效，字幕等确认后按新时间轴重生
+		// 提示词/台词改动 → 渲染 + 合成失效，字幕等视频出来后重生
 		task.Run.Renders = nil
 		task.Run.Output = nil
 		task.Run.PublishMeta = nil
@@ -342,7 +370,7 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		task.Status = VideoStatusWaiting
 		task.Error = ""
 		if task.Config.Subtitles {
-			task.Run.Logs = append(task.Run.Logs, stageLog("提示词已修改，渲染计划已重算（字幕将在确认后重新生成）"))
+			task.Run.Logs = append(task.Run.Logs, stageLog("提示词已修改，渲染计划已重算（字幕将在视频生成后重铺）"))
 		} else {
 			task.Run.Logs = append(task.Run.Logs, stageLog("提示词已修改，渲染计划已重算（字幕未开启）"))
 		}
@@ -360,6 +388,20 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		task.Error = ""
 		task.Run.Logs = append(task.Run.Logs, stageLog("发布元数据已修改，等待确认"))
 
+	case VideoStageConfirmSubs:
+		if edits.Subtitles == nil {
+			return task, errors.New("没有提交字幕修改")
+		}
+		if task.Run.Subtitles == nil {
+			return task, errors.New("任务还没有字幕，请先生成视频")
+		}
+		if err := a.applySubtitleEdits(&task, edits.Subtitles.Cues); err != nil {
+			return task, err
+		}
+		task.Run.Gates[VideoGateSubs] = videoGatePending
+		task.Status = VideoStatusWaiting
+		task.Error = ""
+
 	default:
 		return task, errors.New("仅可在人工确认关卡修改产物")
 	}
@@ -369,6 +411,63 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		return task, err
 	}
 	return task, nil
+}
+
+// SaveVideoSubtitles 字幕关卡里保存用户的逐条修改：时间、文本、位置、字号，支持新增与删除。
+// 前端只需传完整的 cue 列表（增删都在列表里体现），后端不靠 index 对齐旧数据。
+func (a *App) SaveVideoSubtitles(id string, edit VideoSubtitleEdit) (VideoTask, error) {
+	return a.SaveVideoStageEdits(id, VideoGateEdits{Subtitles: &edit})
+}
+
+// applySubtitleEdits 校验并重写用户的字幕：按当前成片画布落 SRT/ASS，并标记为已确认。
+// 确认后的时间轴归用户：合成阶段不再回测重排，否则调好的位置与时间会被默默覆盖。
+func (a *App) applySubtitleEdits(task *VideoTask, cues []VideoSubtitleCue) error {
+	workDir, err := a.ensureTaskWorkDir(task.ID)
+	if err != nil {
+		return err
+	}
+	prep := task.Run.Compose
+	// 上限拿成片真实时长：字幕不能铺到画布之外，测不到时退回任务目标时长
+	total := 0.0
+	if prep != nil && prep.CanvasPath != "" && fileExists(prep.CanvasPath) {
+		probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if info, probeErr := mediaProbe(probeCtx, prep.CanvasPath); probeErr == nil {
+			total = info.Duration
+		}
+		cancel()
+	}
+	if total <= 0 {
+		total = float64(task.Config.DurationS)
+	}
+
+	normalized, notes := normalizeSubtitleCues(cues, total)
+	for _, note := range notes {
+		duplicate := false
+		for _, existing := range task.Run.Warnings {
+			if existing == note {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			task.Run.Warnings = append(task.Run.Warnings, note)
+		}
+	}
+
+	width, height := subtitleCanvasSize(task.Config, prep)
+	subtitles, err := writeSubtitleFiles(workDir, task.ID, task.Config, normalized,
+		firstNonEmpty(task.Run.Subtitles.TimingSource, "measured"), "", width, height)
+	if err != nil {
+		return fmt.Errorf("写入字幕文件失败: %w", err)
+	}
+	subtitles.Confirmed = true
+	subtitles.EditedAt = time.Now().Format(time.RFC3339)
+	task.Run.Subtitles = subtitles
+	task.Run.Logs = append(task.Run.Logs, stageLog(fmt.Sprintf("字幕已保存：%d 条（时间/位置/字号以你的设置为准，合成不再重排）", len(normalized))))
+	if len(normalized) == 0 {
+		task.Run.Logs = append(task.Run.Logs, stageLog("字幕已全部删除：成片将不含字幕，需要时可重新添加"))
+	}
+	return nil
 }
 
 // applyPublishEdits 只改文案与选定时段，平台字数与数量上限仍按档位夹取。
@@ -413,9 +512,12 @@ func applyPublishEdits(meta *PublishMeta, edit VideoPublishEdit, cfg VideoRunCon
 	}
 }
 
-// normalizeScriptShots 用户改动分镜后，重算时长与时间轴，保证口径一致。
+// normalizeScriptShots 用户改动分镜后，重算时间轴，保证口径一致。
+// 段时长以用户填的为准（不再按目标总时长等比缩回）：总时长由段之和反写，
+// 真要让模型档位取整时由 buildVideoPlan 告警，不在这里默默改掉用户的数字。
 func normalizeScriptShots(shots []VideoShot, total float64) []VideoShot {
 	normalized := make([]VideoShot, 0, len(shots))
+	knownSum, knownCount := 0.0, 0
 	for index, shot := range shots {
 		shot.SceneIntent = strings.TrimSpace(shot.SceneIntent)
 		shot.Dialogue = strings.TrimSpace(shot.Dialogue)
@@ -426,8 +528,10 @@ func normalizeScriptShots(shots []VideoShot, total float64) []VideoShot {
 		if shot.Roles == nil {
 			shot.Roles = []string{}
 		}
-		if shot.DurationS <= 0 {
-			shot.DurationS = total / float64(len(shots))
+		shot.DurationS = round2(math.Max(0, shot.DurationS))
+		if shot.DurationS > 0 {
+			knownSum += shot.DurationS
+			knownCount++
 		}
 		normalized = append(normalized, shot)
 	}
@@ -435,17 +539,20 @@ func normalizeScriptShots(shots []VideoShot, total float64) []VideoShot {
 		return normalized
 	}
 
-	sum := 0.0
-	for _, shot := range normalized {
-		sum += shot.DurationS
+	// 没填时长的段：按已知段的均值补，全都没填才按目标总时长均分
+	fallback := total / float64(len(normalized))
+	if knownCount > 0 {
+		fallback = knownSum / float64(knownCount)
 	}
-	scale := 1.0
-	if sum > 0 && total > 0 {
-		scale = total / sum
+	if fallback < 0.5 {
+		fallback = 0.5
 	}
 	cursor := 0.0
 	for i := range normalized {
-		duration := round2(mathMax(0.5, normalized[i].DurationS*scale))
+		duration := round2(math.Max(0.5, normalized[i].DurationS))
+		if normalized[i].DurationS <= 0 {
+			duration = round2(fallback)
+		}
 		normalized[i].DurationS = duration
 		normalized[i].TimeRange = [2]float64{round2(cursor), round2(cursor + duration)}
 		cursor += duration
@@ -600,14 +707,23 @@ func (a *App) runVideoPipeline(id, from, feedback string) {
 			return
 
 		case VideoStageBuildSubs:
-			// gate② 之后才落字幕：台词已经定稿，改台词不会再让早生成的字幕作废
+			// 字幕排在视频之后：先拿真实片段拼好的画布铺轴，再让用户逐条调
 			if err := runner.runSubtitleStage(); err != nil {
 				runner.fail(err)
 				return
 			}
-			runner.task.Stage = VideoStageRender
-			runner.task.Status = VideoStatusRunning
+			if runner.task.Run.Subtitles == nil {
+				// 字幕未开启或本片没有台词：没东西可确认，直接合成
+				runner.task.Stage = VideoStageCompose
+				runner.task.Status = VideoStatusRunning
+				_ = runner.save()
+				continue
+			}
+			runner.task.Stage = VideoStageConfirmSubs
+			runner.task.Run.Gates[VideoGateSubs] = videoGatePending
+			runner.task.Status = VideoStatusWaiting
 			_ = runner.save()
+			return
 
 		case VideoStageRender:
 			// Agent4 只依赖已确认的提示词与剧本，可与渲染并行准备（§10.1）
@@ -627,7 +743,7 @@ func (a *App) runVideoPipeline(id, from, feedback string) {
 				_ = runner.save()
 				return
 			}
-			runner.task.Stage = VideoStageCompose
+			runner.task.Stage = VideoStageBuildSubs
 			runner.task.Status = VideoStatusRunning
 			_ = runner.save()
 
@@ -703,6 +819,7 @@ func (r *videoRunner) runScriptStage() error {
 	r.task.Run.Subtitles = nil
 	r.task.Run.Renders = nil
 	r.task.Run.Output = nil
+	r.task.Run.Compose = nil
 	r.task.Run.PublishMeta = nil
 	r.task.Run.Gates[VideoGateScript] = videoGatePending
 	r.task.Run.Gates[VideoGatePrompt] = videoGatePending
@@ -715,7 +832,7 @@ func (r *videoRunner) runScriptStage() error {
 	return nil
 }
 
-// runPromptStage Agent2：提示词 + 成本计划。字幕不在这里做，等 gate② 确认后再落。
+// runPromptStage Agent2：提示词 + 成本计划。字幕排在视频生成之后，这里不落。
 func (r *videoRunner) runPromptStage() error {
 	if r.task.Run.Script == nil || len(r.task.Run.Script.Shots) == 0 {
 		return errors.New("缺少分镜脚本，无法展开提示词")
@@ -752,10 +869,10 @@ func (r *videoRunner) runPromptStage() error {
 	}
 	r.task.Run.Plan = &plan
 
-	// 字幕不在这一阶段做：台词要等 gate② 定稿，字幕由 BUILD_SUBS 阶段铺轴
+	// 字幕不在这一阶段做：台词等 gate② 定稿，视频出来后才由 BUILD_SUBS 铺轴
 	r.task.Run.Subtitles = nil
 	if r.task.Config.Subtitles {
-		r.logf("字幕将在确认提示词后生成（此时台词还可能被改）")
+		r.logf("字幕将在视频生成后铺轴（真实片段的时长与声音为准，可在字幕关卡逐条调）")
 	} else {
 		// 字幕默认关闭：不产出 SRT/ASS，成片也不烧录
 		r.logf("字幕未开启，本次不生成字幕文件")
@@ -764,6 +881,7 @@ func (r *videoRunner) runPromptStage() error {
 	// 重算后旧渲染结果作废
 	r.task.Run.Renders = nil
 	r.task.Run.Output = nil
+	r.task.Run.Compose = nil
 	r.task.Run.PublishMeta = nil
 	r.task.Run.Gates[VideoGatePrompt] = videoGatePending
 	r.task.Run.Gates[VideoGateMeta] = videoGatePending
@@ -771,9 +889,9 @@ func (r *videoRunner) runPromptStage() error {
 	return nil
 }
 
-// runSubtitleStage 字幕阶段：排在 gate②（确认提示词）之后、渲染之前。
-// 此时台词与归属已经定稿，字幕不会因为用户改台词而白生成一遍。
-// 这里产出的是预算时间轴；合成阶段会按各片段实测时长再重排一次。
+// runSubtitleStage 字幕阶段：排在视频生成之后。
+// 先把合成前的剪辑预处理做完（选段/裁剪/拼接/画幅）拿到真实画布，再按片段实测时长 + 声学对齐铺轴；
+// 预处理结果缓在 run.Compose，合成阶段直接复用，既省一次重编码也让用户调好的字幕不会被重新切过的片段带偏。
 func (r *videoRunner) runSubtitleStage() error {
 	cfg := r.task.Config
 	if !cfg.Subtitles {
@@ -799,13 +917,47 @@ func (r *videoRunner) runSubtitleStage() error {
 	if err != nil {
 		return err
 	}
-	subtitles, err := prepareSubtitleFiles(workDir, r.task.ID, cfg, plan)
+
+	// 成片画布：已有预处理结果可用就直接复用（重渲过某段则重算）
+	prep := r.task.Run.Compose
+	if !composePrepUsable(prep, r.task.Run.Renders) {
+		built, prepWarnings, prepErr := prepareComposeCanvas(r.ctx, workDir, r.task.ID, cfg, &r.task.Run)
+		for _, warning := range prepWarnings {
+			r.warn("%s", warning)
+		}
+		if prepErr != nil {
+			// 预处理失败不阻断字幕：还能按片段实测铺轴，只是没有画布预览与声学对齐
+			r.warn("合成预处理失败，字幕改按片段时长铺轴: %v", prepErr)
+			prep = nil
+			r.task.Run.Compose = nil
+		} else {
+			prep = built
+			r.task.Run.Compose = prep
+		}
+	}
+
+	canvas := ""
+	if prep != nil {
+		canvas = prep.CanvasPath
+	}
+	cues, timingSource, audioSource, measureWarnings := measureSubtitleCues(r.ctx, workDir, cfg, &r.task.Run, canvas)
+	for _, warning := range measureWarnings {
+		r.warn("%s", warning)
+	}
+	if len(cues) == 0 {
+		r.task.Run.Subtitles = nil
+		r.logf("本片没有需要字幕的台词，跳过字幕确认")
+		return nil
+	}
+
+	width, height := subtitleCanvasSize(cfg, prep)
+	subtitles, err := writeSubtitleFiles(workDir, r.task.ID, cfg, cues, timingSource, audioSource, width, height)
 	if err != nil {
 		return fmt.Errorf("生成字幕文件失败: %w", err)
 	}
 	r.task.Run.Subtitles = subtitles
-	r.logf("字幕已生成：%d 条，时间轴来源 %s（提示词已确认，按 %d 段渲染计划铺轴）",
-		len(subtitles.Cues), subtitles.TimingSource, len(plan.Segments))
+	r.logf("字幕已生成：%d 条，时间轴来源 %s（基于成片画布 %dx%d，可在字幕关卡里逐条改时间/位置/字号）",
+		len(subtitles.Cues), subtitles.TimingSource, width, height)
 	return nil
 }
 
@@ -875,6 +1027,9 @@ func (r *videoRunner) runRenderStage() (bool, error) {
 	taskReview := cfg.segmentReviewEnabled()
 	r.task.Run.Renders = nil
 	r.task.Run.Output = nil
+	// 画面要重出了：旧画布与旧字幕时间轴都不再可信，渲完后 BUILD_SUBS 会重铺
+	r.task.Run.Compose = nil
+	r.task.Run.Subtitles = nil
 
 	genCtx := videoGenContext{Provider: provider, Model: provider.Model, AdapterID: adapterID, WorkDir: workDir}
 	renders := make([]VideoRender, 0, len(segments))

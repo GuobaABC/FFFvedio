@@ -7,8 +7,9 @@ export type VideoStage =
   | 'CONFIRM_SCRIPT'
   | 'BUILD_PROMPT'
   | 'CONFIRM_PROMPT'
-  | 'BUILD_SUBS'
   | 'RENDER_VIDEO'
+  | 'BUILD_SUBS'
+  | 'CONFIRM_SUBS'
   | 'COMPOSE'
   | 'BUILD_PUBLISH_META'
   | 'CONFIRM_META'
@@ -155,6 +156,12 @@ export interface VideoSubtitleCue {
   start: number
   end: number
   text: string
+  /** 逐条对齐锚点（ASS numpad 1-9）；0 = 沿用全局样式 */
+  anchor?: number
+  /** 逐条垂直留白（占画面高度百分比）；0 = 沿用全局样式 */
+  marginVpct?: number
+  /** 逐条字号（占画面高度百分比）；0 = 沿用全局样式 */
+  fontSizePct?: number
 }
 
 export interface VideoSubtitles {
@@ -168,6 +175,23 @@ export interface VideoSubtitles {
   /** estimate | measured | tts | aligned（按音频活动对齐） */
   timingSource: string
   cues: VideoSubtitleCue[]
+  /** 用户在字幕关卡确认过：合成阶段只烧录，不再重排时间轴 */
+  confirmed: boolean
+  editedAt?: string
+}
+
+/** 合成前的剪辑预处理产物（选段/拼接/画幅归一），字幕与合成共用同一块画布 */
+export interface VideoComposePrep {
+  mergedPath: string
+  canvasPath: string
+  /** 成片画布的 /media 预览地址（字幕关卡里对着它调位置） */
+  canvasUrl: string
+  canvasWidth: number
+  canvasHeight: number
+  composedBySegment: Record<string, string> | null
+  segmentIds: string[] | null
+  hasFFmpeg: boolean
+  updatedAt: string
 }
 
 export interface VideoRender {
@@ -201,6 +225,8 @@ export interface VideoRunContext {
   plan: VideoPlan | null
   subtitles: VideoSubtitles | null
   renders: VideoRender[] | null
+  /** 合成前预处理缓存（字幕阶段算一次，合成阶段复用） */
+  compose: VideoComposePrep | null
   output: VideoOutput | null
   publishMeta: PublishMeta | null
   /** 任务锁定的模板快照（含生效字段来源） */
@@ -245,10 +271,16 @@ export interface VideoPromptEdit {
   speaker?: string
 }
 
+/** 字幕关卡的修改：提交完整的 cue 列表，增删都体现在列表里 */
+export interface VideoSubtitleEdit {
+  cues: VideoSubtitleCue[]
+}
+
 export interface VideoGateEdits {
   shots: VideoShot[]
   prompts: VideoPromptEdit[]
   meta?: VideoPublishEdit | null
+  subtitles?: VideoSubtitleEdit | null
 }
 
 /** 单段重生成入参：改该段提示词/台词后只重渲这一段及其后 */
@@ -389,8 +421,9 @@ export const VIDEO_STAGES: { id: VideoStage; label: string; hint: string }[] = [
   { id: 'CONFIRM_SCRIPT', label: '确认分镜', hint: '人工确认关卡 ①' },
   { id: 'BUILD_PROMPT', label: '提示词', hint: 'Agent2 展开画面提示词' },
   { id: 'CONFIRM_PROMPT', label: '确认提示词', hint: '人工确认关卡 ②（成本拍板）' },
-  { id: 'BUILD_SUBS', label: '字幕生成', hint: '台词定稿后铺字幕时间轴' },
   { id: 'RENDER_VIDEO', label: '生成视频', hint: 'Agent3 适配器逐段生成' },
+  { id: 'BUILD_SUBS', label: '字幕生成', hint: '按真实片段铺字幕时间轴' },
+  { id: 'CONFIRM_SUBS', label: '确认字幕', hint: '人工确认关卡：逐条改时间/位置/字号' },
   { id: 'COMPOSE', label: '合成成片', hint: 'ffmpeg 拼接 + 烧录字幕' },
   { id: 'BUILD_PUBLISH_META', label: '发布元数据', hint: 'Agent4 标题 / 标签 / 发布时段' },
   { id: 'CONFIRM_META', label: '确认发布', hint: '人工确认关卡 ③' },
@@ -402,8 +435,9 @@ export const STAGE_LABELS: Record<string, string> = {
   CONFIRM_SCRIPT: '确认分镜',
   BUILD_PROMPT: '提示词',
   CONFIRM_PROMPT: '确认提示词',
-  BUILD_SUBS: '字幕生成',
   RENDER_VIDEO: '生成视频',
+  BUILD_SUBS: '字幕生成',
+  CONFIRM_SUBS: '确认字幕',
   COMPOSE: '合成成片',
   BUILD_PUBLISH_META: '发布元数据',
   CONFIRM_META: '确认发布',

@@ -604,6 +604,17 @@ function useCrawlThumbnail() {
   }
 }
 
+/** 把爬取时存的选题标签并入创作要求：extraPrompt 会作为“必须落实的额外要求”进 Agent1/Agent2 */
+function applyDraftTags() {
+  const tags = sourceDraft.value?.tags ?? []
+  if (tags.length === 0) {
+    return
+  }
+  const line = `选题标签：${tags.join('、')}`
+  const current = form.videoParams.extraPrompt.trim()
+  form.videoParams.extraPrompt = current ? `${current}；${line}` : line
+}
+
 function dismissCrawlDraft() {
   sourceDraft.value = null
 }
@@ -764,10 +775,20 @@ async function submit() {
       <div class="source__body">
         <span class="ui-chip ui-chip--ok">已带入爬取素材</span>
         <span class="source__topic">{{ sourceDraft.note }}</span>
+        <span v-for="tag in sourceDraft.tags ?? []" :key="tag" class="ui-chip">#{{ tag }}</span>
       </div>
       <div class="source__actions">
         <button v-if="sourceDraft.thumbnail" class="ui-btn" type="button" @click="useCrawlThumbnail">
           用封面作首帧
+        </button>
+        <button
+          v-if="sourceDraft.tags?.length"
+          class="ui-btn"
+          type="button"
+          title="写进「额外创作要求」，分镜与提示词会落实这几个标签"
+          @click="applyDraftTags"
+        >
+          标签并入创作要求
         </button>
         <button class="ui-btn ui-btn--ghost" type="button" @click="dismissCrawlDraft">仅保留主题</button>
       </div>
