@@ -40,7 +40,7 @@ const saveError = ref('')
 
 const selected = computed(() => templates.value.find((item) => item.id === selectedId.value) ?? null)
 
-/** 标签云：内置模板与个人模板共用一套检索维度（§6 模板库可检索） */
+/** 标签云：团队模板与个人模板共用一套检索维度（§6 模板库可检索） */
 const tagOptions = computed(() => {
   const counts = new Map<string, number>()
   for (const template of templates.value) {
@@ -228,7 +228,7 @@ async function removeSelected() {
       </div>
       <div class="library__stats">
         <span class="ui-chip">共 {{ templates.length }} 个</span>
-        <span class="ui-chip ui-chip--ok">内置 {{ builtinCount }}</span>
+        <span v-if="builtinCount > 0" class="ui-chip ui-chip--ok">内置 {{ builtinCount }}</span>
         <span class="ui-chip ui-chip--warn">自定义 {{ customCount }}</span>
         <button class="ui-btn ui-btn--primary" type="button" @click="startCreate">+ 新建模板</button>
         <button class="ui-btn" type="button" :disabled="loading" @click="load()">
@@ -246,7 +246,6 @@ async function removeSelected() {
           <input v-model="keyword" class="ui-input" type="text" placeholder="搜索名称 / 描述 / 标签" />
           <select v-model="scopeFilter" class="ui-select">
             <option value="all">全部作用域</option>
-            <option value="builtin">内置</option>
             <option value="team">团队</option>
             <option value="personal">个人</option>
           </select>

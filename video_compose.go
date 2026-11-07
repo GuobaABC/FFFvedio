@@ -72,15 +72,16 @@ func extractLastFrame(ctx context.Context, clipPath, framePath string) error {
 	)
 }
 
-/* ---------------- 接缝冻帧裁剪：逐帧 SSIM 比较下一段开头帧与上一段尾帧 ---------------- */
+/* ---------------- 冻帧检测与裁剪：段头重放帧 + 段尾档位填充帧 ---------------- */
 
 // ssimFreezeThreshold：开头帧与上一段尾帧的 SSIM 高于此值＝视觉几乎相同（模型还在重放条件尾帧），
 // 标记为应删帧；一旦降到阈值以下说明真实运动恢复，从该帧起保留。
 const ssimFreezeThreshold = 0.995
 
-// freezeScanMaxFrames：每个接缝最多比对这么多帧。冻帧通常远小于 1 秒，
-// 超出窗口仍“冻”的按创作内容处理，不再多删，避免误删整段静画面。
-const freezeScanMaxFrames = 30
+// freezeScanMaxFrames：每个接缝/每段尾部最多比对这么多帧。冻帧通常在 2 秒上下，
+// 30 帧（约 1.25s）的旧窗口会把超窗的重放与档位填充当成创作内容原样进成片，
+// 放宽到 60 帧（约 2.5s）；超出窗口仍“冻”的按创作内容（如定格收尾）处理，不再多删。
+const freezeScanMaxFrames = 60
 
 // 不同 ffmpeg 版本回显大小写不一（all:/All:），统一不敏感匹配
 var ssimAllPattern = regexp.MustCompile(`(?i)all:([0-9]+(?:\.[0-9]+)?)`)
@@ -242,7 +243,170 @@ func trimFrozenClipHeads(ctx context.Context, ffmpeg, workDir, outputDir string,
 	return paths, composed, warnings
 }
 
-// concatVideoClips 多段拼接：优先流拷贝，失败再统一重编码（避免分辨率/编码不一致）。
+/* ---------------- 段尾冻帧裁剪：档位夹取多出的空窗常被模型用静止帧收尾填充 ---------------- */
+
+// minTailFreezeFrames：段尾连续静止至少这么多帧才动手裁——裁一次就多一次重编码，
+// 肉眼几乎不可见的一两帧不值得。
+const minTailFreezeFrames = 6
+
+// countFrozenTailFrames 从片段尾部窗口倒数：逐帧与末帧比 SSIM，返回与末帧「视觉相同」
+// 的连续帧数（不含末帧本身——末帧留着当画面收尾）。fps 是按素材实测帧率归一后的值，
+// 调用方拿它换算保留时长。无法判定（抽帧失败/没有可比帧）以错误返回，由调用方跳过。
+func countFrozenTailFrames(ctx context.Context, ffmpeg, clipPath, scanDir string, defaultFps int) (int, mediaInfo, float64, error) {
+	info, err := mediaProbe(ctx, clipPath)
+	if err != nil {
+		return 0, info, 0, err
+	}
+	fps := info.FPS
+	if fps <= 0 {
+		if defaultFps > 0 {
+			fps = float64(defaultFps)
+		} else {
+			fps = 24
+		}
+	}
+	if err := os.RemoveAll(scanDir); err != nil {
+		return 0, info, fps, err
+	}
+	if err := os.MkdirAll(scanDir, 0o755); err != nil {
+		return 0, info, fps, err
+	}
+	// 只取尾部窗口抽帧：-sseof 从片尾倒数，窗口按实测帧率折算，短素材夹到整段
+	window := float64(freezeScanMaxFrames)/fps + 1
+	if info.Duration > 0 && window > info.Duration {
+		window = info.Duration
+	}
+	if err := runCommand(ctx, ffmpeg,
+		"-y", "-sseof", fmt.Sprintf("%.3f", -window), "-i", clipPath,
+		"-vsync", "0", "-q:v", "2", filepath.Join(scanDir, "f%03d.png"),
+	); err != nil {
+		return 0, info, fps, fmt.Errorf("抽取尾部帧失败: %w", err)
+	}
+	frames, err := filepath.Glob(filepath.Join(scanDir, "f*.png"))
+	if err != nil || len(frames) < 2 {
+		return 0, info, fps, errors.New("没有可比的尾部帧")
+	}
+	tailFrame := frames[len(frames)-1]
+	discard := 0
+	for index := len(frames) - 2; index >= 0 && discard < freezeScanMaxFrames; index-- {
+		value, err := frameSSIM(ctx, ffmpeg, frames[index], tailFrame)
+		if err != nil {
+			return 0, info, fps, err
+		}
+		if value <= ssimFreezeThreshold {
+			break // 静止起点找到了：这一帧往后是真实运动
+		}
+		discard++
+	}
+	return discard, info, fps, nil
+}
+
+// trimTailFrames 去掉片段末尾 count 帧：-t 截到保留时长并重编码，音视频同步截断，
+// 字幕测时按裁剪后文件实测时长走，不会和画面对不上。
+func trimTailFrames(ctx context.Context, ffmpeg, input, output string, count int, fps, duration float64) error {
+	if fps <= 0 {
+		fps = 24
+	}
+	keep := duration - float64(count)/fps
+	if keep <= 0 {
+		return errors.New("裁剪后没有剩余画面")
+	}
+	return runCommand(ctx, ffmpeg,
+		"-y", "-i", input, "-t", fmt.Sprintf("%.5f", keep),
+		"-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+		"-c:a", "aac", "-movflags", "+faststart", output,
+	)
+}
+
+// trimFrozenClipTails 逐段检测并裁掉尾部冻帧，返回拼接清单、段 ID → 实际入片文件与说明。
+// 与段头检测不同，这里不限衔接模式也不限段数：nearestAllowedDuration 把段长夹到模型档位
+// 后多出来的空窗跟衔接方式无关，单段任务一样会被静止帧填充。任一判定失败只跳过该段
+// （保持原样入片），不阻断合成。
+func trimFrozenClipTails(ctx context.Context, ffmpeg, outputDir string, clips []composeClip, defaultFps int) ([]string, map[string]string, []string) {
+	paths := make([]string, len(clips))
+	composed := make(map[string]string, len(clips))
+	for index, clip := range clips {
+		paths[index] = clip.Path
+		composed[clip.SegmentID] = clip.Path
+	}
+	warnings := make([]string, 0, len(clips))
+	scanBase := filepath.Join(outputDir, "tail-scan")
+	_ = os.RemoveAll(scanBase)
+	for index, clip := range clips {
+		select {
+		case <-ctx.Done():
+			warnings = append(warnings, "段尾冻帧裁剪超时，剩余片段按原样入片")
+			return paths, composed, warnings
+		default:
+		}
+		discard, info, fps, err := countFrozenTailFrames(ctx, ffmpeg, clip.Path,
+			filepath.Join(scanBase, clip.SegmentID), defaultFps)
+		if err != nil || discard < minTailFreezeFrames || info.Duration <= 0 {
+			continue // 无法判定或静止太短：保持原样
+		}
+		// 窗口内整段都冻＝创作者要的画面（如定格收尾），绝不删空
+		totalFrames := int(math.Round(info.Duration * fps))
+		if discard >= totalFrames-1 {
+			warnings = append(warnings, fmt.Sprintf("第 %d 段整段静止，按创作内容保留原样", index+1))
+			continue
+		}
+		if info.Duration-float64(discard)/fps < 1 {
+			continue // 裁完不足 1 秒，宁可留着冻帧
+		}
+		trimmed := filepath.Join(outputDir, fmt.Sprintf("trim-tail-%s.mp4", clip.SegmentID))
+		if err := trimTailFrames(ctx, ffmpeg, clip.Path, trimmed, discard, fps, info.Duration); err != nil {
+			warnings = append(warnings, fmt.Sprintf("第 %d 段段尾冻帧裁剪失败，按原样入片: %v", index+1, err))
+			continue
+		}
+		paths[index] = trimmed
+		composed[clip.SegmentID] = trimmed
+		warnings = append(warnings, fmt.Sprintf(
+			"第 %d 段末尾 %d 帧与末帧 SSIM>%.3f（档位多出的时长被静止帧填充），已裁掉，末帧保留收尾",
+			index+1, discard, ssimFreezeThreshold,
+		))
+	}
+	_ = os.RemoveAll(scanBase)
+	return paths, composed, warnings
+}
+
+// syncPlanWithComposedDurations 按实际入片文件时长重写计划时间轴：
+// nearestAllowedDuration 的档位夹取让计划段长虚高，冻帧裁剪又让实际入片更短，
+// 预算时间轴（plannedSubtitleSpans 兜底）与任务详情都读这份计划，不跟着修正就一直偏高。
+// 每段 DurationS 保留档位值不动：重试重渲仍按档位提交，厂商只认档位。
+func syncPlanWithComposedDurations(ctx context.Context, run *VideoRunContext, composedBySegment map[string]string) []string {
+	if run == nil || run.Plan == nil || len(run.Plan.Segments) == 0 || len(composedBySegment) == 0 {
+		return nil
+	}
+	cursor, changed := 0.0, false
+	for index := range run.Plan.Segments {
+		segment := &run.Plan.Segments[index]
+		duration := segment.End - segment.Start
+		if path, ok := composedBySegment[segment.ID]; ok && fileExists(path) {
+			if info, err := mediaProbe(ctx, path); err == nil && info.Duration > 0 {
+				if math.Abs(info.Duration-duration) >= 0.05 {
+					changed = true
+				}
+				duration = info.Duration
+			}
+		}
+		segment.Start = round2(cursor)
+		segment.End = round2(cursor + duration)
+		cursor += duration
+	}
+	if !changed {
+		return nil
+	}
+	run.Plan.TotalS = round2(cursor)
+	return []string{fmt.Sprintf(
+		"已按实际入片时长修正计划时间轴：总时长 %.1fs（段时长档位值保留，重渲仍按档位提交）",
+		run.Plan.TotalS,
+	)}
+}
+
+// concatVideoClips 多段拼接：先流拷贝（无损快），失败或成片实测时长对不上再统一重编码。
+// 教训：-c copy 是容器级操作、根本不解码，分段参数/时间戳异常时不会报错，
+// 产物“成功”但播放器在坏点冻住最后一帧、总时长虚高（线上 bug：3×8s 拼出 1:38 定格）。
+// 所以判据不能只看命令退出码，必须拿各段实测时长之和对账成片。
 func concatVideoClips(ctx context.Context, clips []string, output string) error {
 	ffmpeg, ok := ffmpegPath()
 	if !ok {
@@ -264,16 +428,156 @@ func concatVideoClips(ctx context.Context, clips []string, output string) error 
 		return fmt.Errorf("写入拼接清单失败: %w", err)
 	}
 
+	expected := 0.0
+	for _, clip := range clips {
+		if info, err := mediaProbe(ctx, clip); err == nil && info.Duration > 0 {
+			expected += info.Duration
+		}
+	}
+
 	copyErr := runCommand(ctx, ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", output)
-	if copyErr == nil {
+	if copyErr == nil && concatDurationSane(ctx, output, expected) {
 		return nil
 	}
-	return runCommand(ctx, ffmpeg,
+	if err := runCommand(ctx, ffmpeg,
 		"-y", "-f", "concat", "-safe", "0", "-i", listPath,
 		"-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
 		"-pix_fmt", "yuv420p", "-c:a", "aac",
 		output,
+	); err != nil {
+		if copyErr != nil {
+			return copyErr
+		}
+		return err
+	}
+	if !concatDurationSane(ctx, output, expected) {
+		return fmt.Errorf("拼接产物时长与分段实测之和相差过大（预期 %.1fs）：分段文件的时间戳或编码参数可能有问题，请重新渲染对应段", expected)
+	}
+	return nil
+}
+
+// concatDurationSane 成片实测时长 ≈ 各段实测之和才算正常；测不出时不阻断（后续环节还有防线）。
+// 容差取 0.5s 与 2% 的较大值：AAC priming 每段只多零点几秒，时间戳空洞则是秒级跳变。
+func concatDurationSane(ctx context.Context, merged string, expected float64) bool {
+	if expected <= 0 {
+		return true
+	}
+	info, err := mediaProbe(ctx, merged)
+	if err != nil || info.Duration <= 0 {
+		return true
+	}
+	return math.Abs(info.Duration-expected) <= math.Max(0.5, expected*0.02)
+}
+
+// normalizeClipsBeforeConcat 拼接前把各段统一到同一画布/帧率/音频有无。
+// 方舟首帧任务跟随素材自身比例出段，last_frame 链上任一段都可能与别的段尺寸不同；
+// 参数不齐就 -c copy 硬拼正是“前 8 秒正常、后面定格”的温床。
+// 实测参数完全一致时不重编码（快路径不变），有差异才逐段归一。
+func normalizeClipsBeforeConcat(ctx context.Context, ffmpeg, outputDir string, clips []composeClip, cfg VideoRunConfig) ([]string, map[string]string, []string) {
+	paths := make([]string, len(clips))
+	composed := make(map[string]string, len(clips))
+	for index, clip := range clips {
+		paths[index] = clip.Path
+		composed[clip.SegmentID] = clip.Path
+	}
+	warnings := make([]string, 0, 2)
+	if len(clips) < 2 {
+		return paths, composed, warnings
+	}
+	infos := make([]mediaInfo, len(clips))
+	for index, clip := range clips {
+		info, err := mediaProbe(ctx, clip.Path)
+		if err != nil || info.Width <= 0 || info.Height <= 0 {
+			reason := "没能读出画面尺寸"
+			if err != nil {
+				reason = err.Error()
+			}
+			return paths, composed, append(warnings, "分段参数实测失败，按原样拼接："+reason)
+		}
+		infos[index] = info
+	}
+	// 公共画布以第一段为基准换算（与拼接后归一的算法一致，单段/多段结果不会跳变）
+	width, height, _ := targetCanvas(cfg.AspectRatio, infos[0].Width, infos[0].Height)
+	if width <= 0 || height <= 0 {
+		width, height = infos[0].Width, infos[0].Height
+	}
+	fps := infos[0].FPS
+	if fps <= 0 {
+		for _, info := range infos {
+			if info.FPS > 0 {
+				fps = info.FPS
+				break
+			}
+		}
+	}
+	if fps <= 0 {
+		fps = 24
+		if cfg.Fps > 0 {
+			fps = float64(cfg.Fps)
+		}
+	}
+	needNormalize := false
+	for _, info := range infos {
+		if info.Width != width || info.Height != height ||
+			(info.FPS > 0 && math.Abs(info.FPS-fps) > 0.5) ||
+			info.HasAudio != infos[0].HasAudio {
+			needNormalize = true
+			break
+		}
+	}
+	if !needNormalize {
+		return paths, composed, warnings
+	}
+	for index, clip := range clips {
+		normalized := filepath.Join(outputDir, fmt.Sprintf("norm-%s.mp4", clip.SegmentID))
+		if err := normalizeClipToCanvas(ctx, ffmpeg, clip.Path, normalized, width, height, fps, infos[index]); err != nil {
+			// 归一失败不阻断：保持原样入拼，拼接环节还有实测时长防线
+			warnings = append(warnings, fmt.Sprintf("第 %d 段统一画幅失败，按原样拼接（接缝可能卡顿）: %v", index+1, err))
+			continue
+		}
+		paths[index] = normalized
+		composed[clip.SegmentID] = normalized
+	}
+	warnings = append(warnings, fmt.Sprintf(
+		"分段画幅/帧率/音轨不一致，已统一为 %dx%d@%.6gfps 后再拼接（避免接缝定格）", width, height, fps))
+	return paths, composed, warnings
+}
+
+// normalizeClipToCanvas 把一段素材重编码到公共画布：尺寸不同用模糊填充兜底（与整片归一同款），
+// 帧率统一 -r，无音轨的段补静音轨（有/无音轨混拼时 -c copy 会坏）。
+func normalizeClipToCanvas(ctx context.Context, ffmpeg, input, output string, width, height int, fps float64, info mediaInfo) error {
+	args := []string{"-y", "-i", input}
+	vmap := "0:v"
+	amap := "0:a?"
+	var filters []string
+	if info.Width != width || info.Height != height {
+		filters = append(filters, fmt.Sprintf(
+			"[0:v]split=2[bg][fg];"+
+				"[bg]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,boxblur=20:2[bgb];"+
+				"[fg]scale=%d:%d:force_original_aspect_ratio=decrease[fgb];"+
+				"[bgb][fgb]overlay=(W-w)/2:(H-h)/2,setsar=1[vout]",
+			width, height, width, height, width, height,
+		))
+		vmap = "[vout]"
+	}
+	if !info.HasAudio {
+		args = append(args, "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100")
+		amap = "1:a"
+	}
+	if len(filters) > 0 {
+		args = append(args, "-filter_complex", filters[0])
+	}
+	args = append(args, "-map", vmap, "-map", amap)
+	if info.Duration > 0 {
+		// 封顶到实测时长：无限长的静音源要跟着视频停
+		args = append(args, "-t", fmt.Sprintf("%.5f", info.Duration))
+	}
+	args = append(args,
+		"-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+		"-r", fmt.Sprintf("%.6g", fps),
+		"-c:a", "aac", "-ar", "44100", "-movflags", "+faststart", output,
 	)
+	return runCommand(ctx, ffmpeg, args...)
 }
 
 // mediaInfo 片段实测到的画面/音频元数据。
@@ -1130,17 +1434,44 @@ func prepareComposeCanvas(ctx context.Context, workDir, taskID string, cfg Video
 	}
 	prep.HasFFmpeg = true
 
-	merged := clips[0]
 	composedBySegment := prep.ComposedBySegment
-	if len(clips) > 1 {
-		// 尾帧延续下服务商常在下一段开头重放条件尾帧并冻住几帧；逐帧 SSIM 比对、删冻帧后再拼，接缝才不顿
-		if cfg.ContinuationMode == "last_frame" {
-			freezeCtx, cancelFreeze := context.WithTimeout(ctx, 20*time.Minute)
-			var freezeWarnings []string
-			clips, composedBySegment, freezeWarnings = trimFrozenClipHeads(freezeCtx, ffmpeg, workDir, outputDir, selected, cfg.Fps)
-			cancelFreeze()
-			warnings = append(warnings, freezeWarnings...)
+	pending := selected
+	if len(pending) > 1 {
+		// 尾帧延续下服务商常在下一段开头重放条件尾帧并冻住几帧；逐帧 SSIM 比对、删冻帧后再拼，接缝才不顿。
+		// 衔接模式为 none/overlap 时同样走这条检测：0.995 的阈值只有真在重放静止画面才会命中，创作内容不会被误删
+		freezeCtx, cancelFreeze := context.WithTimeout(ctx, 20*time.Minute)
+		headPaths, headComposed, freezeWarnings := trimFrozenClipHeads(freezeCtx, ffmpeg, workDir, outputDir, pending, cfg.Fps)
+		cancelFreeze()
+		clips = headPaths
+		composedBySegment = headComposed
+		rebuilt := make([]composeClip, len(pending))
+		for index := range pending {
+			rebuilt[index] = composeClip{SegmentID: pending[index].SegmentID, Path: clips[index]}
 		}
+		pending = rebuilt
+		warnings = append(warnings, freezeWarnings...)
+	}
+	// 段尾冻帧裁剪：分镜被 nearestAllowedDuration 夹到模型档位后，多出的空窗常被静止帧收尾填充；
+	// 单段任务和 none 衔接同样会中招，因此不限段数与衔接模式
+	tailCtx, cancelTail := context.WithTimeout(ctx, 20*time.Minute)
+	var tailWarnings []string
+	clips, composedBySegment, tailWarnings = trimFrozenClipTails(tailCtx, ffmpeg, outputDir, pending, cfg.Fps)
+	cancelTail()
+	warnings = append(warnings, tailWarnings...)
+
+	merged := clips[0]
+	if len(clips) > 1 {
+		// 拼接前先统一各段参数：-c copy 对参数不齐不报错，产物会在接缝处定格且总时长虚高
+		concatInput := make([]composeClip, len(pending))
+		for index := range pending {
+			concatInput[index] = composeClip{SegmentID: pending[index].SegmentID, Path: clips[index]}
+		}
+		normCtx, cancelNorm := context.WithTimeout(ctx, 30*time.Minute)
+		var normWarnings []string
+		clips, composedBySegment, normWarnings = normalizeClipsBeforeConcat(normCtx, ffmpeg, outputDir, concatInput, cfg)
+		cancelNorm()
+		warnings = append(warnings, normWarnings...)
+
 		merged = filepath.Join(outputDir, "merged.mp4")
 		concatCtx, cancel := context.WithTimeout(ctx, 45*time.Minute)
 		err := concatVideoClips(concatCtx, clips, merged)
@@ -1152,6 +1483,8 @@ func prepareComposeCanvas(ctx context.Context, workDir, taskID string, cfg Video
 	}
 	prep.MergedPath = merged
 	prep.ComposedBySegment = composedBySegment
+	// 档位夹取与冻帧裁剪之后，按实际入片时长修正计划时间轴（预算轴与任务详情都读它）
+	warnings = append(warnings, syncPlanWithComposedDurations(ctx, run, composedBySegment)...)
 
 	// 画幅兜底：服务商可能按素材自身比例出片（方舟首帧任务尤其如此），
 	// 不在这里归一，用户选 9:16 拿到的就永远是 16:9。

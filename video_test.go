@@ -540,24 +540,25 @@ func TestSubtitlesDefaultOff(t *testing.T) {
 	}
 }
 
-// 出镜主体统一约束：三段 Agent 提示词、落到视频模型的提示词、以及用户改写后的提示词都要带上动物主体要求。
-func TestAnimalCastDirectiveAppliedEverywhere(t *testing.T) {
+// 出镜主体约束：任务完全没有图片时，三处 Agent system 提示词与本地兜底都要带上动物主体要求。
+func TestAnimalCastDirectiveOnlyWithoutImages(t *testing.T) {
+	cfg, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "橘猫开咖啡馆", DurationS: 12})
+	if err != nil {
+		t.Fatalf("归一化失败: %v", err)
+	}
+	caps := defaultVideoCapabilities()
 	for name, prompt := range map[string]string{
-		"分镜":   scriptSystemPrompt,
-		"提示词":  promptSystemPrompt,
-		"单段重写": segmentPromptSuggestSystemPrompt,
+		"分镜":   scriptSystemPrompt(cfg),
+		"提示词":  promptSystemPrompt(cfg, caps),
+		"单段重写": segmentPromptSuggestSystemPrompt(cfg, caps),
 	} {
 		if !strings.Contains(prompt, animalCastDirective) {
 			t.Fatalf("%s 的 system 提示词缺少动物主体约束", name)
 		}
 	}
 
-	cfg, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "橘猫开咖啡馆", DurationS: 12})
-	if err != nil {
-		t.Fatalf("归一化失败: %v", err)
-	}
 	script := normalizeScript(localVideoScript(cfg), cfg)
-	prompts, _ := (&App{}).generatePrompts(t.Context(), cfg, script, defaultVideoCapabilities(), "")
+	prompts, _ := (&App{}).generatePrompts(t.Context(), cfg, script, caps, "")
 	if len(prompts) == 0 {
 		t.Fatal("提示词不应为空")
 	}
@@ -566,19 +567,78 @@ func TestAnimalCastDirectiveAppliedEverywhere(t *testing.T) {
 			t.Fatalf("本地兜底提示词缺少动物主体约束: %q", prompt.VisualPrompt)
 		}
 	}
+}
 
-	// 用户在确认关卡改写提示词后仍要补齐，且重复提交不叠加
-	edited := []VideoPromptItem{{
-		ShotID:       prompts[0].ShotID,
-		VisualPrompt: "固定机位，柴犬推开店门",
-		Start:        prompts[0].Start,
-		End:          prompts[0].End,
-	}}
-	submission := []VideoPromptEdit{{ShotID: edited[0].ShotID, VisualPrompt: "固定机位，柴犬推开店门"}}
-	applyPromptEdits(edited, submission, cfg)
-	applyPromptEdits(edited, []VideoPromptEdit{{ShotID: edited[0].ShotID, VisualPrompt: edited[0].VisualPrompt}}, cfg)
-	if count := strings.Count(edited[0].VisualPrompt, animalCastDirective); count != 1 {
-		t.Fatalf("动物主体约束应只出现一次，实际 %d 次: %q", count, edited[0].VisualPrompt)
+// 只要用户提供了首帧，就必须取消动物限制；角色图与首帧都走“以图为准”。
+func TestFirstFrameLiftsAnimalDirective(t *testing.T) {
+	firstFrame := filepath.Join(t.TempDir(), "first.png")
+	if err := os.WriteFile(firstFrame, []byte("fake-png"), 0o644); err != nil {
+		t.Fatalf("写首帧失败: %v", err)
+	}
+	cfg, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "真人出镜", DurationS: 6, FirstFrame: firstFrame})
+	if err != nil {
+		t.Fatalf("归一化失败: %v", err)
+	}
+	caps := defaultVideoCapabilities()
+	for name, prompt := range map[string]string{
+		"分镜":   scriptSystemPrompt(cfg),
+		"提示词":  promptSystemPrompt(cfg, caps),
+		"单段重写": segmentPromptSuggestSystemPrompt(cfg, caps),
+	} {
+		if strings.Contains(prompt, animalCastDirective) {
+			t.Fatalf("%s 的 system 提示词仍然强制动物主体", name)
+		}
+		if !strings.Contains(prompt, imageCastDirective) {
+			t.Fatalf("%s 的 system 提示词缺少以图为准约束", name)
+		}
+	}
+
+	script := normalizeScript(localVideoScript(cfg), cfg)
+	prompts, _ := (&App{}).generatePrompts(t.Context(), cfg, script, caps, "")
+	if len(prompts) == 0 {
+		t.Fatal("提示词不应为空")
+	}
+	for _, prompt := range prompts {
+		if strings.Contains(prompt.VisualPrompt, animalCastDirective) {
+			t.Fatalf("有首帧时提示词仍出现动物约束: %q", prompt.VisualPrompt)
+		}
+		if !strings.Contains(prompt.VisualPrompt, imageCastDirective) {
+			t.Fatalf("有首帧时提示词缺少以图为准约束: %q", prompt.VisualPrompt)
+		}
+	}
+}
+
+// 模型读不到角色图、且没有首帧可锁时，Agent2 只能用文字外观锚点，绝不回退动物。
+func TestPromptDirectiveFallsBackToTextAnchor(t *testing.T) {
+	cfg := VideoRunConfig{Topic: "角色一致性", DurationS: 6, CharacterRefs: []VideoCharacterRef{{
+		RoleID: "host", Name: "主理人", Images: []string{"host.png"}, ImageSource: CharacterImageSourceUser,
+	}}}
+	caps := defaultVideoCapabilities()
+	caps.CharacterReference = false
+	prompt := promptSystemPrompt(cfg, caps)
+	if !strings.Contains(prompt, textAnchorCastDirective) {
+		t.Fatalf("模型不支持参考图且无首帧时应使用文字锚点: %s", prompt)
+	}
+	if strings.Contains(prompt, animalCastDirective) {
+		t.Fatal("有角色图时不应回退动物主体")
+	}
+
+	caps.CharacterReference = true
+	if prompt := promptSystemPrompt(cfg, caps); !strings.Contains(prompt, imageCastDirective) {
+		t.Fatalf("模型支持参考图时应以图为准: %s", prompt)
+	}
+}
+
+// 用户在关卡②改写的提示词就是最终版：程序不再补主体约束，也不会把动物加回来。
+func TestPromptEditsPreserveUserText(t *testing.T) {
+	cfg, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "真人出镜", DurationS: 6})
+	if err != nil {
+		t.Fatalf("归一化失败: %v", err)
+	}
+	edited := []VideoPromptItem{{ShotID: "s1", VisualPrompt: "固定机位，真人推开店门", Start: 0, End: 6}}
+	applyPromptEdits(edited, []VideoPromptEdit{{ShotID: "s1", VisualPrompt: "固定机位，真人推开店门"}}, cfg)
+	if edited[0].VisualPrompt != "固定机位，真人推开店门" {
+		t.Fatalf("用户改写应原样保留: %q", edited[0].VisualPrompt)
 	}
 }
 

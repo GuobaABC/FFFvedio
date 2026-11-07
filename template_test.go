@@ -7,76 +7,116 @@ import (
 	"testing"
 )
 
-func TestVideoTemplateBuiltinsSeeded(t *testing.T) {
+// testTemplate 写入一份个人模板，替代已下线的默认示例。
+// 覆盖风格 / 角色 / 开场白 / 字幕 / 发布档，供模板链路用例复用。
+func testTemplate(t *testing.T, app *App) VideoTemplate {
+	t.Helper()
+	f := func(value float64) *float64 { return &value }
+	b := func(value bool) *bool { return &value }
+	template, err := app.SaveVideoTemplate(VideoTemplate{
+		Name:        "测试品牌口播",
+		Scope:       TemplateScopePersonal,
+		Description: "模板链路测试用",
+		Tags:        []string{"测试", "口播"},
+		Style: VideoTemplateStyle{
+			Tokens: map[string]string{
+				"lighting": "侧逆光 45°，暖调反光板补亮面部",
+				"grade":    "暖琥珀色调，暗部保留细节不压黑",
+				"lens":     "35mm 定焦，f/2.0 浅景深",
+				"camera":   "手持轻微呼吸感，缓慢推近",
+				"texture":  "细颗粒胶片质感",
+				"mood":     "温暖、松弛、有食欲",
+			},
+			PromptSnippets: map[string]string{
+				"kling":   "35mm 定焦手持轻推，暖琥珀色调，细颗粒胶片质感，温暖口播氛围",
+				"generic": "手持缓慢推近，35mm 定焦浅景深，暖琥珀色调，细颗粒胶片质感",
+			},
+		},
+		Characters: []VideoTemplateCharacter{{
+			RoleID:          "host",
+			Name:            "主理人（橘猫）",
+			AppearanceBlock: "成年橘色短毛猫，圆脸、耳尖有一小撮白毛，脖子系米白色针织围巾",
+			VoiceHint:       "温暖中音，语速 4.2 字/秒",
+			Perspective:     "主视角，正对镜头半身",
+		}},
+		Opening: VideoTemplateOpening{
+			Variants: []string{
+				"先别急着下结论，{topic}里有个反直觉的点",
+				"{product}不是越贵越好，这三步就能喝出差别",
+				"先说结论：{brand}这次把{product}做对了什么",
+			},
+			Vars:       []string{"topic", "brand", "product"},
+			SpeechRate: 4.2,
+		},
+		SubtitleStyle: VideoTemplateSubtitleStyle{
+			FontName:     "思源黑体",
+			FontSizePct:  f(4.6),
+			PrimaryColor: "#FFFFFF",
+			OutlineColor: "#1A1A1A",
+			OutlineWidth: f(2),
+			Alignment:    2,
+			MarginVPct:   f(6),
+			Bold:         b(true),
+		},
+		PublishDefaults: VideoTemplatePublishDefaults{
+			Platforms: []string{"douyin"},
+			Region:    "Asia/Shanghai",
+			Vertical:  "美食",
+		},
+		Defaults: VideoTemplateDefaults{
+			AspectRatio:      "9:16",
+			DurationS:        24,
+			Fps:              24,
+			SpeechRate:       f(4.2),
+			ContinuationMode: "last_frame",
+			Language:         "zh-CN",
+		},
+	})
+	if err != nil {
+		t.Fatalf("写入测试模板失败: %v", err)
+	}
+	return template
+}
+
+// 默认模板已全部下线：新库不应写入任何内置模板。
+func TestNoBuiltinTemplatesSeeded(t *testing.T) {
 	app := newTestApp(t)
 
 	templates, err := app.ListVideoTemplates()
 	if err != nil {
 		t.Fatalf("读取模板库失败: %v", err)
 	}
-	if len(templates) < 3 {
-		t.Fatalf("内置模板未写入，当前 %d 个", len(templates))
-	}
-	for _, template := range templates {
-		if template.Scope != TemplateScopeBuiltin {
-			t.Fatalf("内置模板应排在最前且作用域为 builtin: %s / %s", template.Name, template.Scope)
-		}
-		if template.Version == "" || template.Name == "" {
-			t.Fatalf("内置模板缺少名称或版本: %+v", template)
-		}
+	if len(templates) != 0 {
+		t.Fatalf("新库不应有默认模板，当前 %d 个: %+v", len(templates), templates)
 	}
 }
 
-// 内置模板升版（真人角色 → 动物角色）时，存量库的 builtin 行要刷新，个人模板不受牵连。
-func TestBuiltinTemplateSeedRefreshesLegacyAnchors(t *testing.T) {
+// 老库升级时清掉历史内置模板，用户自建模板不受影响。
+func TestMigrateRemovesLegacyBuiltinTemplates(t *testing.T) {
 	app := newTestApp(t)
 
-	const legacyPayload = `{"id":"tpl_builtin_brand_warm","name":"品牌口播·暖调","version":"1.2","scope":"builtin","characters":[{"roleId":"host","name":"主理人","appearanceBlock":"35 岁女性，齐肩黑发别在耳后"}]}`
-	if _, err := app.db.Exec(`UPDATE video_templates SET version = '1.2', payload_json = ? WHERE id = 'tpl_builtin_brand_warm'`, legacyPayload); err != nil {
-		t.Fatalf("构造老库模板失败: %v", err)
-	}
+	const legacyPayload = `{"id":"tpl_builtin_brand_warm","name":"品牌口播·暖调","version":"1.4","scope":"builtin","characters":[{"roleId":"host","name":"主理人","appearanceBlock":"成年橘猫"}]}`
 	if _, err := app.db.Exec(`INSERT INTO video_templates (`+videoTemplateColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		"tpl_mine", "我的模板", "1.2", TemplateScopePersonal, "[]", legacyPayload, "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z"); err != nil {
-		t.Fatalf("写入个人模板失败: %v", err)
+		"tpl_builtin_brand_warm", "品牌口播·暖调", "1.4", TemplateScopeBuiltin, "[]", legacyPayload, "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("构造老库内置模板失败: %v", err)
 	}
+	personal := testTemplate(t, app)
 
-	if err := seedBuiltinVideoTemplates(app.db); err != nil {
-		t.Fatalf("刷新内置模板失败: %v", err)
+	if err := migrate(app.db); err != nil {
+		t.Fatalf("迁移失败: %v", err)
 	}
-
-	var wantVersion string
-	for _, item := range builtinVideoTemplates() {
-		if item.ID == "tpl_builtin_brand_warm" {
-			wantVersion = item.Version
-		}
+	if _, err := app.videoTemplateByID("tpl_builtin_brand_warm"); err == nil {
+		t.Fatal("历史内置模板应被清理")
 	}
-	template, err := app.videoTemplateByID("tpl_builtin_brand_warm")
-	if err != nil {
-		t.Fatalf("读取内置模板失败: %v", err)
-	}
-	if template.Version != wantVersion {
-		t.Fatalf("内置模板版本未刷新: %s / 期望 %s", template.Version, wantVersion)
-	}
-	if len(template.Characters) == 0 || !strings.Contains(template.Characters[0].AppearanceBlock, "猫") {
-		t.Fatalf("内置模板角色应刷新为动物主体: %+v", template.Characters)
-	}
-
-	var personalPayload string
-	if err := app.db.QueryRow(`SELECT payload_json FROM video_templates WHERE id = 'tpl_mine'`).Scan(&personalPayload); err != nil {
-		t.Fatalf("读取个人模板失败: %v", err)
-	}
-	if !strings.Contains(personalPayload, "35 岁女性") {
-		t.Fatalf("个人模板不应被内置刷新波及: %s", personalPayload)
+	if _, err := app.videoTemplateByID(personal.ID); err != nil {
+		t.Fatalf("个人模板不应被清理: %v", err)
 	}
 }
 
 func TestVideoTemplateLayeredOverrideAndSources(t *testing.T) {
 	app := newTestApp(t)
 
-	template, err := app.videoTemplateByID("tpl_builtin_brand_warm")
-	if err != nil {
-		t.Fatalf("读取内置模板失败: %v", err)
-	}
+	template := testTemplate(t, app)
 	cfg := VideoRunConfig{
 		Topic:     "清晨手冲咖啡",
 		DurationS: 30, // 本次显式覆盖模板的 24s
@@ -162,17 +202,14 @@ func TestCreateVideoTaskWithTemplate(t *testing.T) {
 	withTempVideoRoot(t)
 	app := newTestApp(t)
 
-	builtin, err := app.videoTemplateByID("tpl_builtin_brand_warm")
-	if err != nil {
-		t.Fatalf("读取内置模板失败: %v", err)
-	}
+	template := testTemplate(t, app)
 
 	task, err := app.CreateVideoTask(VideoTaskInput{
 		Config: VideoRunConfig{
 			Topic: "清晨手冲咖啡",
 			TemplateRef: &VideoTemplateRef{
-				ID:          "tpl_builtin_brand_warm",
-				Version:     "1.0", // 老任务锁定的历史版本
+				ID:          template.ID,
+				Version:     "0.9", // 老任务锁定的历史版本
 				Overrides:   map[string]string{"durationS": "30"},
 				OpeningVars: map[string]string{"brand": "晨光", "product": "手冲咖啡"},
 			},
@@ -182,14 +219,14 @@ func TestCreateVideoTaskWithTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("按模板创建任务失败: %v", err)
 	}
-	if task.TemplateID != "tpl_builtin_brand_warm" {
+	if task.TemplateID != template.ID {
 		t.Fatalf("任务未记录模板 ID: %q", task.TemplateID)
 	}
 	if task.Run.Template == nil {
 		t.Fatal("任务缺少模板快照")
 	}
-	if task.Run.Template.Version != builtin.Version {
-		t.Fatalf("模板快照应按最新版本固化: %q / 期望 %q", task.Run.Template.Version, builtin.Version)
+	if task.Run.Template.Version != template.Version {
+		t.Fatalf("模板快照应按最新版本固化: %q / 期望 %q", task.Run.Template.Version, template.Version)
 	}
 	if task.Run.ConfigSources[templateFieldAspect] != TemplateSourceTemplate {
 		t.Fatalf("字段来源未落库: %+v", task.Run.ConfigSources)
@@ -212,12 +249,16 @@ func TestCreateVideoTaskWithTemplate(t *testing.T) {
 func TestTemplateOpeningRotatesAcrossTasks(t *testing.T) {
 	withTempVideoRoot(t)
 	app := newTestApp(t)
+	template := testTemplate(t, app)
 
 	create := func() string {
 		task, err := app.CreateVideoTask(VideoTaskInput{
 			Config: VideoRunConfig{
-				Topic:       "清晨手冲咖啡",
-				TemplateRef: &VideoTemplateRef{ID: "tpl_builtin_slice_life"},
+				Topic: "清晨手冲咖啡",
+				TemplateRef: &VideoTemplateRef{
+					ID:          template.ID,
+					OpeningVars: map[string]string{"brand": "晨光", "product": "手冲咖啡"},
+				},
 			},
 		})
 		if err != nil {
@@ -289,16 +330,8 @@ func TestVideoTemplateLifecycle(t *testing.T) {
 		t.Fatalf("模板更新未生效: %+v", updated)
 	}
 
-	builtin, err := app.videoTemplateByID("tpl_builtin_brand_warm")
-	if err != nil {
-		t.Fatalf("读取内置模板失败: %v", err)
-	}
-	builtin.Name = "改个名"
-	if _, err := app.SaveVideoTemplate(builtin); err == nil {
-		t.Fatal("内置模板不允许修改")
-	}
-	if err := app.DeleteVideoTemplate("tpl_builtin_brand_warm"); err == nil {
-		t.Fatal("内置模板不允许删除")
+	if _, err := app.SaveVideoTemplate(VideoTemplate{Name: "内置作用域", Scope: TemplateScopeBuiltin}); err == nil {
+		t.Fatal("内置作用域仍应由系统保留")
 	}
 	if err := app.DeleteVideoTemplate(updated.ID); err != nil {
 		t.Fatalf("未被引用的个人模板应可删除: %v", err)
@@ -308,10 +341,7 @@ func TestVideoTemplateLifecycle(t *testing.T) {
 func TestTemplateInjectionIntoPromptAndLocalScript(t *testing.T) {
 	app := newTestApp(t)
 
-	template, err := app.videoTemplateByID("tpl_builtin_brand_warm")
-	if err != nil {
-		t.Fatalf("读取内置模板失败: %v", err)
-	}
+	template := testTemplate(t, app)
 	cfg, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "清晨手冲咖啡", DurationS: 24, AspectRatio: "9:16"})
 	if err != nil {
 		t.Fatalf("归一化失败: %v", err)
@@ -359,10 +389,40 @@ func TestTemplateInjectionIntoPromptAndLocalScript(t *testing.T) {
 	}
 }
 
+// 用户给某个角色上传了定妆图后，模板里的动物外观文字要让位：图片才是权威形象。
+// 没上传图的角色继续用模板外观锚点做跨段一致性。
+func TestTemplateAppearanceYieldsToUserImage(t *testing.T) {
+	app := newTestApp(t)
+	tpl := testTemplate(t, app)
+	if len(tpl.Characters) == 0 || strings.TrimSpace(tpl.Characters[0].AppearanceBlock) == "" {
+		t.Fatal("测试模板应带角色外观锚点")
+	}
+	run := &VideoTemplateRun{VideoTemplate: tpl}
+	role := tpl.Characters[0].RoleID
+	shot := VideoShot{ID: "s1", Roles: []string{role}}
+	caps := defaultVideoCapabilities()
+
+	cfg := VideoRunConfig{CharacterRefs: []VideoCharacterRef{{
+		RoleID: role, Name: tpl.Characters[0].Name,
+		Images: []string{"host.png"}, ImageSource: CharacterImageSourceUser,
+	}}}
+	visual := applyTemplatePromptExtras("固定机位，主体推开店门", shot, caps, run, cfg)
+	if strings.Contains(visual, tpl.Characters[0].AppearanceBlock) {
+		t.Fatalf("用户上传图后不应再注入模板外观: %q", visual)
+	}
+
+	cfg.CharacterRefs[0].Images = nil
+	visual = applyTemplatePromptExtras("固定机位，主体推开店门", shot, caps, run, cfg)
+	if !strings.Contains(visual, tpl.Characters[0].AppearanceBlock) {
+		t.Fatalf("没上传图的角色应保留模板外观锚点: %q", visual)
+	}
+}
+
 func TestTemplatePreviewRendersSamples(t *testing.T) {
 	app := newTestApp(t)
+	template := testTemplate(t, app)
 
-	preview, err := app.PreviewVideoTemplate("tpl_builtin_knowledge_cool", "利率为什么影响房价", nil)
+	preview, err := app.PreviewVideoTemplate(template.ID, "利率为什么影响房价", nil)
 	if err != nil {
 		t.Fatalf("预览模板失败: %v", err)
 	}
@@ -420,7 +480,7 @@ func TestMigrateUpgradesLegacyDatabase(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM video_templates`).Scan(&count); err != nil {
 		t.Fatalf("模板表未创建: %v", err)
 	}
-	if count < 3 {
-		t.Fatalf("内置模板应随迁移写入，当前 %d 个", count)
+	if count != 0 {
+		t.Fatalf("默认模板已下线，迁移后不应写入内置模板，当前 %d 个", count)
 	}
 }

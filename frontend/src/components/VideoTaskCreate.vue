@@ -445,6 +445,13 @@ const derivedFrames = computed(() => {
 
 const unitLabel = computed(() => (form.language.startsWith('en') ? '词' : '字'))
 
+/** 任务是否已有任何图片输入：有图时主体以图为准，不再默认动物 */
+const hasImageInput = computed(
+  () =>
+    form.firstFrame.trim() !== '' ||
+    characterImagesText.value.some((text) => text.trim() !== ''),
+)
+
 const platformHint = computed(() => {
   const primary = VIDEO_PLATFORMS.find((item) => item.id === form.platforms[0])
   if (!primary) {
@@ -953,7 +960,8 @@ async function submit() {
           首帧驱动叙事：Agent1 会把画面基调、主体、光线与首帧对齐；i2v 提示词只描述「从首帧开始发生的变化」。
         </p>
         <p v-if="form.firstFrame" class="hint hint--warn">
-          严格锁帧已开启（默认）：新视频一定从这张图开始，有角色参考图也不让位；若连通道本身不支持以首帧起片，任务会直接报错而不是静默忽略。
+          严格锁帧已开启（默认）：新视频一定从这张图开始；与角色参考图冲突时首帧优先，主体以首帧为准，不再强制动物。
+          若连通道本身不支持以首帧起片，任务会直接报错而不是静默忽略。
         </p>
       </section>
 
@@ -962,9 +970,14 @@ async function submit() {
           <h3 class="ui-h3">2. 角色参考图（可选）</h3>
           <button class="ui-btn" type="button" @click="addCharacter">+ 添加角色</button>
         </div>
-        <p v-if="form.characterRefs.length === 0" class="hint">
+        <p class="hint">
           角色图用于跨段保持主体外观一致；不支持主体参考的模型会把统一外观描述写进每段提示词。
-          出镜主体默认优先使用猫 / 狗 / 猪 / 鸡等动物（可拟人化），避开真人形象。
+          <template v-if="hasImageInput">
+            已提供首帧或角色参考图：出镜主体以图为准，不再强制动物；请自行确认图片的肖像与使用授权。
+          </template>
+          <template v-else>
+            当前没有首帧或角色参考图：出镜主体默认使用猫 / 狗 / 猪 / 鸡等动物（可拟人化），避开真人形象。
+          </template>
         </p>
         <div v-for="(ref, index) in form.characterRefs" :key="index" class="character">
           <input v-model="ref.name" class="ui-input" type="text" placeholder="角色名称，如 橘座（猫）" />
@@ -1247,7 +1260,7 @@ async function submit() {
           </label>
           <label class="ui-field">
             <span class="ui-label">负向提示</span>
-            <input v-model="form.videoParams.negativePrompt" class="ui-input" type="text" placeholder="避免出现：真人面孔与人体、文字水印、畸形手指" />
+            <input v-model="form.videoParams.negativePrompt" class="ui-input" type="text" placeholder="避免出现：文字水印、畸形手指" />
           </label>
           <label class="ui-field">
             <span class="ui-label">随机种子（0 = 随机）</span>

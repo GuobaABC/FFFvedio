@@ -227,5 +227,6 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_purpose ON usage_events (purpose, cr
 		return fmt.Errorf("创建项目索引失败: %w", err)
 	}
 
-	return seedBuiltinVideoTemplates(db)
+	// 默认模板已全部下线：只清理历史库里的内置行，不再写入任何示例模板。
+	return removeLegacyBuiltinVideoTemplates(db)
 }

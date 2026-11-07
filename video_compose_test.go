@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -211,6 +212,158 @@ func TestTrimFrozenClipHeadsDropsReplayedTailFrames(t *testing.T) {
 		[]composeClip{{SegmentID: "s2-1", Path: prevBlue}, {SegmentID: "s2-2", Path: headRed}}, 24)
 	if cleanPaths[1] != headRed || cleanComposed["s2-2"] != headRed {
 		t.Fatalf("无冻帧时不应裁剪: %v %v", cleanPaths, cleanWarnings)
+	}
+}
+
+// 段尾冻帧裁剪：分镜被 nearestAllowedDuration 夹到模型档位后，多出的空窗常被静止帧收尾填充，
+// 这些帧应删（末帧保留收尾）；整段静止的（定格画面属创作内容）绝不删；
+// 计划时间轴要按实际入片时长修正，但档位值保留给重渲提交。
+func TestTrimFrozenClipTailsAndPlanSync(t *testing.T) {
+	ffmpeg := bundledFFmpeg(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	outputDir := filepath.Join(dir, "output")
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		t.Fatalf("创建输出目录失败: %v", err)
+	}
+
+	// 前 1s 红（真实内容）+ 后 0.5s 蓝（段尾静止填充：档位多出的时长）
+	frozen := filepath.Join(dir, "tail-frozen.mp4")
+	if err := runCommand(ctx, ffmpeg, "-y",
+		"-f", "lavfi", "-i", "color=c=red:s=320x240:r=24:d=1",
+		"-f", "lavfi", "-i", "color=c=blue:s=320x240:r=24:d=0.5",
+		"-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0",
+		"-c:v", "libx264", "-crf", "12", "-preset", "ultrafast", "-pix_fmt", "yuv420p", frozen); err != nil {
+		t.Fatalf("生成尾部冻帧片段失败: %v", err)
+	}
+	// 整段静止：不该被当成“可裁的填充”删空
+	still := filepath.Join(dir, "all-still.mp4")
+	makeColorClip(t, ffmpeg, still, "blue", 1)
+
+	clips := []composeClip{{SegmentID: "t1-1", Path: frozen}, {SegmentID: "t1-2", Path: still}}
+	paths, composed, warnings := trimFrozenClipTails(ctx, ffmpeg, outputDir, clips, 24)
+	joined := strings.Join(warnings, "\n")
+	if !strings.Contains(joined, "第 1 段") || !strings.Contains(joined, "已裁掉") {
+		t.Fatalf("应报告裁掉第一段段尾冻帧，实际警告: %v", warnings)
+	}
+	if !strings.Contains(joined, "整段静止") {
+		t.Fatalf("整段静止应提示按创作内容保留: %v", warnings)
+	}
+	if paths[0] == frozen || composed["t1-1"] != paths[0] {
+		t.Fatalf("第一段应被替换为裁剪后文件: %v %+v", paths, composed)
+	}
+	if paths[1] != still || composed["t1-2"] != still {
+		t.Fatalf("整段静止的不应被裁剪: %v", paths)
+	}
+
+	// 尾部 12 帧蓝里裁掉与末帧相同的部分、留着末帧：应剩约 1.0~1.1s
+	info, err := mediaProbe(ctx, paths[0])
+	if err != nil {
+		t.Fatalf("回读裁剪结果失败: %v", err)
+	}
+	if info.Duration < 0.9 || info.Duration > 1.2 {
+		t.Fatalf("裁剪后应剩约 1.04s，实际 %.3fs", info.Duration)
+	}
+
+	// 档位夹取的计划段长（10s）按实测入片时长修正，DurationS 保留档位值供重渲提交
+	plan := &VideoPlan{Segments: []VideoSegment{
+		{ID: "t1-1", Start: 0, End: 10, DurationS: 10},
+		{ID: "t1-2", Start: 10, End: 15, DurationS: 5},
+	}}
+	run := &VideoRunContext{Plan: plan}
+	if msgs := syncPlanWithComposedDurations(ctx, run, composed); len(msgs) == 0 {
+		t.Fatal("计划时间轴与实际时长不一致时应给出修正提示")
+	}
+	if plan.Segments[0].End < 0.9 || plan.Segments[0].End > 1.2 {
+		t.Fatalf("第一段终点应跟实测入片时长（约 1.04s），实际 %.2f", plan.Segments[0].End)
+	}
+	if math.Abs(plan.Segments[1].Start-plan.Segments[0].End) > 0.01 {
+		t.Fatalf("第二段起点应紧跟上一段终点: %.2f / %.2f", plan.Segments[1].Start, plan.Segments[0].End)
+	}
+	if plan.Segments[0].DurationS != 10 || plan.Segments[1].DurationS != 5 {
+		t.Fatalf("档位值是重渲提交依据，不得改写: %+v", plan.Segments)
+	}
+	if plan.TotalS < 1.9 || plan.TotalS > 2.3 {
+		t.Fatalf("总时长应为实测两段之和（约 2.0s），实际 %.2f", plan.TotalS)
+	}
+}
+
+// 拼接前的参数归一：方舟首帧任务按素材自身比例出段，尺寸不齐的段直接 -c copy 硬拼
+// 不会报错，产物却会在接缝处定格——必须先统一到同一画布再拼。
+func TestNormalizeClipsBeforeConcatUnifiesMismatchedCanvas(t *testing.T) {
+	ffmpeg := bundledFFmpeg(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	outputDir := filepath.Join(dir, "output")
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		t.Fatalf("创建输出目录失败: %v", err)
+	}
+
+	small := filepath.Join(dir, "a.mp4")
+	makeColorClip(t, ffmpeg, small, "red", 1) // 320x240
+	big := filepath.Join(dir, "b.mp4")
+	if err := runCommand(ctx, ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=blue:s=640x480:r=24:d=1",
+		"-c:v", "libx264", "-crf", "12", "-preset", "ultrafast", "-pix_fmt", "yuv420p", big); err != nil {
+		t.Fatalf("生成大尺寸片段失败: %v", err)
+	}
+
+	cfg := VideoRunConfig{AspectRatio: "4:3", Fps: 24}
+	clips := []composeClip{{SegmentID: "m1", Path: small}, {SegmentID: "m2", Path: big}}
+	paths, composed, warnings := normalizeClipsBeforeConcat(ctx, ffmpeg, outputDir, clips, cfg)
+	joined := strings.Join(warnings, "\n")
+	if !strings.Contains(joined, "统一") {
+		t.Fatalf("尺寸不一致时应报告已统一画幅: %v", warnings)
+	}
+	if paths[0] == small || paths[1] == big || composed["m1"] != paths[0] || composed["m2"] != paths[1] {
+		t.Fatalf("两段都应被替换为归一后文件: %v %+v", paths, composed)
+	}
+	first, err := mediaProbe(ctx, paths[0])
+	if err != nil {
+		t.Fatalf("回读归一结果失败: %v", err)
+	}
+	second, err := mediaProbe(ctx, paths[1])
+	if err != nil {
+		t.Fatalf("回读归一结果失败: %v", err)
+	}
+	if first.Width != second.Width || first.Height != second.Height {
+		t.Fatalf("归一后尺寸仍不一致: %dx%d vs %dx%d", first.Width, first.Height, second.Width, second.Height)
+	}
+
+	// 参数完全一致时走快路径：不重编码、不产生警告
+	same1 := filepath.Join(dir, "s1.mp4")
+	same2 := filepath.Join(dir, "s2.mp4")
+	makeColorClip(t, ffmpeg, same1, "red", 1)
+	makeColorClip(t, ffmpeg, same2, "blue", 1)
+	fastPaths, fastComposed, fastWarnings := normalizeClipsBeforeConcat(ctx, ffmpeg, outputDir,
+		[]composeClip{{SegmentID: "f1", Path: same1}, {SegmentID: "f2", Path: same2}}, cfg)
+	if fastPaths[0] != same1 || fastPaths[1] != same2 || fastComposed["f2"] != same2 || len(fastWarnings) != 0 {
+		t.Fatalf("参数一致时不应重编码: %v %v", fastPaths, fastWarnings)
+	}
+}
+
+// 拼接实测对账：参数齐的段走 -c copy 快路径，成片时长必须等于各段实测之和。
+func TestConcatVideoClipsKeepsDurationAccounting(t *testing.T) {
+	ffmpeg := bundledFFmpeg(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "output"), 0o755); err != nil {
+		t.Fatalf("创建输出目录失败: %v", err)
+	}
+	first := filepath.Join(dir, "c1.mp4")
+	second := filepath.Join(dir, "c2.mp4")
+	makeColorClip(t, ffmpeg, first, "red", 1)
+	makeColorClip(t, ffmpeg, second, "blue", 1)
+
+	merged := filepath.Join(dir, "output", "merged.mp4")
+	if err := concatVideoClips(ctx, []string{first, second}, merged); err != nil {
+		t.Fatalf("拼接失败: %v", err)
+	}
+	info, err := mediaProbe(ctx, merged)
+	if err != nil {
+		t.Fatalf("回读拼接结果失败: %v", err)
+	}
+	if info.Duration < 1.7 || info.Duration > 2.4 {
+		t.Fatalf("成片应约 2s（两段之和），实际 %.3fs", info.Duration)
 	}
 }
 

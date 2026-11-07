@@ -561,6 +561,8 @@ func normalizeScriptShots(shots []VideoShot, total float64) []VideoShot {
 }
 
 // applyPromptEdits 只改提示词与台词，并按语速预算重新校验。
+// 提示词是 Agent2 定稿、用户在关卡②确认过的最终版本：这里不再补主体约束，
+// 否则用户手动删掉或改写的句式会被程序悄悄加回来。
 func applyPromptEdits(prompts []VideoPromptItem, edits []VideoPromptEdit, cfg VideoRunConfig) {
 	index := make(map[string]int, len(prompts))
 	for i, prompt := range prompts {
@@ -571,7 +573,7 @@ func applyPromptEdits(prompts []VideoPromptItem, edits []VideoPromptEdit, cfg Vi
 		if !ok {
 			continue
 		}
-		prompts[i].VisualPrompt = appendCastDirective(strings.TrimSpace(edit.VisualPrompt))
+		prompts[i].VisualPrompt = strings.TrimSpace(edit.VisualPrompt)
 		prompts[i].Dialogue = strings.TrimSpace(edit.Dialogue)
 		// 台词归属：关卡里改了就按关卡，没改就保留原归属；台词被清空则归属也清空
 		if speaker := strings.TrimSpace(edit.Speaker); speaker != "" {
@@ -1095,8 +1097,11 @@ func (r *videoRunner) runRenderStage() (bool, error) {
 		}
 
 		outputPath := filepath.Join(workDir, "clips", fmt.Sprintf("%02d-%s.mp4", segment.Index+1, segment.ID))
+		// 提示词由 Agent2 定稿、用户在关卡②确认：渲染层只按定稿原样提交，
+		// 不再追加或改写主体约束，保证“看到的提示词就是发给视频模型的提示词”。
+		renderPrompt := composeRenderPrompt(segment, caps)
 		request := VideoGenRequest{
-			Prompt:           composeRenderPrompt(segment, caps),
+			Prompt:           renderPrompt,
 			FirstFrame:       firstFrame,
 			CharacterImages:  charImages,
 			StrictFirstFrame: cfg.strictFirstFrameEnabled(),

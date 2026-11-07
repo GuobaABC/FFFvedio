@@ -269,7 +269,7 @@ function cancel() {
         </div>
         <p v-if="draft.characters.length === 0" class="hint">
           不定义角色也可以：模板允许部分定义，主体由主题决定。添加后请同时给「定妆图 + 外观描述块」，不支持的模型会自动降级用文字。
-          外观描述请写成猫 / 狗 / 猪 / 鸡等动物主体（可拟人化穿衣、站立），避免真人特征描述。
+          外观描述可写成猫 / 狗 / 猪 / 鸡等动物主体（可拟人化穿衣、站立），也可写成中性描述；未提供参考图时按此兜底，使用者上传参考图时以图为准。
         </p>
         <div v-for="(character, index) in draft.characters" :key="index" class="character">
           <div class="grid grid--3">
