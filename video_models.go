@@ -15,26 +15,32 @@ import (
 // 视频生成流水线的阶段（与《视频生成工具·架构与最佳实践设计》§2 一致，
 // 并在合成之后接入 Agent4 发布元数据与 gate③）。
 // 人工确认关卡本身也是一个阶段，处于该阶段时任务状态为 waiting。
-// 字幕排在视频生成之后：先拿到真实片段（甚至已拼接的画布），再铺时间轴并让用户逐条调位置；
-// 确认后合成阶段只负责烧录，不再重排时间轴，否则用户的编辑会被覆盖。
+// 剪辑与字幕排在视频生成之后：先拿到真实片段，生成默认剪辑计划、预览画布与字幕时间轴，
+// 再让用户在同一页里调片段与字幕；确认后合成阶段只负责烧录，不再重排时间轴。
 const (
 	VideoStageDraftScript   = "DRAFT_SCRIPT"
 	VideoStageConfirmScript = "CONFIRM_SCRIPT"
 	VideoStageBuildPrompt   = "BUILD_PROMPT"
 	VideoStageConfirmPrompt = "CONFIRM_PROMPT"
 	VideoStageRender        = "RENDER_VIDEO"
-	VideoStageBuildSubs     = "BUILD_SUBS"
-	VideoStageConfirmSubs   = "CONFIRM_SUBS"
+	VideoStageBuildEdit     = "BUILD_EDIT"
+	VideoStageConfirmEdit   = "CONFIRM_EDIT"
 	VideoStageCompose       = "COMPOSE"
 	VideoStageBuildMeta     = "BUILD_PUBLISH_META"
 	VideoStageConfirmMeta   = "CONFIRM_META"
 	VideoStageDone          = "DONE"
 )
 
+// legacyVideoGateSubs v0.1.1 及更早版本的剪辑关卡键；读取任务时迁移到 VideoGateEdit。
+const legacyVideoGateSubs = "gate_subs"
+
 // legacyVideoStages 把历史任务里存过的旧阶段名映射到当前阶段名：
-// v0.0.5 之前提示词与字幕挤在同一阶段（BUILD_PROMPT_SUBS），现在拆成两段。
+// v0.0.5 之前提示词与字幕挤在同一阶段（BUILD_PROMPT_SUBS），现在拆成两段；
+// v0.1.2 把字幕阶段并入剪辑（BUILD_SUBS / CONFIRM_SUBS）。
 var legacyVideoStages = map[string]string{
 	"BUILD_PROMPT_SUBS": VideoStageBuildPrompt,
+	"BUILD_SUBS":        VideoStageBuildEdit,
+	"CONFIRM_SUBS":      VideoStageConfirmEdit,
 }
 
 func normalizeVideoStage(stage string) string {
@@ -54,11 +60,11 @@ const (
 	VideoStatusFailed  = "failed"
 )
 
-// 确认关卡：分镜 → 提示词 → 字幕 → 发布元数据（字幕关卡只在开了字幕时出现）
+// 确认关卡：分镜 → 提示词 → 剪辑与字幕 → 发布元数据（剪辑关卡始终出现，字幕可以关闭）
 const (
 	VideoGateScript = "gate1"
 	VideoGatePrompt = "gate2"
-	VideoGateSubs   = "gate_subs"
+	VideoGateEdit   = "gate_edit"
 	VideoGateMeta   = "gate3"
 )
 
@@ -159,7 +165,7 @@ type VideoRunConfig struct {
 	ContinuationMode string              `json:"continuationMode"` // none|last_frame|overlap
 	SpeechRate       float64             `json:"speechRate"`       // 字/秒 或 词/秒
 	Language         string              `json:"language"`
-	Subtitles        bool                `json:"subtitles"` // 是否生成并烧录字幕（默认关闭）
+	Subtitles        bool                `json:"subtitles"` // 是否生成并烧录字幕（0.1.2 起新任务默认开启）
 	SegmentReview    *bool               `json:"segmentReview"`
 	// StrictFirstFrame 严格首帧：本段有首帧（多为用户输入或从尾帧资产带入的那张图）时，
 	// 必须以「图生视频-首帧」任务提交、画面从这张图开始，不为角色参考图让位（nil 默认开启）。
@@ -312,6 +318,10 @@ type VideoSubtitleCue struct {
 	MarginVPct float64 `json:"marginVpct,omitempty"`
 	// FontSizePct 字号（画面高度百分比），≤0 表示沿用全局样式
 	FontSizePct float64 `json:"fontSizePct,omitempty"`
+	// SegmentID 自动生成的字幕归属片段；剪辑重排/裁剪时按它做段内重映射
+	SegmentID string `json:"segmentId,omitempty"`
+	// OffsetS 相对片段起点的偏移（秒），由保存时按当前剪辑计划重算
+	OffsetS float64 `json:"offsetS,omitempty"`
 }
 
 // VideoSubtitles 字幕产物（SRT + ASS）。
@@ -325,9 +335,42 @@ type VideoSubtitles struct {
 	TimingTableURL  string             `json:"timingTableUrl"`
 	TimingSource    string             `json:"timingSource"` // estimate|measured|tts|aligned
 	Cues            []VideoSubtitleCue `json:"cues"`
-	// Confirmed 用户在 CONFIRM_SUBS 里确认过时间轴与位置，合成时以它为准
+	// Confirmed 用户在 CONFIRM_EDIT 里确认过时间轴与位置，合成时以它为准
 	Confirmed bool   `json:"confirmed"`
 	EditedAt  string `json:"editedAt,omitempty"`
+}
+
+// VideoEditClip 剪辑计划里的一个片段：顺序、启停与入出点。
+// 顺序只在 none/overlap 续接模式下允许调整；last_frame 必须保持渲染顺序。
+type VideoEditClip struct {
+	SegmentID       string  `json:"segmentId"`
+	ShotID          string  `json:"shotId,omitempty"`
+	Order           int     `json:"order"`           // 0-based，越小越靠前
+	Enabled         bool    `json:"enabled"`         // false 表示该段不入片
+	InPoint         float64 `json:"inPoint"`         // 相对源片段起点，秒
+	OutPoint        float64 `json:"outPoint"`        // 相对源片段起点，秒；0 表示到片尾
+	SourceDurationS float64 `json:"sourceDurationS"` // 只读：probe 出来的源时长
+}
+
+// VideoEditPlan 用户可编辑的剪辑计划；Revision 只在片段顺序/启停/入出点变化时 +1。
+type VideoEditPlan struct {
+	Clips     []VideoEditClip `json:"clips"`
+	Revision  int             `json:"revision"`
+	UpdatedAt string          `json:"updatedAt"`
+}
+
+// VideoSubtitleIssue 字幕校验问题：error 级禁止确认合成，warning 只提示。
+type VideoSubtitleIssue struct {
+	Index   int    `json:"index"`
+	Level   string `json:"level"` // error|warning
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// VideoEditEdit 剪辑页保存/校验的整表提交：片段计划 + 字幕草稿。
+type VideoEditEdit struct {
+	Clips []VideoEditClip    `json:"clips"`
+	Cues  []VideoSubtitleCue `json:"cues"`
 }
 
 // VideoRender 单段渲染记录（可断点续跑）。
@@ -357,7 +400,7 @@ type VideoOutput struct {
 }
 
 // VideoComposePrep 合成前的剪辑预处理产物：选段 → 冻帧裁剪 → 拼接 → 画幅归一。
-// 字幕阶段（BUILD_SUBS）先把它算出来，字幕时间轴才能按真实成片测量；
+// BUILD_EDIT 先把它算出来，字幕时间轴才能按真实成片测量；
 // 合成阶段直接复用，避免二次裁切/二次拼接，也避免用户调好的字幕被重排。
 type VideoComposePrep struct {
 	MergedPath        string            `json:"mergedPath"` // 拼接后（未归一画幅）的素材
@@ -365,30 +408,34 @@ type VideoComposePrep struct {
 	CanvasUrl         string            `json:"canvasUrl"`  // 前端预览地址
 	CanvasWidth       int               `json:"canvasWidth"`
 	CanvasHeight      int               `json:"canvasHeight"`
-	ComposedBySegment map[string]string `json:"composedBySegment"` // 段 ID → 实际入片文件（冻帧裁剪后的）
-	SegmentIDs        []string          `json:"segmentIds"`        // 参与合成的段，用于判断缓存是否过期
+	ComposedBySegment map[string]string `json:"composedBySegment"` // 段 ID → 实际入片文件（裁剪后的）
+	SegmentIDs        []string          `json:"segmentIds"`        // 实际入片段顺序，用于判断缓存是否过期
+	EditRevision      int               `json:"editRevision"`      // 与 Edit.Revision 对齐；不等就重建
+	DurationS         float64           `json:"durationS"`         // 画布实测总时长，前端时间轴上限
 	HasFFmpeg         bool              `json:"hasFFmpeg"`
 	UpdatedAt         string            `json:"updatedAt"`
 }
 
 // VideoRunContext 贯穿全链路的 RunContext（§7）。
 type VideoRunContext struct {
-	Adapter              string            `json:"adapter"`
-	Script               *VideoScript      `json:"script"`
-	Prompts              []VideoPromptItem `json:"prompts"`
-	Plan                 *VideoPlan        `json:"plan"`
-	Subtitles            *VideoSubtitles   `json:"subtitles"`
-	Renders              []VideoRender     `json:"renders"`
-	Compose              *VideoComposePrep `json:"compose"`
-	Output               *VideoOutput      `json:"output"`
-	PublishMeta          *PublishMeta      `json:"publishMeta"`
-	Template             *VideoTemplateRun `json:"template"`      // 任务锁定的模板快照（可复现、可审计）
-	ConfigSources        map[string]string `json:"configSources"` // 每个字段的来源：template / override / default
-	Gates                map[string]string `json:"gates"`
-	Warnings             []string          `json:"warnings"`
-	Logs                 []string          `json:"logs"`
-	Feedback             string            `json:"feedback"`
-	ReviewPendingSegment string            `json:"reviewPendingSegment"` // 逐段确认关卡：等待用户确认的片段 ID
+	Adapter              string               `json:"adapter"`
+	Script               *VideoScript         `json:"script"`
+	Prompts              []VideoPromptItem    `json:"prompts"`
+	Plan                 *VideoPlan           `json:"plan"`
+	Edit                 *VideoEditPlan       `json:"edit,omitempty"`
+	Subtitles            *VideoSubtitles      `json:"subtitles"`
+	SubtitleIssues       []VideoSubtitleIssue `json:"subtitleIssues,omitempty"`
+	Renders              []VideoRender        `json:"renders"`
+	Compose              *VideoComposePrep    `json:"compose"`
+	Output               *VideoOutput         `json:"output"`
+	PublishMeta          *PublishMeta         `json:"publishMeta"`
+	Template             *VideoTemplateRun    `json:"template"`      // 任务锁定的模板快照（可复现、可审计）
+	ConfigSources        map[string]string    `json:"configSources"` // 每个字段的来源：template / override / default
+	Gates                map[string]string    `json:"gates"`
+	Warnings             []string             `json:"warnings"`
+	Logs                 []string             `json:"logs"`
+	Feedback             string               `json:"feedback"`
+	ReviewPendingSegment string               `json:"reviewPendingSegment"` // 逐段确认关卡：等待用户确认的片段 ID
 	// ReviewPendingPromptSegment 逐段确认的「生成前」关卡：下一段尚未消耗额度，等待用户确认提示词。
 	ReviewPendingPromptSegment string `json:"reviewPendingPromptSegment"`
 	// ApprovedSegmentPrompts 已确认过提示词、可以直接生成的片段 ID：
@@ -510,8 +557,13 @@ func ensureVideoGates(run *VideoRunContext) {
 	if _, ok := run.Gates[VideoGatePrompt]; !ok {
 		run.Gates[VideoGatePrompt] = videoGatePending
 	}
-	if _, ok := run.Gates[VideoGateSubs]; !ok {
-		run.Gates[VideoGateSubs] = videoGatePending
+	if _, ok := run.Gates[VideoGateEdit]; !ok {
+		// 旧任务的 gate_subs 状态迁移过来：已批准的剪辑/字幕不该因为改名又变回待确认
+		state := videoGatePending
+		if legacy, ok := run.Gates[legacyVideoGateSubs]; ok && strings.TrimSpace(legacy) != "" {
+			state = legacy
+		}
+		run.Gates[VideoGateEdit] = state
 	}
 	if _, ok := run.Gates[VideoGateMeta]; !ok {
 		run.Gates[VideoGateMeta] = videoGatePending
@@ -520,7 +572,7 @@ func ensureVideoGates(run *VideoRunContext) {
 
 func defaultVideoSubtitleStyle() VideoSubtitleStyle {
 	return VideoSubtitleStyle{
-		FontName:     "思源黑体",
+		FontName:     "Noto Sans SC",
 		FontSizePct:  4.2,
 		PrimaryColor: "#FFFFFF",
 		OutlineColor: "#000000",
@@ -677,7 +729,7 @@ func normalizeVideoConfig(cfg VideoRunConfig) (VideoRunConfig, []string, error) 
 	// 字幕样式
 	style := cfg.SubtitleStyle
 	if strings.TrimSpace(style.FontName) == "" {
-		style.FontName = "思源黑体"
+		style.FontName = "Noto Sans SC"
 	}
 	if style.FontSizePct <= 0 {
 		style.FontSizePct = 4.2
@@ -1251,10 +1303,11 @@ func buildVideoPlan(cfg VideoRunConfig, prompts []VideoPromptItem, caps VideoCap
 // 合成阶段会用片段真实时长来填它：模型经常把 5s 档位渲染成 5.04s，
 // 逐段累加后计划时间轴整体漂移，字幕就会和画面对不上。
 type SubtitleSpan struct {
+	SegmentID  string
 	Start      float64
 	Duration   float64
 	Text       string
-	FillWindow bool // 片段自带配音时语速由模型掌控，台词铺满整段而不是按字速估算
+	FillWindow bool // 片段自带配音时语速由模型掌控，只在声学对齐路径下允许铺满说话窗口
 }
 
 // plannedSubtitleSpans 把预算的分镜时间轴当作字幕窗口（无实测数据时的兜底）。
@@ -1262,9 +1315,10 @@ func plannedSubtitleSpans(plan VideoPlan) []SubtitleSpan {
 	spans := make([]SubtitleSpan, 0, len(plan.Segments))
 	for _, segment := range plan.Segments {
 		spans = append(spans, SubtitleSpan{
-			Start:    segment.Start,
-			Duration: segment.End - segment.Start,
-			Text:     segment.Dialogue,
+			SegmentID: segment.ID,
+			Start:     segment.Start,
+			Duration:  segment.End - segment.Start,
+			Text:      segment.Dialogue,
 		})
 	}
 	return spans
@@ -1278,45 +1332,211 @@ func buildSubtitleCues(plan VideoPlan, cfg VideoRunConfig) []VideoSubtitleCue {
 // subtitleCueMinS 单条字幕最短停留：更短的话人眼根本来不及读。
 const subtitleCueMinS = 0.4
 
-// normalizeSubtitleCues 字幕关卡提交的整表整理：去空行、夹取到成片范围内、重排序号。
-// 用户改时间就按用户的时间走（不重排到台词上），但越出成片或倒流的条目会被夹取并告警。
-func normalizeSubtitleCues(cues []VideoSubtitleCue, total float64) ([]VideoSubtitleCue, []string) {
-	warnings := make([]string, 0, 2)
-	if len(cues) > 200 {
-		cues = cues[:200]
-		warnings = append(warnings, "字幕最多 200 条，超出的部分已丢弃")
+// subtitleMaxCues 单次提交的字幕条数上限：0.1.2 从 200 提高到 1000，
+// 长视频/密集对白不再静默丢条；仍超过才截断并明确告警。
+const subtitleMaxCues = 1000
+
+// subtitleReadMaxUnits 每秒最多读多少字/词，超过只提醒不阻断。
+const subtitleReadMaxUnits = 8.0
+
+// normalizeSubtitleCues 字幕关卡提交的整表整理：去空行、消解重叠、夹取越界、重排序号。
+// 用户改时间就按用户的时间走（不重排到台词上）；无法保留的条目不静默处理，逐条返回问题。
+func normalizeSubtitleCues(cues []VideoSubtitleCue, total float64, cfg VideoRunConfig) ([]VideoSubtitleCue, []VideoSubtitleIssue) {
+	issues := make([]VideoSubtitleIssue, 0, 4)
+	if len(cues) > subtitleMaxCues {
+		cues = cues[:subtitleMaxCues]
+		issues = append(issues, VideoSubtitleIssue{Level: "warning", Code: "cue_limit",
+			Message: fmt.Sprintf("字幕最多 %d 条，超出的部分已丢弃", subtitleMaxCues)})
 	}
 	out := make([]VideoSubtitleCue, 0, len(cues))
-	for _, cue := range cues {
-		cue.Text = strings.TrimSpace(strings.ReplaceAll(cue.Text, "\r\n", "\n"))
-		if cue.Text == "" {
+	for position, cue := range cues {
+		index := cue.Index
+		if index <= 0 {
+			index = position + 1
+		}
+		text := strings.TrimSpace(strings.ReplaceAll(cue.Text, "\r\n", "\n"))
+		if text == "" {
+			issues = append(issues, VideoSubtitleIssue{Index: index, Level: "error", Code: "empty_text",
+				Message: fmt.Sprintf("第 %d 条字幕文本为空，已丢弃", index)})
 			continue
+		}
+		wrapped := wrapSubtitleText(text, cfg.Language)
+		if wrapped != text {
+			text = wrapped
+			issues = append(issues, VideoSubtitleIssue{Index: index, Level: "warning", Code: "wrapped",
+				Message: fmt.Sprintf("第 %d 条字幕过长，已自动换行", index)})
 		}
 		start := round2(math.Max(0, cue.Start))
 		end := round2(cue.End)
-		if end-start < subtitleCueMinS {
-			end = round2(start + subtitleCueMinS)
-		}
-		if total > 0 && start > total-subtitleCueMinS {
-			start = round2(math.Max(0, total-subtitleCueMinS))
-			end = round2(total)
-			warnings = append(warnings, fmt.Sprintf("有字幕的起始时间超出成片长度（%.1fs），已贴到片尾", total))
+		if total > 0 && start >= total {
+			issues = append(issues, VideoSubtitleIssue{Index: index, Level: "error", Code: "out_of_range",
+				Message: fmt.Sprintf("第 %d 条字幕起始时间 %.1fs 超出成片长度 %.1fs，已丢弃", index, start, total)})
+			continue
 		}
 		if total > 0 && end > total {
 			end = round2(total)
+			issues = append(issues, VideoSubtitleIssue{Index: index, Level: "warning", Code: "clamped_end",
+				Message: fmt.Sprintf("第 %d 条字幕结束时间超出成片长度，已夹到 %.1fs", index, total)})
+		}
+		if end-start < subtitleCueMinS {
+			end = round2(start + subtitleCueMinS)
+			if total > 0 && end > total {
+				end = round2(total)
+			}
+			if end-start < subtitleCueMinS {
+				issues = append(issues, VideoSubtitleIssue{Index: index, Level: "error", Code: "too_short",
+					Message: fmt.Sprintf("第 %d 条字幕无法满足最短 %.1fs，已丢弃", index, subtitleCueMinS)})
+				continue
+			}
+			issues = append(issues, VideoSubtitleIssue{Index: index, Level: "warning", Code: "extended",
+				Message: fmt.Sprintf("第 %d 条字幕过短，已延长到 %.1fs", index, subtitleCueMinS)})
 		}
 		if cue.Anchor < 1 || cue.Anchor > 9 {
 			cue.Anchor = 0
 		}
 		cue.MarginVPct = clampFloat(round2(cue.MarginVPct), 0, 90)
 		cue.FontSizePct = clampFloat(round2(cue.FontSizePct), 0, 30)
-		out = append(out, VideoSubtitleCue{Start: start, End: end, Text: cue.Text, Anchor: cue.Anchor, MarginVPct: cue.MarginVPct, FontSizePct: cue.FontSizePct})
+		out = append(out, VideoSubtitleCue{
+			Start: start, End: end, Text: text,
+			Anchor: cue.Anchor, MarginVPct: cue.MarginVPct, FontSizePct: cue.FontSizePct,
+			SegmentID: strings.TrimSpace(cue.SegmentID), OffsetS: round2(math.Max(0, cue.OffsetS)),
+		})
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Start < out[j].Start })
+
+	// 按起始时间排序后再消解重叠：用户拖动过的顺序才是最终时间顺序
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Start == out[j].Start {
+			return out[i].End < out[j].End
+		}
+		return out[i].Start < out[j].Start
+	})
+	for index := 1; index < len(out); index++ {
+		prev := &out[index-1]
+		current := &out[index]
+		if current.Start >= prev.End {
+			continue
+		}
+		// 优先收前一条的尾巴；收完不足最短停留就把后一条整体顺延
+		if nextEnd := round2(current.Start - 0.05); nextEnd-prev.Start >= subtitleCueMinS {
+			prev.End = nextEnd
+			continue
+		}
+		shifted := round2(prev.End + 0.05)
+		if total > 0 && shifted >= total {
+			shifted = round2(math.Max(prev.End, total-subtitleCueMinS))
+		}
+		current.Start = shifted
+		if current.End-current.Start < subtitleCueMinS {
+			current.End = round2(current.Start + subtitleCueMinS)
+			if total > 0 && current.End > total {
+				current.End = round2(total)
+			}
+		}
+		issues = append(issues, VideoSubtitleIssue{Index: index + 1, Level: "warning", Code: "overlap",
+			Message: fmt.Sprintf("第 %d 条与上一条重叠，已自动顺延", index+1)})
+	}
+	// 顺延可能把后段推出成片，最后统一夹取一次
+	if total > 0 {
+		filtered := out[:0]
+		for _, cue := range out {
+			if cue.Start >= total {
+				issues = append(issues, VideoSubtitleIssue{Index: cue.Index, Level: "error", Code: "out_of_range",
+					Message: fmt.Sprintf("第 %d 条字幕起始时间超出成片长度，已丢弃", cue.Index)})
+				continue
+			}
+			if cue.End > total {
+				cue.End = round2(total)
+			}
+			filtered = append(filtered, cue)
+		}
+		out = filtered
+	}
 	for index := range out {
 		out[index].Index = index + 1
 	}
-	return out, warnings
+	issues = append(issues, ValidateVideoSubtitles(out, total, cfg)...)
+	return out, dedupeSubtitleIssues(issues)
+}
+
+// ValidateVideoSubtitles 字幕规则校验：error 级禁止确认合成，warning 只提示。
+// 前端用同一套口径做实时校验，保存/确认时以后端结果为准。
+func ValidateVideoSubtitles(cues []VideoSubtitleCue, total float64, cfg VideoRunConfig) []VideoSubtitleIssue {
+	issues := make([]VideoSubtitleIssue, 0, 4)
+	if len(cues) > subtitleMaxCues {
+		issues = append(issues, VideoSubtitleIssue{Level: "warning", Code: "cue_limit",
+			Message: fmt.Sprintf("字幕条数 %d 超过上限 %d，将只保留前 %d 条", len(cues), subtitleMaxCues, subtitleMaxCues)})
+	}
+	limit := subtitleLineLimit(cfg.Language)
+	for position, cue := range cues {
+		index := cue.Index
+		if index <= 0 {
+			index = position + 1
+		}
+		text := strings.TrimSpace(cue.Text)
+		if text == "" {
+			issues = append(issues, VideoSubtitleIssue{Index: index, Level: "error", Code: "empty_text",
+				Message: fmt.Sprintf("第 %d 条字幕文本为空", index)})
+			continue
+		}
+		if cue.Start < 0 || (total > 0 && cue.Start >= total) {
+			issues = append(issues, VideoSubtitleIssue{Index: index, Level: "error", Code: "out_of_range",
+				Message: fmt.Sprintf("第 %d 条字幕起始时间越界", index)})
+		}
+		if total > 0 && cue.End > total+0.01 {
+			issues = append(issues, VideoSubtitleIssue{Index: index, Level: "error", Code: "out_of_range",
+				Message: fmt.Sprintf("第 %d 条字幕结束时间 %.1fs 超出成片长度 %.1fs", index, cue.End, total)})
+		}
+		if cue.End-cue.Start < subtitleCueMinS-0.001 {
+			issues = append(issues, VideoSubtitleIssue{Index: index, Level: "error", Code: "too_short",
+				Message: fmt.Sprintf("第 %d 条字幕短于 %.1fs", index, subtitleCueMinS)})
+		}
+		units := speechUnitCount(text, cfg.Language)
+		duration := cue.End - cue.Start
+		if duration > 0 && float64(units)/duration > subtitleReadMaxUnits {
+			issues = append(issues, VideoSubtitleIssue{Index: index, Level: "warning", Code: "reading_speed",
+				Message: fmt.Sprintf("第 %d 条字幕语速过快（%.1f 字/秒），建议拆分或延长", index, float64(units)/duration)})
+		}
+		for _, line := range strings.Split(text, "\n") {
+			if runeLen(strings.TrimSpace(line)) > limit {
+				issues = append(issues, VideoSubtitleIssue{Index: index, Level: "warning", Code: "line_too_long",
+					Message: fmt.Sprintf("第 %d 条字幕有单行超过 %d 字，建议换行", index, limit)})
+				break
+			}
+		}
+	}
+	if len(cues) > 0 && !subtitleFontAvailable(cfg.SubtitleStyle.FontName) {
+		issues = append(issues, VideoSubtitleIssue{Level: "warning", Code: "font_unavailable",
+			Message: fmt.Sprintf("字幕字体「%s」在本机可能不存在，建议改用内置 Noto Sans SC", firstNonEmpty(cfg.SubtitleStyle.FontName, "Noto Sans SC"))})
+	}
+	return dedupeSubtitleIssues(issues)
+}
+
+// dedupeSubtitleIssues 去掉重复的同一问题（规范化与校验会各报一次）。
+func dedupeSubtitleIssues(issues []VideoSubtitleIssue) []VideoSubtitleIssue {
+	if len(issues) < 2 {
+		return issues
+	}
+	out := make([]VideoSubtitleIssue, 0, len(issues))
+	seen := make(map[string]bool, len(issues))
+	for _, issue := range issues {
+		key := fmt.Sprintf("%d|%s|%s", issue.Index, issue.Level, issue.Code)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, issue)
+	}
+	return out
+}
+
+// hasSubtitleErrors 是否有阻止确认合成的错误级问题。
+func hasSubtitleErrors(issues []VideoSubtitleIssue) bool {
+	for _, issue := range issues {
+		if issue.Level == "error" {
+			return true
+		}
+	}
+	return false
 }
 
 // buildSubtitleCuesFromSpans 把台词铺进每一段的真实时间窗：
@@ -1344,13 +1564,11 @@ func appendEstimatedCues(cues []VideoSubtitleCue, cfg VideoRunConfig, span Subti
 		return cues
 	}
 	estimate := estimateSpeechSeconds(text, cfg.Language, cfg.SpeechRate)
-	// 台词比窗口短就按自然语速收尾（别在静音处挂着字幕），比窗口长就铺满整段
+	// 台词比窗口短就按自然语速收尾（别在静音处挂着字幕），比窗口长就铺满整段。
+	// FillWindow 只服务于声学对齐路径；估算路径短句不再被拉满整段。
 	spoken := math.Min(math.Max(estimate, 0.6), window)
-	if span.FillWindow {
-		spoken = window
-	}
 
-	parts := splitDialogueSentences(text)
+	parts := splitDialogueSentences(text, cfg.Language)
 	if len(parts) == 0 {
 		return cues
 	}
@@ -1389,12 +1607,25 @@ func appendEstimatedCues(cues []VideoSubtitleCue, cfg VideoRunConfig, span Subti
 		if index == len(parts)-1 {
 			display = bound
 		}
-		if display > cursor {
+		start := round2(cursor)
+		end := round2(display)
+		if end <= start {
+			// 窗口被压到极短时不丢条：并入上一条字幕（保持时间不倒退）
+			if len(cues) > 0 && cues[len(cues)-1].End >= start {
+				last := &cues[len(cues)-1]
+				last.Text = strings.TrimSpace(last.Text + "\n" + wrapSubtitleText(part, cfg.Language))
+				if end > last.End {
+					last.End = end
+				}
+			}
+		} else {
 			cues = append(cues, VideoSubtitleCue{
-				Index: len(cues) + 1,
-				Start: round2(cursor),
-				End:   round2(display),
-				Text:  wrapSubtitleText(part, cfg.Language),
+				Index:     len(cues) + 1,
+				Start:     start,
+				End:       end,
+				Text:      wrapSubtitleText(part, cfg.Language),
+				SegmentID: span.SegmentID,
+				OffsetS:   round2(start - span.Start),
 			})
 		}
 		cursor = bound
@@ -1403,8 +1634,12 @@ func appendEstimatedCues(cues []VideoSubtitleCue, cfg VideoRunConfig, span Subti
 }
 
 // splitDialogueSentences 按句末标点/换行把台词拆成字幕行，过短的碎片并回上一句，
-// 避免“嗯”“然后”这类词单独闪一条字幕。
-func splitDialogueSentences(text string) []string {
+// 避免“嗯”“然后”这类词单独闪一条字幕；单句超长时再按逗号/空格与长度二次切分，绝不丢尾。
+func splitDialogueSentences(text, lang string) []string {
+	text = strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
+	if text == "" {
+		return nil
+	}
 	ender := func(r rune) bool {
 		switch r {
 		case '。', '！', '？', '…', '；', '!', '?', ';', '\n', '\r':
@@ -1428,13 +1663,17 @@ func splitDialogueSentences(text string) []string {
 		raw = append(raw, tail)
 	}
 
-	parts := make([]string, 0, len(raw))
+	merged := make([]string, 0, len(raw))
 	for _, piece := range raw {
-		if len(piece) > 0 && len([]rune(piece)) < 4 && len(parts) > 0 {
-			parts[len(parts)-1] = parts[len(parts)-1] + "，" + piece
+		if len([]rune(piece)) < 4 && len(merged) > 0 {
+			merged[len(merged)-1] = merged[len(merged)-1] + "，" + piece
 			continue
 		}
-		parts = append(parts, piece)
+		merged = append(merged, piece)
+	}
+	parts := make([]string, 0, len(merged))
+	for _, piece := range merged {
+		parts = append(parts, splitLongSubtitlePart(piece, lang)...)
 	}
 	if len(parts) == 0 && strings.TrimSpace(text) != "" {
 		parts = append(parts, strings.TrimSpace(text))
@@ -1442,29 +1681,106 @@ func splitDialogueSentences(text string) []string {
 	return parts
 }
 
-// wrapSubtitleText 建议断行：中文每行 ≤18 字，英文每行 ≤42 字符。
-func wrapSubtitleText(text, lang string) string {
-	limit := 18
+// subtitleLineLimit 单行字数上限：中文 18 字、英文 42 字符。
+func subtitleLineLimit(lang string) int {
 	if isEnglishLanguage(lang) {
-		limit = 42
+		return 42
 	}
-	runes := []rune(strings.TrimSpace(text))
-	if len(runes) <= limit {
-		return string(runes)
+	return 18
+}
+
+// subtitleMaxLines 一条字幕最多显示三行；更长的句子会先拆成多条 cue。
+const subtitleMaxLines = 3
+
+// splitLongSubtitlePart 把一段可能很长的台词拆成若干条（每条 ≤3 行），保证所有字符都有归属。
+func splitLongSubtitlePart(part, lang string) []string {
+	part = strings.TrimSpace(part)
+	if part == "" {
+		return nil
 	}
-	lines := make([]string, 0, 3)
-	for len(runes) > 0 {
-		cut := limit
-		if len(runes) < cut {
-			cut = len(runes)
+	lines := subtitleLines(part, lang)
+	maxLines := subtitleLineLimit(lang) * subtitleMaxLines
+	if len([]rune(part)) <= maxLines {
+		return []string{strings.Join(lines, "\n")}
+	}
+	out := make([]string, 0, len(lines)/subtitleMaxLines+1)
+	for index := 0; index < len(lines); index += subtitleMaxLines {
+		end := index + subtitleMaxLines
+		if end > len(lines) {
+			end = len(lines)
 		}
-		lines = append(lines, string(runes[:cut]))
-		runes = runes[cut:]
-		if len(lines) == 2 {
-			break
+		out = append(out, strings.Join(lines[index:end], "\n"))
+	}
+	return out
+}
+
+// subtitleLines 把一段文本按语言习惯拆成视觉行：中文按字数，英文优先在空格处断行。
+func subtitleLines(text, lang string) []string {
+	limit := subtitleLineLimit(lang)
+	paragraphs := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	lines := make([]string, 0, 4)
+	for _, paragraph := range paragraphs {
+		paragraph = strings.TrimSpace(paragraph)
+		if paragraph == "" {
+			continue
+		}
+		if isEnglishLanguage(lang) {
+			lines = append(lines, wrapEnglishParagraph(paragraph, limit)...)
+			continue
+		}
+		runes := []rune(paragraph)
+		for len(runes) > limit {
+			lines = append(lines, string(runes[:limit]))
+			runes = runes[limit:]
+		}
+		if len(runes) > 0 {
+			lines = append(lines, string(runes))
 		}
 	}
-	return strings.Join(lines, "\n")
+	if len(lines) == 0 {
+		return []string{strings.TrimSpace(text)}
+	}
+	return lines
+}
+
+// wrapEnglishParagraph 英文按单词断行，单词本身超长时硬切，任何字符都不丢。
+func wrapEnglishParagraph(text string, limit int) []string {
+	words := strings.Fields(text)
+	lines := make([]string, 0, 2)
+	current := ""
+	for _, word := range words {
+		for len([]rune(word)) > limit {
+			if current != "" {
+				lines = append(lines, current)
+				current = ""
+			}
+			runes := []rune(word)
+			lines = append(lines, string(runes[:limit]))
+			word = string(runes[limit:])
+		}
+		if current == "" {
+			current = word
+			continue
+		}
+		if len([]rune(current))+1+len([]rune(word)) <= limit {
+			current += " " + word
+			continue
+		}
+		lines = append(lines, current)
+		current = word
+	}
+	if current != "" {
+		lines = append(lines, current)
+	}
+	if len(lines) == 0 {
+		lines = append(lines, text)
+	}
+	return lines
+}
+
+// wrapSubtitleText 建议断行：返回全部行，不再只保留前两行。
+func wrapSubtitleText(text, lang string) string {
+	return strings.Join(subtitleLines(text, lang), "\n")
 }
 
 // aspectResolution 与 ASS PlayRes 对应的基准分辨率（§6.3）。

@@ -11,10 +11,12 @@ import type {
   TailFrameAsset,
   VideoCharacter,
   VideoEnvironment,
+  VideoEditEdit,
   VideoGateEdits,
   VideoProject,
   VideoSegmentRegen,
   VideoSubtitleEdit,
+  VideoSubtitleIssue,
   VideoTask,
   VideoTaskInput,
 } from '../types/video'
@@ -45,6 +47,11 @@ interface AppBindings {
   RegenerateVideoMeta(id: string, platforms: string[], feedback: string): Promise<void>
   SaveVideoStageEdits(id: string, edits: VideoGateEdits): Promise<VideoTask>
   SaveVideoSubtitles(id: string, edit: VideoSubtitleEdit): Promise<VideoTask>
+  ValidateVideoEdit(id: string, edit: VideoEditEdit): Promise<VideoSubtitleIssue[]>
+  SaveVideoEdit(id: string, edit: VideoEditEdit): Promise<VideoTask>
+  ApplyVideoEdit(id: string): Promise<void>
+  RelayoutVideoSubtitles(id: string): Promise<void>
+  SetVideoSubtitlesEnabled(id: string, enabled: boolean): Promise<VideoTask>
   GetVideoEnvironment(): Promise<VideoEnvironment>
 
   /* 逐段确认关卡 + 尾帧资产 */
@@ -131,6 +138,14 @@ export const backend = {
     bindings().SaveVideoStageEdits(id, edits),
   saveVideoSubtitles: (id: string, edit: VideoSubtitleEdit): Promise<VideoTask> =>
     bindings().SaveVideoSubtitles(id, edit),
+  validateVideoEdit: (id: string, edit: VideoEditEdit): Promise<VideoSubtitleIssue[]> =>
+    bindings().ValidateVideoEdit(id, edit),
+  saveVideoEdit: (id: string, edit: VideoEditEdit): Promise<VideoTask> =>
+    bindings().SaveVideoEdit(id, edit),
+  applyVideoEdit: (id: string): Promise<void> => bindings().ApplyVideoEdit(id),
+  relayoutVideoSubtitles: (id: string): Promise<void> => bindings().RelayoutVideoSubtitles(id),
+  setVideoSubtitlesEnabled: (id: string, enabled: boolean): Promise<VideoTask> =>
+    bindings().SetVideoSubtitlesEnabled(id, enabled),
   getVideoEnvironment: (): Promise<VideoEnvironment> => bindings().GetVideoEnvironment(),
 
   approveVideoSegment: (id: string): Promise<void> => bindings().ApproveVideoSegment(id),

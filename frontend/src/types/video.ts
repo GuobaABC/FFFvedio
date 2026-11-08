@@ -8,8 +8,8 @@ export type VideoStage =
   | 'BUILD_PROMPT'
   | 'CONFIRM_PROMPT'
   | 'RENDER_VIDEO'
-  | 'BUILD_SUBS'
-  | 'CONFIRM_SUBS'
+  | 'BUILD_EDIT'
+  | 'CONFIRM_EDIT'
   | 'COMPOSE'
   | 'BUILD_PUBLISH_META'
   | 'CONFIRM_META'
@@ -208,6 +208,40 @@ export interface VideoSubtitleCue {
   marginVpct?: number
   /** 逐条字号（占画面高度百分比）；0 = 沿用全局样式 */
   fontSizePct?: number
+  /** 自动生成的字幕归属片段；剪辑重排/裁剪时按它做段内重映射 */
+  segmentId?: string
+  /** 相对片段起点的偏移（秒），保存时按当前剪辑计划重算 */
+  offsetS?: number
+}
+
+/** 剪辑计划里的一个片段：顺序、启停与入出点 */
+export interface VideoEditClip {
+  segmentId: string
+  shotId?: string
+  /** 0-based，越小越靠前 */
+  order: number
+  enabled: boolean
+  /** 相对源片段起点，秒 */
+  inPoint: number
+  /** 相对源片段起点，秒；0 表示到片尾 */
+  outPoint: number
+  /** 只读：probe 出来的源时长 */
+  sourceDurationS: number
+}
+
+/** 用户可编辑的剪辑计划；revision 只在顺序/启停/入出点变化时 +1 */
+export interface VideoEditPlan {
+  clips: VideoEditClip[]
+  revision: number
+  updatedAt?: string
+}
+
+/** 字幕校验问题：error 级禁止确认合成，warning 只提示 */
+export interface VideoSubtitleIssue {
+  index: number
+  level: 'error' | 'warning'
+  code: string
+  message: string
 }
 
 export interface VideoSubtitles {
@@ -236,6 +270,10 @@ export interface VideoComposePrep {
   canvasHeight: number
   composedBySegment: Record<string, string> | null
   segmentIds: string[] | null
+  /** 与剪辑计划 Revision 对齐；不等就说明画布已过期 */
+  editRevision: number
+  /** 画布实测总时长（秒），前端时间轴上限 */
+  durationS: number
   hasFFmpeg: boolean
   updatedAt: string
 }
@@ -269,9 +307,13 @@ export interface VideoRunContext {
   script: VideoScript | null
   prompts: VideoPromptItem[] | null
   plan: VideoPlan | null
+  /** 剪辑计划（BUILD_EDIT 自动生成，CONFIRM_EDIT 人工调整） */
+  edit?: VideoEditPlan | null
   subtitles: VideoSubtitles | null
+  /** 字幕校验问题：error 级禁止确认合成 */
+  subtitleIssues?: VideoSubtitleIssue[] | null
   renders: VideoRender[] | null
-  /** 合成前预处理缓存（字幕阶段算一次，合成阶段复用） */
+  /** 合成前预处理缓存（BUILD_EDIT 算一次，合成阶段复用） */
   compose: VideoComposePrep | null
   output: VideoOutput | null
   publishMeta: PublishMeta | null
@@ -327,6 +369,12 @@ export interface VideoPromptEdit {
 
 /** 字幕关卡的修改：提交完整的 cue 列表，增删都体现在列表里 */
 export interface VideoSubtitleEdit {
+  cues: VideoSubtitleCue[]
+}
+
+/** 剪辑页保存/校验的整表提交：片段计划 + 字幕草稿 */
+export interface VideoEditEdit {
+  clips: VideoEditClip[]
   cues: VideoSubtitleCue[]
 }
 
@@ -480,8 +528,8 @@ export const VIDEO_STAGES: { id: VideoStage; label: string; hint: string }[] = [
   { id: 'BUILD_PROMPT', label: '提示词', hint: 'Agent2 展开画面提示词' },
   { id: 'CONFIRM_PROMPT', label: '确认提示词', hint: '人工确认关卡 ②（成本拍板）' },
   { id: 'RENDER_VIDEO', label: '生成视频', hint: 'Agent3 适配器逐段生成' },
-  { id: 'BUILD_SUBS', label: '字幕生成', hint: '按真实片段铺字幕时间轴' },
-  { id: 'CONFIRM_SUBS', label: '确认字幕', hint: '人工确认关卡：逐条改时间/位置/字号' },
+  { id: 'BUILD_EDIT', label: '剪辑生成', hint: '生成默认剪辑计划、预览画布与字幕时间轴' },
+  { id: 'CONFIRM_EDIT', label: '剪辑与字幕', hint: '人工确认关卡：预览、裁剪、排序与调时间轴' },
   { id: 'COMPOSE', label: '合成成片', hint: 'ffmpeg 拼接 + 烧录字幕' },
   { id: 'BUILD_PUBLISH_META', label: '发布元数据', hint: 'Agent4 标题 / 标签 / 发布时段' },
   { id: 'CONFIRM_META', label: '确认发布', hint: '人工确认关卡 ③' },
@@ -494,8 +542,8 @@ export const STAGE_LABELS: Record<string, string> = {
   BUILD_PROMPT: '提示词',
   CONFIRM_PROMPT: '确认提示词',
   RENDER_VIDEO: '生成视频',
-  BUILD_SUBS: '字幕生成',
-  CONFIRM_SUBS: '确认字幕',
+  BUILD_EDIT: '剪辑生成',
+  CONFIRM_EDIT: '剪辑与字幕',
   COMPOSE: '合成成片',
   BUILD_PUBLISH_META: '发布元数据',
   CONFIRM_META: '确认发布',
@@ -562,7 +610,7 @@ export function createEmptyVideoConfig(): VideoRunConfig {
     continuationMode: 'last_frame',
     speechRate: 4,
     language: 'zh-CN',
-    subtitles: false,
+    subtitles: true,
     segmentReview: true,
     strictFirstFrame: true,
     keepLastFrame: false,
@@ -575,7 +623,7 @@ export function createEmptyVideoConfig(): VideoRunConfig {
       seed: 0,
     },
     subtitleStyle: {
-      fontName: '思源黑体',
+      fontName: 'Noto Sans SC',
       fontSizePct: 4.2,
       primaryColor: '#FFFFFF',
       outlineColor: '#000000',

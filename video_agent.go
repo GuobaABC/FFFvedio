@@ -481,6 +481,9 @@ func characterProfileLine(cfg VideoRunConfig, tpl *VideoTemplateRun, ref VideoCh
 	if strings.TrimSpace(profile.VoiceHint) != "" {
 		line += "｜声音：" + profile.VoiceHint
 	}
+	if detail := voiceProfileDetail(profile.VoiceProfile); detail != "" {
+		line += "｜音色参数：" + detail
+	}
 	return line
 }
 

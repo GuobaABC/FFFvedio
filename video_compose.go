@@ -169,6 +169,10 @@ func trimHeadFrames(ctx context.Context, ffmpeg, input, output string, count int
 type composeClip struct {
 	SegmentID string
 	Path      string
+	// SkipHeadFreeze 用户显式设了入点时，起点由用户定，不再自动删段头冻帧
+	SkipHeadFreeze bool
+	// SkipTailFreeze 用户显式设了出点时，终点由用户定，不再自动删段尾冻帧
+	SkipTailFreeze bool
 }
 
 // trimFrozenClipHeads 从第二段起逐接缝检测并裁掉冻帧重复帧，返回拼接清单、
@@ -190,6 +194,9 @@ func trimFrozenClipHeads(ctx context.Context, ffmpeg, workDir, outputDir string,
 	_ = os.RemoveAll(scanBase)
 	for index := 1; index < len(clips); index++ {
 		clip := clips[index]
+		if clip.SkipHeadFreeze {
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			warnings = append(warnings, "冻帧裁剪超时，剩余接缝按硬切拼接")
@@ -241,6 +248,25 @@ func trimFrozenClipHeads(ctx context.Context, ffmpeg, workDir, outputDir string,
 	}
 	_ = os.RemoveAll(scanBase)
 	return paths, composed, warnings
+}
+
+// trimClipRange 按用户入/出点裁剪源片段：输入侧 -ss 保证帧精确，音视频同步重编码。
+// 裁剪后文件再参与冻帧检测/拼接，字幕测时也以它为准。
+func trimClipRange(ctx context.Context, ffmpeg, input, output string, inPoint, outPoint float64) error {
+	if inPoint < 0 {
+		inPoint = 0
+	}
+	duration := outPoint - inPoint
+	if duration <= 0 {
+		return errors.New("裁剪区间无效")
+	}
+	return runCommand(ctx, ffmpeg,
+		"-y", "-ss", fmt.Sprintf("%.5f", inPoint), "-i", input,
+		"-t", fmt.Sprintf("%.5f", duration),
+		"-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+		"-c:a", "aac", "-movflags", "+faststart",
+		output,
+	)
 }
 
 /* ---------------- 段尾冻帧裁剪：档位夹取多出的空窗常被模型用静止帧收尾填充 ---------------- */
@@ -333,6 +359,9 @@ func trimFrozenClipTails(ctx context.Context, ffmpeg, outputDir string, clips []
 	scanBase := filepath.Join(outputDir, "tail-scan")
 	_ = os.RemoveAll(scanBase)
 	for index, clip := range clips {
+		if clip.SkipTailFreeze {
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			warnings = append(warnings, "段尾冻帧裁剪超时，剩余片段按原样入片")
@@ -377,11 +406,31 @@ func syncPlanWithComposedDurations(ctx context.Context, run *VideoRunContext, co
 	if run == nil || run.Plan == nil || len(run.Plan.Segments) == 0 || len(composedBySegment) == 0 {
 		return nil
 	}
-	cursor, changed := 0.0, false
+	// 时间轴顺序以剪辑计划为准；Plan.Segments 数组顺序保持不动，断点续跑与单段重渲仍按原顺序
+	order := make([]string, 0, len(run.Plan.Segments))
+	if run.Edit != nil && len(run.Edit.Clips) > 0 {
+		for _, clip := range orderedEditClips(run.Edit.Clips) {
+			if clip.Enabled {
+				order = append(order, clip.SegmentID)
+			}
+		}
+	} else {
+		for _, segment := range run.Plan.Segments {
+			order = append(order, segment.ID)
+		}
+	}
+	byID := make(map[string]*VideoSegment, len(run.Plan.Segments))
 	for index := range run.Plan.Segments {
-		segment := &run.Plan.Segments[index]
+		byID[run.Plan.Segments[index].ID] = &run.Plan.Segments[index]
+	}
+	cursor, changed := 0.0, false
+	for _, segmentID := range order {
+		segment, ok := byID[segmentID]
+		if !ok {
+			continue
+		}
 		duration := segment.End - segment.Start
-		if path, ok := composedBySegment[segment.ID]; ok && fileExists(path) {
+		if path, ok := composedBySegment[segmentID]; ok && fileExists(path) {
 			if info, err := mediaProbe(ctx, path); err == nil && info.Duration > 0 {
 				if math.Abs(info.Duration-duration) >= 0.05 {
 					changed = true
@@ -389,9 +438,15 @@ func syncPlanWithComposedDurations(ctx context.Context, run *VideoRunContext, co
 				duration = info.Duration
 			}
 		}
+		if math.Abs(segment.Start-cursor) >= 0.01 {
+			changed = true
+		}
 		segment.Start = round2(cursor)
 		segment.End = round2(cursor + duration)
 		cursor += duration
+	}
+	if math.Abs(run.Plan.TotalS-cursor) >= 0.01 {
+		changed = true
 	}
 	if !changed {
 		return nil
@@ -722,6 +777,370 @@ func parseFFmpegMetadata(text string) mediaInfo {
 	return info
 }
 
+// minEditClipS 一个片段裁剪后至少保留的时长；再短就没有可看的画面。
+const minEditClipS = 0.25
+
+// renderBySegment 索引成功且文件仍在的渲染结果。
+func renderBySegment(run *VideoRunContext) map[string]VideoRender {
+	out := make(map[string]VideoRender, len(run.Renders))
+	for _, render := range run.Renders {
+		if render.Status == "succeeded" && fileExists(render.VideoURI) {
+			out[render.SegmentID] = render
+		}
+	}
+	return out
+}
+
+// orderedEditClips 按 Order 排序的剪辑片段副本；Order 相同的保持原顺序。
+func orderedEditClips(clips []VideoEditClip) []VideoEditClip {
+	out := make([]VideoEditClip, len(clips))
+	copy(out, clips)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Order < out[j].Order })
+	return out
+}
+
+// clipWindow 把入出点规范成 [in, out) 窗口；OutPoint≤0 或超出源时长视为到片尾。
+func clipWindow(clip VideoEditClip, sourceDuration float64) (in, out float64, ok bool) {
+	if sourceDuration <= 0 {
+		return 0, 0, false
+	}
+	in = clampFloat(round2(clip.InPoint), 0, math.Max(0, sourceDuration-minEditClipS))
+	out = round2(clip.OutPoint)
+	if out <= 0 || out > sourceDuration {
+		out = round2(sourceDuration)
+	}
+	if out-in < minEditClipS {
+		return in, out, false
+	}
+	return in, out, true
+}
+
+// sourceDurationOf 取片段源时长：优先 clip 里已 probe 的值，缺失时现场 probe/退回渲染记录。
+func sourceDurationOf(ctx context.Context, clip VideoEditClip, render VideoRender) float64 {
+	if clip.SourceDurationS > 0 {
+		return round2(clip.SourceDurationS)
+	}
+	if info, err := mediaProbe(ctx, render.VideoURI); err == nil && info.Duration > 0 {
+		return round2(info.Duration)
+	}
+	if render.DurationS > 0 {
+		return round2(render.DurationS)
+	}
+	return 0
+}
+
+// normalizeVideoEditClips 校验并规范化剪辑计划：片段必须仍可读、入出点合法、无重复。
+// last_frame 续接模式下顺序必须与渲染顺序一致，防止破坏尾帧衔接。
+func normalizeVideoEditClips(ctx context.Context, cfg VideoRunConfig, run *VideoRunContext, clips []VideoEditClip, strictOrder bool) ([]VideoEditClip, []string, error) {
+	warnings := make([]string, 0, 2)
+	if len(clips) == 0 {
+		return nil, warnings, errors.New("剪辑计划为空，至少保留一个片段")
+	}
+	renders := renderBySegment(run)
+	ordered := orderedEditClips(clips)
+	seen := make(map[string]bool, len(ordered))
+	out := make([]VideoEditClip, 0, len(ordered))
+	for _, clip := range ordered {
+		segmentID := strings.TrimSpace(clip.SegmentID)
+		if segmentID == "" {
+			return nil, warnings, errors.New("剪辑片段缺少 segmentId")
+		}
+		if seen[segmentID] {
+			return nil, warnings, fmt.Errorf("片段 %s 重复出现", segmentID)
+		}
+		seen[segmentID] = true
+		render, ok := renders[segmentID]
+		if !ok {
+			return nil, warnings, fmt.Errorf("片段 %s 没有可用的渲染文件，请先重新生成该段", segmentID)
+		}
+		source := sourceDurationOf(ctx, clip, render)
+		inPoint, outPoint, ok := clipWindow(clip, source)
+		if !ok {
+			return nil, warnings, fmt.Errorf("片段 %s 的入/出点无效（入点 %.2fs，出点 %.2fs，源时长 %.2fs）", segmentID, clip.InPoint, clip.OutPoint, source)
+		}
+		if clip.OutPoint > 0 && math.Abs(clip.OutPoint-source) > 0.05 && clip.OutPoint < source {
+			// 用户显式设了出点：保留，但清空依赖自动裁剪的缓存
+			warnings = append(warnings, fmt.Sprintf("片段 %s 已按出点 %.2fs 截断", segmentID, outPoint))
+		}
+		out = append(out, VideoEditClip{
+			SegmentID:       segmentID,
+			ShotID:          strings.TrimSpace(clip.ShotID),
+			Order:           len(out),
+			Enabled:         clip.Enabled,
+			InPoint:         round2(inPoint),
+			OutPoint:        round2(outPoint),
+			SourceDurationS: round2(source),
+		})
+	}
+	if strictOrder {
+		current := make([]string, 0, len(renders))
+		for _, render := range run.Renders {
+			if render.Status == "succeeded" && fileExists(render.VideoURI) {
+				current = append(current, render.SegmentID)
+			}
+		}
+		submitted := make([]string, 0, len(out))
+		for _, clip := range out {
+			submitted = append(submitted, clip.SegmentID)
+		}
+		if strings.Join(current, "|") != strings.Join(submitted, "|") {
+			return nil, warnings, errors.New("尾帧延续模式下不支持调整片段顺序；如需排序请把续接方式改为硬切或重叠帧")
+		}
+		// 禁用中间片段会打断上一段尾帧与下一段首帧的衔接：允许，但必须明确提示
+		for index, clip := range out {
+			if clip.Enabled || index == 0 || index == len(out)-1 {
+				continue
+			}
+			warnings = append(warnings, fmt.Sprintf("片段 %s 已禁用：会打断上一段尾帧与下一段首帧的画面衔接", clip.SegmentID))
+		}
+	}
+	return out, warnings, nil
+}
+
+// videoEditChanged 判断两份剪辑计划是否有实质变化（顺序/启停/入出点）。
+func videoEditChanged(old, next *VideoEditPlan) bool {
+	if old == nil || next == nil {
+		return old != next
+	}
+	if len(old.Clips) != len(next.Clips) {
+		return true
+	}
+	compare := func(a, b []VideoEditClip) (string, bool) {
+		aOrdered, bOrdered := orderedEditClips(a), orderedEditClips(b)
+		for index := range aOrdered {
+			left, right := aOrdered[index], bOrdered[index]
+			if left.SegmentID != right.SegmentID || left.Enabled != right.Enabled {
+				return left.SegmentID, true
+			}
+			if math.Abs(left.InPoint-right.InPoint) >= 0.01 || math.Abs(left.OutPoint-right.OutPoint) >= 0.01 {
+				return left.SegmentID, true
+			}
+		}
+		return "", false
+	}
+	_, changed := compare(old.Clips, next.Clips)
+	return changed
+}
+
+// buildDefaultVideoEditPlan 用成功渲染结果生成默认剪辑计划：渲染顺序、启用、整段保留。
+func buildDefaultVideoEditPlan(ctx context.Context, run *VideoRunContext) (*VideoEditPlan, []string, error) {
+	renders := renderBySegment(run)
+	order := make([]string, 0, len(renders))
+	if run.Plan != nil {
+		for _, segment := range run.Plan.Segments {
+			if _, ok := renders[segment.ID]; ok {
+				order = append(order, segment.ID)
+			}
+		}
+	}
+	// 计划里没有的（旧任务/临时补渲）按渲染顺序补在后面
+	for _, render := range run.Renders {
+		if _, ok := renders[render.SegmentID]; !ok {
+			continue
+		}
+		found := false
+		for _, id := range order {
+			if id == render.SegmentID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			order = append(order, render.SegmentID)
+		}
+	}
+	if len(order) == 0 {
+		return nil, nil, errors.New("没有成功且文件可读的视频片段，无法进入剪辑")
+	}
+	warnings := make([]string, 0, 1)
+	clips := make([]VideoEditClip, 0, len(order))
+	for index, segmentID := range order {
+		render := renders[segmentID]
+		duration := sourceDurationOf(ctx, VideoEditClip{SegmentID: segmentID}, render)
+		if duration <= 0 {
+			warnings = append(warnings, fmt.Sprintf("片段 %s 读不到时长，按渲染记录 %.1fs 处理", segmentID, render.DurationS))
+			duration = render.DurationS
+		}
+		clips = append(clips, VideoEditClip{
+			SegmentID:       segmentID,
+			ShotID:          render.ShotID,
+			Order:           index,
+			Enabled:         true,
+			InPoint:         0,
+			OutPoint:        round2(duration),
+			SourceDurationS: round2(duration),
+		})
+	}
+	return &VideoEditPlan{Clips: clips, Revision: 0, UpdatedAt: time.Now().Format(time.RFC3339)}, warnings, nil
+}
+
+// editSubtitleSpans 按剪辑计划顺序与入出点生成字幕时间窗。
+// 已有同版本画布时用实际入片文件测时；否则按源片段与入出点计算。
+func editSubtitleSpans(ctx context.Context, run *VideoRunContext) ([]SubtitleSpan, map[string]SubtitleSpan, error) {
+	spans := make([]SubtitleSpan, 0, len(run.Edit.Clips))
+	bySegment := make(map[string]SubtitleSpan, len(run.Edit.Clips))
+	renders := renderBySegment(run)
+	textBySegment := make(map[string]string)
+	if run.Plan != nil {
+		for _, segment := range run.Plan.Segments {
+			textBySegment[segment.ID] = segment.Dialogue
+		}
+	}
+	useComposed := run.Compose != nil && run.Compose.EditRevision == run.Edit.Revision
+	offset := 0.0
+	for _, clip := range orderedEditClips(run.Edit.Clips) {
+		if !clip.Enabled {
+			continue
+		}
+		render, ok := renders[clip.SegmentID]
+		if !ok {
+			continue
+		}
+		duration := 0.0
+		if useComposed {
+			if path, ok := run.Compose.ComposedBySegment[clip.SegmentID]; ok && fileExists(path) {
+				if info, err := mediaProbe(ctx, path); err == nil && info.Duration > 0 {
+					duration = info.Duration
+				}
+			}
+		}
+		if duration <= 0 {
+			in, out, ok := clipWindow(clip, sourceDurationOf(ctx, clip, render))
+			if !ok {
+				continue
+			}
+			duration = out - in
+		}
+		hasAudio := false
+		if probePath := firstNonEmpty(composedPath(run, clip.SegmentID), render.VideoURI); probePath != "" {
+			if info, err := mediaProbe(ctx, probePath); err == nil {
+				hasAudio = info.HasAudio
+			}
+		}
+		span := SubtitleSpan{
+			SegmentID:  clip.SegmentID,
+			Start:      round2(offset),
+			Duration:   round2(duration),
+			Text:       textBySegment[clip.SegmentID],
+			FillWindow: hasAudio,
+		}
+		spans = append(spans, span)
+		bySegment[clip.SegmentID] = span
+		offset += duration
+	}
+	if len(spans) == 0 {
+		return nil, nil, errors.New("剪辑计划里没有启用的片段")
+	}
+	return spans, bySegment, nil
+}
+
+// composedPath 取当前版本画布里的入片文件；版本不一致时返回空。
+func composedPath(run *VideoRunContext, segmentID string) string {
+	if run == nil || run.Compose == nil {
+		return ""
+	}
+	if run.Edit != nil && run.Compose.EditRevision != run.Edit.Revision {
+		return ""
+	}
+	return run.Compose.ComposedBySegment[segmentID]
+}
+
+// composeEditClips 把剪辑计划翻译成待拼接片段：按入出点裁剪，标出需要跳过冻帧检测的一侧。
+func composeEditClips(ctx context.Context, ffmpeg, outputDir string, run *VideoRunContext) ([]composeClip, []string, error) {
+	if run.Edit == nil || len(run.Edit.Clips) == 0 {
+		return nil, nil, errors.New("缺少剪辑计划")
+	}
+	renders := renderBySegment(run)
+	clips := make([]composeClip, 0, len(run.Edit.Clips))
+	warnings := make([]string, 0, 1)
+	for _, editClip := range orderedEditClips(run.Edit.Clips) {
+		if !editClip.Enabled {
+			continue
+		}
+		render, ok := renders[editClip.SegmentID]
+		if !ok {
+			continue
+		}
+		source := sourceDurationOf(ctx, editClip, render)
+		in, out, ok := clipWindow(editClip, source)
+		if !ok {
+			return nil, warnings, fmt.Errorf("片段 %s 的入/出点无效", editClip.SegmentID)
+		}
+		trimmed := in > 0.01 || out < source-0.01
+		path := render.VideoURI
+		if trimmed {
+			cut := filepath.Join(outputDir, fmt.Sprintf("cut-%s.mp4", editClip.SegmentID))
+			if err := trimClipRange(ctx, ffmpeg, render.VideoURI, cut, in, out); err != nil {
+				return nil, warnings, fmt.Errorf("裁剪片段 %s 失败: %w", editClip.SegmentID, err)
+			}
+			path = cut
+		}
+		clips = append(clips, composeClip{
+			SegmentID:      editClip.SegmentID,
+			Path:           path,
+			SkipHeadFreeze: in > 0.01,
+			SkipTailFreeze: out < source-0.01,
+		})
+	}
+	if len(clips) == 0 {
+		return nil, warnings, errors.New("至少保留一个启用的片段")
+	}
+	return clips, warnings, nil
+}
+
+// relayoutSubtitleCues 剪辑变化后重映射字幕：有 SegmentID 的按段内 OffsetS 跟随片段移动，
+// 被禁用/删除的段其字幕一并移除；没有 SegmentID 的旧字幕按绝对时间保留，越界逐条告警。
+func relayoutSubtitleCues(cues []VideoSubtitleCue, oldSpans, newSpans map[string]SubtitleSpan, total float64, cfg VideoRunConfig) ([]VideoSubtitleCue, []string) {
+	warnings := make([]string, 0, 2)
+	out := make([]VideoSubtitleCue, 0, len(cues))
+	for position, cue := range cues {
+		index := cue.Index
+		if index <= 0 {
+			index = position + 1
+		}
+		segmentID := strings.TrimSpace(cue.SegmentID)
+		if segmentID == "" {
+			// 旧数据：按绝对时间保留，越界交给 normalize 逐条处理
+			out = append(out, cue)
+			continue
+		}
+		newSpan, ok := newSpans[segmentID]
+		if !ok || newSpan.Duration < subtitleCueMinS {
+			warnings = append(warnings, fmt.Sprintf("第 %d 条字幕所属片段已禁用或移除，字幕一并移除", index))
+			continue
+		}
+		offset := cue.OffsetS
+		if oldSpan, ok := oldSpans[segmentID]; ok {
+			offset = cue.Start - oldSpan.Start
+		}
+		maxOffset := math.Max(0, newSpan.Duration-subtitleCueMinS)
+		offset = clampFloat(round2(offset), 0, maxOffset)
+		start := round2(newSpan.Start + offset)
+		duration := cue.End - cue.Start
+		end := round2(start + duration)
+		if limit := round2(newSpan.Start + newSpan.Duration); end > limit {
+			end = limit
+		}
+		if end-start < subtitleCueMinS {
+			end = round2(math.Min(start+subtitleCueMinS, newSpan.Start+newSpan.Duration))
+		}
+		if end-start < subtitleCueMinS {
+			warnings = append(warnings, fmt.Sprintf("第 %d 条字幕在片段 %s 内放不下，已移除", index, segmentID))
+			continue
+		}
+		cue.Start, cue.End = start, end
+		cue.OffsetS = round2(offset)
+		out = append(out, cue)
+	}
+	normalized, issues := normalizeSubtitleCues(out, total, cfg)
+	for _, issue := range issues {
+		if issue.Level == "error" {
+			warnings = append(warnings, issue.Message)
+		}
+	}
+	return normalized, warnings
+}
+
 // measuredSubtitleSpans 用片段真实时长重排字幕时间轴。
 // 拼接是硬切，第 N 段的起点就是它之前所有已入选片段实际时长之和；
 // 沿用计划时长会逐段累计偏移，到后半段字幕就和对白错开了。
@@ -927,7 +1346,7 @@ func alignSubtitleCues(cfg VideoRunConfig, spans []SubtitleSpan, windows []speec
 			cues = appendEstimatedCues(cues, cfg, span)
 			continue
 		}
-		parts := splitDialogueSentences(text)
+		parts := splitDialogueSentences(text, cfg.Language)
 		if len(parts) == 0 {
 			continue
 		}
@@ -963,11 +1382,14 @@ func alignSubtitleCues(cfg VideoRunConfig, spans []SubtitleSpan, windows []speec
 				display = endLocal // 末句吃掉取整误差，避免字幕提前消失
 			}
 			if display > startLocal {
+				start := round2(span.Start + startLocal)
 				cues = append(cues, VideoSubtitleCue{
-					Index: len(cues) + 1,
-					Start: round2(span.Start + startLocal),
-					End:   round2(span.Start + display),
-					Text:  wrapSubtitleText(part, cfg.Language),
+					Index:     len(cues) + 1,
+					Start:     start,
+					End:       round2(span.Start + display),
+					Text:      wrapSubtitleText(part, cfg.Language),
+					SegmentID: span.SegmentID,
+					OffsetS:   round2(start - span.Start),
 				})
 			}
 			cursor += slots[index]
@@ -1089,18 +1511,27 @@ func escapeFilterPath(path string) string {
 }
 
 // burnSubtitles 烧录字幕必须重编码（不能 -c:v copy），音频原样保留。
-func burnSubtitles(ctx context.Context, ffmpeg, input, assPath, output string) error {
+func burnSubtitles(ctx context.Context, ffmpeg, input, assPath, output, fontDir string) error {
 	if assPath == "" || !fileExists(assPath) {
 		return errors.New("缺少 ASS 字幕文件")
 	}
 	return runCommand(ctx, ffmpeg,
 		"-y", "-i", input,
-		"-vf", "ass="+escapeFilterPath(assPath),
+		"-vf", assFilter(assPath, fontDir),
 		"-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p",
 		"-c:a", "copy",
 		"-movflags", "+faststart",
 		output,
 	)
+}
+
+// assFilter 拼接 ass 滤镜；fontDir 非空时指到内置字体目录，跨机器不依赖系统安装。
+func assFilter(assPath, fontDir string) string {
+	filter := "ass=" + escapeFilterPath(assPath)
+	if strings.TrimSpace(fontDir) != "" {
+		filter += ":fontsdir=" + escapeFilterPath(fontDir)
+	}
+	return filter
 }
 
 // hexToASSColor ASS 颜色是 &HAABBGGRR（不是 #RRGGBB），AA=00 表示不透明。
@@ -1143,12 +1574,28 @@ func assTime(seconds float64) string {
 	return fmt.Sprintf("%d:%02d:%02d.%02d", hour, min, sec, cs)
 }
 
+// assEscapeText 把用户文本转成 ASS 安全文本：{} 与反斜杠映射成全角等价字符，
+// 换行按行拆开再用 \N 连接。顺序必须是「先按行拆、再逐行转义」，否则 \N 会被二次处理。
+func assEscapeText(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	lines := strings.Split(text, "\n")
+	for index, line := range lines {
+		line = strings.ReplaceAll(line, `\`, "＼")
+		line = strings.ReplaceAll(line, "{", "｛")
+		line = strings.ReplaceAll(line, "}", "｝")
+		lines[index] = line
+	}
+	return strings.Join(lines, `\N`)
+}
+
+// renderSRT 文本保持原文，只替换会破坏 SRT 结构的箭头。
 func renderSRT(cues []VideoSubtitleCue) string {
 	var builder strings.Builder
 	for index, cue := range cues {
+		text := strings.ReplaceAll(cue.Text, "-->", "→")
 		builder.WriteString(fmt.Sprintf("%d\n", index+1))
 		builder.WriteString(fmt.Sprintf("%s --> %s\n", srtTime(cue.Start), srtTime(cue.End)))
-		builder.WriteString(cue.Text)
+		builder.WriteString(text)
 		builder.WriteString("\n\n")
 	}
 	return builder.String()
@@ -1181,7 +1628,7 @@ func renderASS(cues []VideoSubtitleCue, cfg VideoRunConfig, width, height int) s
 	builder.WriteString("[Events]\n")
 	builder.WriteString("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
 	for _, cue := range cues {
-		text := strings.ReplaceAll(cue.Text, "\n", `\N`)
+		text := assEscapeText(cue.Text)
 		// 逐条位置：没写锚点就沿用全局样式；写了就用 Dialogue 的 MarginV 字段推到底部/顶部对应距离
 		cueMarginV := marginV
 		overrides := ""
@@ -1278,7 +1725,15 @@ func finalizeVideo(ctx context.Context, ffmpeg, input, output string, run *Video
 		return false, false, warnings
 	}
 
-	if err := renderFinalWithAssets(ctx, ffmpeg, input, output, assPath, overlayPath, bgmPath); err == nil {
+	fontDir := ""
+	if assPath != "" {
+		fontDir = bundledFontDir()
+		if fontDir == "" {
+			warnings = append(warnings, "内置字幕字体解压失败，已退回系统字体；若出现方块/缺字请检查工作目录权限")
+		}
+	}
+
+	if err := renderFinalWithAssets(ctx, ffmpeg, input, output, assPath, overlayPath, bgmPath, fontDir); err == nil {
 		return true, assPath != "", warnings
 	} else {
 		warnings = append(warnings, "字幕/模板资产一次渲染失败，已降级为逐项处理: "+err.Error())
@@ -1286,7 +1741,7 @@ func finalizeVideo(ctx context.Context, ffmpeg, input, output string, run *Video
 
 	// 降级一：只烧字幕（模板资产放弃，但成片仍可交付）
 	if assPath != "" {
-		if err := burnSubtitles(ctx, ffmpeg, input, assPath, output); err == nil {
+		if err := burnSubtitles(ctx, ffmpeg, input, assPath, output, fontDir); err == nil {
 			return true, true, warnings
 		}
 		warnings = append(warnings, "字幕烧录失败，将输出无字幕成片")
@@ -1310,7 +1765,7 @@ func templateAssetFiles(tpl *VideoTemplateRun, warnings *[]string) (overlayPath,
 }
 
 // renderFinalWithAssets 单次 ffmpeg 完成：烧字幕 + 右下角水印 + BGM 混音（BGM 循环至成片时长）。
-func renderFinalWithAssets(ctx context.Context, ffmpeg, input, output, assPath, overlayPath, bgmPath string) error {
+func renderFinalWithAssets(ctx context.Context, ffmpeg, input, output, assPath, overlayPath, bgmPath, fontDir string) error {
 	args := []string{"-y", "-i", input}
 	nextInput := 1
 	overlayIndex := -1
@@ -1329,7 +1784,7 @@ func renderFinalWithAssets(ctx context.Context, ffmpeg, input, output, assPath, 
 	filters := make([]string, 0, 6)
 	last := "[0:v]"
 	if assPath != "" {
-		filters = append(filters, last+"ass="+escapeFilterPath(assPath)+"[vsub]")
+		filters = append(filters, last+assFilter(assPath, fontDir)+"[vsub]")
 		last = "[vsub]"
 	}
 	if overlayIndex >= 0 {
@@ -1362,14 +1817,21 @@ func renderFinalWithAssets(ctx context.Context, ffmpeg, input, output, assPath, 
 	return runCommand(ctx, ffmpeg, args...)
 }
 
-// composeVideo 合成阶段（§6）：拼接 → 混流 → 烧录字幕 → 成片。
 // composePrepUsable 判断缓存的预处理产物是否还能用：画布与每个入片文件都必须存在，
-// 且段集合与当前成功片段一致（重渲过某段就得重新拼）。
-func composePrepUsable(prep *VideoComposePrep, renders []VideoRender) bool {
+// 剪辑版本一致，且入片段集合与当前启用的剪辑计划一致（重渲/改入出点就得重新拼）。
+func composePrepUsable(prep *VideoComposePrep, run *VideoRunContext) bool {
 	if prep == nil || !prep.HasFFmpeg || prep.CanvasPath == "" || len(prep.ComposedBySegment) == 0 {
 		return false
 	}
 	if !fileExists(prep.CanvasPath) {
+		return false
+	}
+	revision := editRevisionOf(run)
+	if prep.EditRevision != revision {
+		return false
+	}
+	// 新版本字段：有剪辑计划时必须知道画布时长，否则前端时间轴没有上限
+	if run != nil && run.Edit != nil && prep.DurationS <= 0 {
 		return false
 	}
 	for _, path := range prep.ComposedBySegment {
@@ -1377,21 +1839,42 @@ func composePrepUsable(prep *VideoComposePrep, renders []VideoRender) bool {
 			return false
 		}
 	}
-	current := make(map[string]bool, len(renders))
-	for _, render := range renders {
-		if render.Status == "succeeded" && fileExists(render.VideoURI) {
-			current[render.SegmentID] = true
+	expected := make(map[string]bool, len(prep.ComposedBySegment))
+	if run != nil && run.Edit != nil && len(run.Edit.Clips) > 0 {
+		renders := renderBySegment(run)
+		for _, clip := range run.Edit.Clips {
+			if !clip.Enabled {
+				continue
+			}
+			if _, ok := renders[clip.SegmentID]; !ok {
+				continue
+			}
+			expected[clip.SegmentID] = true
+		}
+	} else if run != nil {
+		for _, render := range run.Renders {
+			if render.Status == "succeeded" && fileExists(render.VideoURI) {
+				expected[render.SegmentID] = true
+			}
 		}
 	}
-	if len(current) != len(prep.ComposedBySegment) {
+	if len(expected) != len(prep.ComposedBySegment) {
 		return false
 	}
-	for id := range current {
+	for id := range expected {
 		if _, ok := prep.ComposedBySegment[id]; !ok {
 			return false
 		}
 	}
 	return true
+}
+
+// editRevisionOf 剪辑计划版本号；没有 Edit 的旧任务按 0 处理。
+func editRevisionOf(run *VideoRunContext) int {
+	if run != nil && run.Edit != nil {
+		return run.Edit.Revision
+	}
+	return 0
 }
 
 // prepareComposeCanvas 合成前的剪辑预处理：选段 → 冻帧裁剪 → 拼接 → 画幅归一。
@@ -1405,17 +1888,30 @@ func prepareComposeCanvas(ctx context.Context, workDir, taskID string, cfg Video
 	}
 
 	selected := make([]composeClip, 0, len(run.Renders))
-	for _, render := range run.Renders {
-		if render.Status == "succeeded" && fileExists(render.VideoURI) {
-			selected = append(selected, composeClip{SegmentID: render.SegmentID, Path: render.VideoURI})
+	var selectionWarnings []string
+	ffmpeg, hasFFmpeg := ffmpegPath()
+	if run.Edit != nil && len(run.Edit.Clips) > 0 {
+		clips, editWarnings, err := composeEditClips(ctx, ffmpeg, outputDir, run)
+		selectionWarnings = append(selectionWarnings, editWarnings...)
+		if err != nil {
+			return nil, append(warnings, selectionWarnings...), err
+		}
+		selected = clips
+	} else {
+		for _, render := range run.Renders {
+			if render.Status == "succeeded" && fileExists(render.VideoURI) {
+				selected = append(selected, composeClip{SegmentID: render.SegmentID, Path: render.VideoURI})
+			}
 		}
 	}
+	warnings = append(warnings, selectionWarnings...)
 	if len(selected) == 0 {
 		return nil, warnings, errors.New("没有可合成的视频片段")
 	}
 	prep := &VideoComposePrep{
 		ComposedBySegment: make(map[string]string, len(selected)),
 		SegmentIDs:        make([]string, 0, len(selected)),
+		EditRevision:      editRevisionOf(run),
 		UpdatedAt:         time.Now().Format(time.RFC3339),
 	}
 	clips := make([]string, 0, len(selected))
@@ -1425,7 +1921,6 @@ func prepareComposeCanvas(ctx context.Context, workDir, taskID string, cfg Video
 		prep.SegmentIDs = append(prep.SegmentIDs, clip.SegmentID)
 	}
 
-	ffmpeg, hasFFmpeg := ffmpegPath()
 	if !hasFFmpeg {
 		prep.MergedPath = clips[0]
 		prep.CanvasPath = clips[0]
@@ -1515,6 +2010,17 @@ func prepareComposeCanvas(ctx context.Context, workDir, taskID string, cfg Video
 	prep.CanvasPath = canvas
 	prep.CanvasWidth = canvasWidth
 	prep.CanvasHeight = canvasHeight
+	if info, err := mediaProbe(ctx, canvas); err == nil && info.Duration > 0 {
+		prep.DurationS = round2(info.Duration)
+	} else {
+		total := 0.0
+		for _, clip := range selected {
+			if info, probeErr := mediaProbe(ctx, clip.Path); probeErr == nil && info.Duration > 0 {
+				total += info.Duration
+			}
+		}
+		prep.DurationS = round2(total)
+	}
 	if rel := relativeUnderWorkDir(workDir, canvas); rel != "" {
 		prep.CanvasUrl = videoMediaURL(taskID, rel)
 	}
@@ -1529,7 +2035,13 @@ func measureSubtitleCues(ctx context.Context, workDir string, cfg VideoRunConfig
 	if run.Compose != nil {
 		composed = run.Compose.ComposedBySegment
 	}
-	spans, spanErr := measuredSubtitleSpans(ctx, run.Plan, run.Renders, composed)
+	var spans []SubtitleSpan
+	var spanErr error
+	if run.Edit != nil && len(run.Edit.Clips) > 0 {
+		spans, _, spanErr = editSubtitleSpans(ctx, run)
+	} else {
+		spans, spanErr = measuredSubtitleSpans(ctx, run.Plan, run.Renders, composed)
+	}
 	if spanErr != nil {
 		if run.Plan == nil {
 			return nil, "", "", append(warnings, "生成字幕时间轴失败: "+spanErr.Error())
@@ -1564,9 +2076,10 @@ func composeVideo(ctx context.Context, workDir, taskID string, cfg VideoRunConfi
 	warnings := make([]string, 0, 3)
 	output := VideoOutput{FinishedAt: time.Now().Format(time.RFC3339)}
 
-	// 预处理（选段/裁剪/拼接/画幅）优先复用字幕阶段已经算好的结果，避免二次重编码
+	// 预处理（选段/裁剪/拼接/画幅）优先复用剪辑确认时已经算好的结果，避免二次重编码
 	prep := run.Compose
-	if !composePrepUsable(prep, run.Renders) {
+	recomposed := false
+	if !composePrepUsable(prep, run) {
 		built, prepWarnings, err := prepareComposeCanvas(ctx, workDir, taskID, cfg, run)
 		warnings = append(warnings, prepWarnings...)
 		if err != nil {
@@ -1574,6 +2087,7 @@ func composeVideo(ctx context.Context, workDir, taskID string, cfg VideoRunConfi
 		}
 		prep = built
 		run.Compose = prep
+		recomposed = true
 	}
 	if !prep.HasFFmpeg {
 		output.MergedPath = prep.MergedPath
@@ -1587,8 +2101,20 @@ func composeVideo(ctx context.Context, workDir, taskID string, cfg VideoRunConfi
 	if cfg.Subtitles {
 		subtitleWidth, subtitleHeight := subtitleCanvasSize(cfg, prep)
 		if run.Subtitles != nil && run.Subtitles.Confirmed {
-			// 用户在字幕关卡确认过：时间轴与位置以用户为准（包括删成 0 条），这里只按最终画布重写文件
-			subtitles, err := writeSubtitleFiles(workDir, taskID, cfg, run.Subtitles.Cues,
+			// 用户在剪辑关卡确认过：时间轴与位置以用户为准（包括删成 0 条）。
+			// 如果画布因剪辑版本变化刚被重建，先把 cue 按新时间轴重映射，避免烧到旧时间点。
+			cues := run.Subtitles.Cues
+			if recomposed && run.Edit != nil {
+				_, spans, spanErr := editSubtitleSpans(ctx, run)
+				if spanErr != nil {
+					warnings = append(warnings, "字幕按新剪辑重映射失败，沿用原时间轴: "+spanErr.Error())
+				} else {
+					relaid, notes := relayoutSubtitleCues(cues, nil, spans, composeTotalS(ctx, cfg, prep), cfg)
+					warnings = append(warnings, notes...)
+					cues = relaid
+				}
+			}
+			subtitles, err := writeSubtitleFiles(workDir, taskID, cfg, cues,
 				firstNonEmpty(run.Subtitles.TimingSource, "measured"), "", subtitleWidth, subtitleHeight)
 			if err != nil {
 				warnings = append(warnings, "生成字幕文件失败: "+err.Error())

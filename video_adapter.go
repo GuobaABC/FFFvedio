@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -428,10 +429,61 @@ func dialoguePromptBlock(cfg VideoRunConfig, lines []VideoDialogueLine, caps Vid
 			unit = "词"
 		}
 		b.WriteString(fmt.Sprintf("\n语速约 %.1f %s/秒，按台词长度均匀读完，不要拖长停顿。", rate, unit))
+		// 音色只写给支持原生音频的模型：同一角色全片用同一副嗓子。
+		for _, speaker := range speakers {
+			if speaker == VideoSpeakerNarration {
+				continue
+			}
+			if voice := speakerVoiceHint(cfg, speaker); voice != "" {
+				b.WriteString(fmt.Sprintf("\n%s 的音色：%s（同一角色全片保持一致，不要中途换音色）。",
+					speakerLabel(cfg, speaker), voice))
+			}
+		}
 	} else {
 		b.WriteString("\n台词内容由后期字幕与配音承载，画面内不出现任何文字。")
 	}
 	return b.String()
+}
+
+// speakerVoiceHint 汇总某个说话人的音色线索：自然语言描述 + 结构化音色参数。
+// 音色只用于提示词，不接外部 TTS，也不产生额外费用；未配置时返回空串。
+func speakerVoiceHint(cfg VideoRunConfig, role string) string {
+	ref := videoCharacterByRole(cfg, role)
+	if ref == nil {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if hint := strings.TrimSpace(ref.VoiceHint); hint != "" {
+		parts = append(parts, hint)
+	}
+	if detail := voiceProfileDetail(ref.VoiceProfile); detail != "" {
+		parts = append(parts, detail)
+	}
+	return strings.Join(parts, "；")
+}
+
+// voiceProfileDetail 把结构化音色档案转成可直接写进提示词的中文短句。
+func voiceProfileDetail(profile *VideoVoiceProfile) string {
+	if profile == nil {
+		return ""
+	}
+	parts := make([]string, 0, 5)
+	if id := strings.TrimSpace(profile.VoiceID); id != "" {
+		parts = append(parts, "音色标识 "+id)
+	}
+	if profile.Rate > 0 && math.Abs(profile.Rate-1) >= 0.01 {
+		parts = append(parts, fmt.Sprintf("语速 %.2fx", profile.Rate))
+	}
+	if math.Abs(profile.Pitch) >= 0.01 {
+		parts = append(parts, fmt.Sprintf("音高 %+.1f 半音", profile.Pitch))
+	}
+	if profile.Volume > 0 && math.Abs(profile.Volume-1) >= 0.01 {
+		parts = append(parts, fmt.Sprintf("音量 %.2f", profile.Volume))
+	}
+	if emotion := strings.TrimSpace(profile.Emotion); emotion != "" {
+		parts = append(parts, "情绪 "+emotion)
+	}
+	return strings.Join(parts, "，")
 }
 
 /* ------------------------------ 本地联调适配器 ------------------------------ */

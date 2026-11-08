@@ -20,7 +20,7 @@ func (a *App) RunVideoTask(id string) error {
 		return errors.New("任务正在执行，请稍候")
 	}
 	switch task.Stage {
-	case VideoStageConfirmScript, VideoStageConfirmPrompt, VideoStageConfirmSubs, VideoStageConfirmMeta:
+	case VideoStageConfirmScript, VideoStageConfirmPrompt, VideoStageConfirmEdit, VideoStageConfirmMeta:
 		return errors.New("当前处于人工确认关卡，请先确认或重新生成")
 	case VideoStageDone:
 		return errors.New("任务已完成；如需重做请使用「重新生成」")
@@ -72,8 +72,8 @@ func (a *App) ApproveVideoGate(id string) error {
 	case VideoStageConfirmPrompt:
 		// 提示词确认后就烧额度出片：字幕排在视频之后，拿真实片段铺轴才对得上画面
 		next = VideoStageRender
-	case VideoStageConfirmSubs:
-		// 字幕确认后合成只负责烧录：把用户调好的时间轴钉成最终版，不再回测重排
+	case VideoStageConfirmEdit:
+		// 剪辑确认后合成只负责按最终计划重建画布并烧录：时间轴以用户的设置为准，不再回测重排
 		ensureVideoGates(&task.Run)
 		if task.Run.Subtitles != nil {
 			task.Run.Subtitles.Confirmed = true
@@ -81,8 +81,8 @@ func (a *App) ApproveVideoGate(id string) error {
 				task.Run.Subtitles.EditedAt = time.Now().Format(time.RFC3339)
 			}
 		}
-		task.Run.Gates[VideoGateSubs] = videoGateApproved
-		task.Run.Logs = append(task.Run.Logs, stageLog("字幕已确认，合成阶段按这份时间轴烧录"))
+		task.Run.Gates[VideoGateEdit] = videoGateApproved
+		task.Run.Logs = append(task.Run.Logs, stageLog("剪辑与字幕已确认，合成阶段按这份时间轴烧录"))
 		task.UpdatedAt = time.Now().Format(time.RFC3339)
 		if err := a.updateVideoTaskRecord(task); err != nil {
 			return err
@@ -113,19 +113,22 @@ func (a *App) RegenerateVideoStage(id, feedback string) error {
 	}
 
 	from := task.Stage
+	discardEdit := false
 	switch task.Stage {
 	case VideoStageConfirmScript:
 		from = VideoStageDraftScript
 	case VideoStageConfirmPrompt:
 		from = VideoStageBuildPrompt
-	case VideoStageConfirmSubs:
-		from = VideoStageBuildSubs
+	case VideoStageConfirmEdit:
+		// 「丢弃草稿并重新生成」：连同画布缓存一起清掉，BUILD_EDIT 才会重算默认计划
+		from = VideoStageBuildEdit
+		discardEdit = true
 	case VideoStageRender, VideoStageCompose, VideoStageDone:
 		from = VideoStageRender
 	case VideoStageConfirmMeta:
 		// gate③ 重生成只回 Agent4，不动视频
 		from = VideoStageBuildMeta
-	case VideoStageDraftScript, VideoStageBuildPrompt, VideoStageBuildSubs, VideoStageBuildMeta:
+	case VideoStageDraftScript, VideoStageBuildPrompt, VideoStageBuildEdit, VideoStageBuildMeta:
 		// 保持当前阶段
 	default:
 		from = VideoStageDraftScript
@@ -133,6 +136,21 @@ func (a *App) RegenerateVideoStage(id, feedback string) error {
 
 	if !a.beginVideoRun(id) {
 		return errors.New("任务正在执行，请稍候")
+	}
+	if discardEdit {
+		// 先落库再起协程：runVideoPipeline 会重新读库，读不到清理结果就白丢了草稿
+		task.Run.Edit = nil
+		task.Run.Compose = nil
+		task.Run.Subtitles = nil
+		task.Run.SubtitleIssues = nil
+		ensureVideoGates(&task.Run)
+		task.Run.Gates[VideoGateEdit] = videoGatePending
+		task.Run.Logs = append(task.Run.Logs, stageLog("已丢弃剪辑草稿，按现有视频重新生成默认剪辑计划与字幕"))
+		task.UpdatedAt = time.Now().Format(time.RFC3339)
+		if err := a.updateVideoTaskRecord(task); err != nil {
+			a.endVideoRun(id)
+			return err
+		}
 	}
 	go func() {
 		defer a.endVideoRun(id)
@@ -564,6 +582,8 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		task.Run.Prompts = nil
 		task.Run.Plan = nil
 		task.Run.Subtitles = nil
+		task.Run.SubtitleIssues = nil
+		task.Run.Edit = nil
 		task.Run.Renders = nil
 		task.Run.Output = nil
 		task.Run.Compose = nil
@@ -602,6 +622,8 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 
 		// 字幕在视频生成之后才铺轴：这里只作废旧字幕
 		task.Run.Subtitles = nil
+		task.Run.SubtitleIssues = nil
+		task.Run.Edit = nil
 		task.Run.Compose = nil
 
 		// 提示词/台词改动 → 渲染 + 合成失效，字幕等视频出来后重生
@@ -634,7 +656,7 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		task.Error = ""
 		task.Run.Logs = append(task.Run.Logs, stageLog("发布元数据已修改，等待确认"))
 
-	case VideoStageConfirmSubs:
+	case VideoStageConfirmEdit:
 		if edits.Subtitles == nil {
 			return task, errors.New("没有提交字幕修改")
 		}
@@ -644,7 +666,7 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		if err := a.applySubtitleEdits(&task, edits.Subtitles.Cues); err != nil {
 			return task, err
 		}
-		task.Run.Gates[VideoGateSubs] = videoGatePending
+		task.Run.Gates[VideoGateEdit] = videoGatePending
 		task.Status = VideoStatusWaiting
 		task.Error = ""
 
@@ -673,30 +695,26 @@ func (a *App) applySubtitleEdits(task *VideoTask, cues []VideoSubtitleCue) error
 		return err
 	}
 	prep := task.Run.Compose
-	// 上限拿成片真实时长：字幕不能铺到画布之外，测不到时退回任务目标时长
-	total := 0.0
-	if prep != nil && prep.CanvasPath != "" && fileExists(prep.CanvasPath) {
-		probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if info, probeErr := mediaProbe(probeCtx, prep.CanvasPath); probeErr == nil {
-			total = info.Duration
-		}
-		cancel()
-	}
+	total := composeTotalS(context.Background(), task.Config, prep)
 	if total <= 0 {
 		total = float64(task.Config.DurationS)
 	}
 
-	normalized, notes := normalizeSubtitleCues(cues, total)
-	for _, note := range notes {
+	normalized, issues := normalizeSubtitleCues(cues, total, task.Config)
+	task.Run.SubtitleIssues = issues
+	for _, issue := range issues {
+		if issue.Level != "error" {
+			continue
+		}
 		duplicate := false
 		for _, existing := range task.Run.Warnings {
-			if existing == note {
+			if existing == issue.Message {
 				duplicate = true
 				break
 			}
 		}
 		if !duplicate {
-			task.Run.Warnings = append(task.Run.Warnings, note)
+			task.Run.Warnings = append(task.Run.Warnings, issue.Message)
 		}
 	}
 
@@ -716,7 +734,372 @@ func (a *App) applySubtitleEdits(task *VideoTask, cues []VideoSubtitleCue) error
 	return nil
 }
 
-// applyPublishEdits 只改文案与选定时段，平台字数与数量上限仍按档位夹取。
+// ValidateVideoEdit 实时校验剪辑草稿：不写库，返回字幕问题；片段本身不合法直接返回错误。
+func (a *App) ValidateVideoEdit(id string, edit VideoEditEdit) ([]VideoSubtitleIssue, error) {
+	task, err := a.videoTaskByID(id)
+	if err != nil {
+		return nil, err
+	}
+	return a.validateVideoEditPayload(context.Background(), &task, edit)
+}
+
+func (a *App) validateVideoEditPayload(ctx context.Context, task *VideoTask, edit VideoEditEdit) ([]VideoSubtitleIssue, error) {
+	clips, _, err := normalizeVideoEditClips(ctx, task.Config, &task.Run, edit.Clips,
+		task.Config.ContinuationMode == "last_frame")
+	if err != nil {
+		return nil, err
+	}
+	candidate := &VideoEditPlan{Clips: clips}
+	if task.Run.Edit != nil {
+		candidate.Revision = task.Run.Edit.Revision
+		if videoEditChanged(task.Run.Edit, candidate) {
+			candidate.Revision++
+		}
+	} else if len(clips) > 0 {
+		candidate.Revision = 1
+	}
+	probe := *task
+	runCopy := task.Run
+	runCopy.Edit = candidate
+	probe.Run = runCopy
+	total := float64(task.Config.DurationS)
+	if spans, _, spanErr := editSubtitleSpans(ctx, &runCopy); spanErr == nil && len(spans) > 0 {
+		last := spans[len(spans)-1]
+		total = round2(last.Start + last.Duration)
+	}
+	cues := edit.Cues
+	if cues == nil && task.Run.Subtitles != nil {
+		cues = task.Run.Subtitles.Cues
+	}
+	_, issues := normalizeSubtitleCues(cues, total, task.Config)
+	return issues, nil
+}
+
+// SaveVideoEdit 保存剪辑计划与字幕草稿：只写库、跑校验，不重建预览、不标记已确认。
+// 片段顺序/启停/入出点变化时 Revision+1；last_frame 下改变片段顺序直接拒绝。
+func (a *App) SaveVideoEdit(id string, edit VideoEditEdit) (VideoTask, error) {
+	task, err := a.videoTaskByID(id)
+	if err != nil {
+		return task, err
+	}
+	if a.isVideoTaskRunning(id) {
+		return task, errors.New("任务正在执行，无法保存修改")
+	}
+	if task.Stage != VideoStageConfirmEdit {
+		return task, errors.New("仅可在剪辑确认关卡保存剪辑")
+	}
+	if len(edit.Clips) == 0 {
+		return task, errors.New("剪辑计划为空，至少保留一个片段")
+	}
+
+	// 先把 cue 的段内偏移按「旧剪辑 + 当前画布」算好，再换新计划
+	oldSpans := map[string]SubtitleSpan{}
+	if task.Run.Edit != nil {
+		if spans, bySegment, spanErr := editSubtitleSpans(context.Background(), &task.Run); spanErr == nil {
+			_ = spans
+			oldSpans = bySegment
+		}
+	}
+	cues := make([]VideoSubtitleCue, len(edit.Cues))
+	copy(cues, edit.Cues)
+	for index := range cues {
+		segmentID := strings.TrimSpace(cues[index].SegmentID)
+		if segmentID == "" {
+			continue
+		}
+		if span, ok := oldSpans[segmentID]; ok {
+			cues[index].OffsetS = round2(math.Max(0, cues[index].Start-span.Start))
+		}
+	}
+
+	clips, clipWarnings, err := normalizeVideoEditClips(context.Background(), task.Config, &task.Run, edit.Clips,
+		task.Config.ContinuationMode == "last_frame")
+	if err != nil {
+		return task, err
+	}
+	nextEdit := &VideoEditPlan{Clips: clips, UpdatedAt: time.Now().Format(time.RFC3339)}
+	if task.Run.Edit != nil {
+		nextEdit.Revision = task.Run.Edit.Revision
+		if videoEditChanged(task.Run.Edit, nextEdit) {
+			nextEdit.Revision++
+		}
+	} else {
+		nextEdit.Revision = 1
+	}
+	task.Run.Edit = nextEdit
+
+	total := float64(task.Config.DurationS)
+	if spans, _, spanErr := editSubtitleSpans(context.Background(), &task.Run); spanErr == nil && len(spans) > 0 {
+		last := spans[len(spans)-1]
+		total = round2(last.Start + last.Duration)
+	}
+	normalized, issues := normalizeSubtitleCues(cues, total, task.Config)
+	task.Run.SubtitleIssues = issues
+	if hasSubtitleErrors(issues) {
+		messages := make([]string, 0, 3)
+		for _, issue := range issues {
+			if issue.Level != "error" {
+				continue
+			}
+			messages = append(messages, issue.Message)
+			if len(messages) >= 3 {
+				break
+			}
+		}
+		return task, errors.New("字幕存在错误，未保存：" + strings.Join(messages, "；"))
+	}
+
+	workDir, err := a.ensureTaskWorkDir(task.ID)
+	if err != nil {
+		return task, err
+	}
+	width, height := subtitleCanvasSize(task.Config, task.Run.Compose)
+	timingSource := "measured"
+	editedAt := ""
+	if task.Run.Subtitles != nil {
+		timingSource = firstNonEmpty(task.Run.Subtitles.TimingSource, "measured")
+		editedAt = task.Run.Subtitles.EditedAt
+	}
+	subtitles, err := writeSubtitleFiles(workDir, task.ID, task.Config, normalized, timingSource, "", width, height)
+	if err != nil {
+		return task, fmt.Errorf("写入字幕草稿失败: %w", err)
+	}
+	subtitles.EditedAt = editedAt
+	task.Run.Subtitles = subtitles
+	for _, warning := range clipWarnings {
+		task.Run.Warnings = append(task.Run.Warnings, warning)
+	}
+	task.Run.Gates[VideoGateEdit] = videoGatePending
+	task.Status = VideoStatusWaiting
+	task.Error = ""
+	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	if err := a.updateVideoTaskRecord(task); err != nil {
+		return task, err
+	}
+	task.Run.Logs = append(task.Run.Logs, stageLog(fmt.Sprintf("剪辑草稿已保存：%d 个片段、%d 条字幕（尚未应用与确认）",
+		len(nextEdit.Clips), len(normalized))))
+	return task, nil
+}
+
+// ApplyVideoEdit 异步应用剪辑：重建预览画布、按新时间轴重映射字幕，完成后回剪辑页。
+func (a *App) ApplyVideoEdit(id string) error {
+	task, err := a.videoTaskByID(id)
+	if err != nil {
+		return err
+	}
+	if a.isVideoTaskRunning(id) {
+		return errors.New("任务正在执行，请稍候")
+	}
+	if task.Stage != VideoStageConfirmEdit {
+		return errors.New("仅可在剪辑确认关卡应用剪辑")
+	}
+	if task.Run.Edit == nil || len(task.Run.Edit.Clips) == 0 {
+		return errors.New("缺少剪辑计划，请先保存草稿")
+	}
+	if !a.beginVideoRun(id) {
+		return errors.New("任务正在执行，请稍候")
+	}
+	go func() {
+		defer a.endVideoRun(id)
+		a.runApplyVideoEdit(id)
+	}()
+	return nil
+}
+
+// runApplyVideoEdit 执行 ApplyVideoEdit：期间任务处于 BUILD_EDIT/running；失败也回剪辑页并留下原因。
+func (a *App) runApplyVideoEdit(id string) {
+	task, err := a.videoTaskByID(id)
+	if err != nil {
+		return
+	}
+	task.Stage = VideoStageBuildEdit
+	task.Status = VideoStatusRunning
+	task.Error = ""
+	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	runner := &videoRunner{app: a, task: &task, ctx: withUsageTask(context.Background(), id), feedbackStage: VideoStageBuildEdit}
+	runner.logf("开始应用剪辑计划…")
+	_ = runner.save()
+
+	if applyErr := runner.runApplyEditStage(); applyErr != nil {
+		runner.warn("应用剪辑失败，已保留原预览：%v", applyErr)
+	}
+	runner.task.Stage = VideoStageConfirmEdit
+	runner.task.Status = VideoStatusWaiting
+	runner.task.Run.Gates[VideoGateEdit] = videoGatePending
+	_ = runner.save()
+}
+
+// RelayoutVideoSubtitles 按当前剪辑与画布重新测时、声学对齐并覆盖字幕（会丢弃手工修改）。
+func (a *App) RelayoutVideoSubtitles(id string) error {
+	task, err := a.videoTaskByID(id)
+	if err != nil {
+		return err
+	}
+	if a.isVideoTaskRunning(id) {
+		return errors.New("任务正在执行，请稍候")
+	}
+	if task.Stage != VideoStageConfirmEdit {
+		return errors.New("仅可在剪辑确认关卡重铺字幕")
+	}
+	if !a.beginVideoRun(id) {
+		return errors.New("任务正在执行，请稍候")
+	}
+	go func() {
+		defer a.endVideoRun(id)
+		a.runRelayoutVideoSubtitles(id)
+	}()
+	return nil
+}
+
+func (a *App) runRelayoutVideoSubtitles(id string) {
+	task, err := a.videoTaskByID(id)
+	if err != nil {
+		return
+	}
+	task.Stage = VideoStageBuildEdit
+	task.Status = VideoStatusRunning
+	task.Error = ""
+	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	runner := &videoRunner{app: a, task: &task, ctx: withUsageTask(context.Background(), id), feedbackStage: VideoStageBuildEdit}
+	runner.logf("开始按当前时间轴重铺字幕（手工修改将被覆盖）…")
+	_ = runner.save()
+
+	if layoutErr := runner.relayoutSubtitleStage(); layoutErr != nil {
+		runner.warn("重铺字幕失败：%v", layoutErr)
+	}
+	runner.task.Stage = VideoStageConfirmEdit
+	runner.task.Status = VideoStatusWaiting
+	runner.task.Run.Gates[VideoGateEdit] = videoGatePending
+	_ = runner.save()
+}
+
+// relayoutSubtitleStage 重新测时并重建 SRT/ASS；不复用旧 cue。
+func (r *videoRunner) relayoutSubtitleStage() error {
+	cfg := r.task.Config
+	workDir, err := r.app.ensureTaskWorkDir(r.task.ID)
+	if err != nil {
+		return err
+	}
+	if r.task.Run.Edit == nil || len(r.task.Run.Edit.Clips) == 0 {
+		edit, warnings, buildErr := buildDefaultVideoEditPlan(r.ctx, &r.task.Run)
+		for _, warning := range warnings {
+			r.warn("%s", warning)
+		}
+		if buildErr != nil {
+			return buildErr
+		}
+		r.task.Run.Edit = edit
+	}
+	if !composePrepUsable(r.task.Run.Compose, &r.task.Run) {
+		built, prepWarnings, prepErr := prepareComposeCanvas(r.ctx, workDir, r.task.ID, cfg, &r.task.Run)
+		for _, warning := range prepWarnings {
+			r.warn("%s", warning)
+		}
+		if prepErr != nil {
+			return prepErr
+		}
+		r.task.Run.Compose = built
+	}
+	prep := r.task.Run.Compose
+	canvas := ""
+	if prep != nil {
+		canvas = prep.CanvasPath
+	}
+	cues, timingSource, audioSource, measureWarnings := measureSubtitleCues(r.ctx, workDir, cfg, &r.task.Run, canvas)
+	for _, warning := range measureWarnings {
+		r.warn("%s", warning)
+	}
+	total := composeTotalS(r.ctx, cfg, prep)
+	normalized, issues := normalizeSubtitleCues(cues, total, cfg)
+	r.task.Run.SubtitleIssues = issues
+	if len(normalized) == 0 {
+		r.task.Run.Subtitles = nil
+		r.logf("重铺后没有需要字幕的台词")
+		return nil
+	}
+	width, height := subtitleCanvasSize(cfg, prep)
+	subtitles, err := writeSubtitleFiles(workDir, r.task.ID, cfg, normalized, timingSource, audioSource, width, height)
+	if err != nil {
+		return err
+	}
+	r.task.Run.Subtitles = subtitles
+	r.logf("字幕已按新时间轴重铺：%d 条，来源 %s", len(normalized), timingSource)
+	return nil
+}
+
+// SetVideoSubtitlesEnabled 旧任务兼容：为本次开启/关闭字幕并生成时间轴。
+// 新任务默认开启字幕，不需要这个开关。
+func (a *App) SetVideoSubtitlesEnabled(id string, enabled bool) (VideoTask, error) {
+	task, err := a.videoTaskByID(id)
+	if err != nil {
+		return task, err
+	}
+	if a.isVideoTaskRunning(id) {
+		return task, errors.New("任务正在执行，请稍候")
+	}
+	if task.Stage != VideoStageConfirmEdit {
+		return task, errors.New("仅在剪辑确认关卡可以开启/关闭字幕")
+	}
+	task.Config.Subtitles = enabled
+	if !enabled {
+		task.Run.Subtitles = nil
+		task.Run.SubtitleIssues = nil
+		task.Run.Logs = append(task.Run.Logs, stageLog("已关闭本任务字幕：成片不会烧录字幕"))
+		task.UpdatedAt = time.Now().Format(time.RFC3339)
+		return task, a.updateVideoTaskRecord(task)
+	}
+	workDir, err := a.ensureTaskWorkDir(task.ID)
+	if err != nil {
+		return task, err
+	}
+	if task.Run.Edit == nil || len(task.Run.Edit.Clips) == 0 {
+		edit, warnings, buildErr := buildDefaultVideoEditPlan(context.Background(), &task.Run)
+		for _, warning := range warnings {
+			task.Run.Warnings = append(task.Run.Warnings, warning)
+		}
+		if buildErr != nil {
+			return task, buildErr
+		}
+		task.Run.Edit = edit
+	}
+	if !composePrepUsable(task.Run.Compose, &task.Run) {
+		built, prepWarnings, prepErr := prepareComposeCanvas(context.Background(), workDir, task.ID, task.Config, &task.Run)
+		for _, warning := range prepWarnings {
+			task.Run.Warnings = append(task.Run.Warnings, warning)
+		}
+		if prepErr != nil {
+			return task, prepErr
+		}
+		task.Run.Compose = built
+	}
+	prep := task.Run.Compose
+	canvas := ""
+	if prep != nil {
+		canvas = prep.CanvasPath
+	}
+	cues, timingSource, audioSource, measureWarnings := measureSubtitleCues(context.Background(), workDir, task.Config, &task.Run, canvas)
+	for _, warning := range measureWarnings {
+		task.Run.Warnings = append(task.Run.Warnings, warning)
+	}
+	total := composeTotalS(context.Background(), task.Config, prep)
+	normalized, issues := normalizeSubtitleCues(cues, total, task.Config)
+	task.Run.SubtitleIssues = issues
+	if len(normalized) == 0 {
+		task.Run.Subtitles = nil
+		task.Run.Logs = append(task.Run.Logs, stageLog("已为本次开启字幕，但本片没有需要字幕的台词"))
+		task.UpdatedAt = time.Now().Format(time.RFC3339)
+		return task, a.updateVideoTaskRecord(task)
+	}
+	width, height := subtitleCanvasSize(task.Config, prep)
+	subtitles, err := writeSubtitleFiles(workDir, task.ID, task.Config, normalized, timingSource, audioSource, width, height)
+	if err != nil {
+		return task, err
+	}
+	task.Run.Subtitles = subtitles
+	task.Run.Logs = append(task.Run.Logs, stageLog(fmt.Sprintf("已为本次开启字幕：%d 条，可在剪辑页继续调整", len(normalized))))
+	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	return task, a.updateVideoTaskRecord(task)
+}
 func applyPublishEdits(meta *PublishMeta, edit VideoPublishEdit, cfg VideoRunConfig) {
 	profile := platformProfile(meta.Platform)
 
@@ -1008,7 +1391,7 @@ func (a *App) runVideoPipeline(id, from, feedback string) {
 	switch from {
 	case VideoStageBuildPrompt:
 		task.Run.Gates[VideoGateScript] = videoGateApproved
-	case VideoStageBuildSubs, VideoStageRender:
+	case VideoStageBuildEdit, VideoStageRender:
 		task.Run.Gates[VideoGatePrompt] = videoGateApproved
 	}
 
@@ -1040,21 +1423,14 @@ func (a *App) runVideoPipeline(id, from, feedback string) {
 			_ = runner.save()
 			return
 
-		case VideoStageBuildSubs:
-			// 字幕排在视频之后：先拿真实片段拼好的画布铺轴，再让用户逐条调
-			if err := runner.runSubtitleStage(); err != nil {
+		case VideoStageBuildEdit:
+			// 剪辑排在视频之后：生成默认剪辑计划、预览画布与字幕时间轴，再让用户调
+			if err := runner.runEditStage(); err != nil {
 				runner.fail(err)
 				return
 			}
-			if runner.task.Run.Subtitles == nil {
-				// 字幕未开启或本片没有台词：没东西可确认，直接合成
-				runner.task.Stage = VideoStageCompose
-				runner.task.Status = VideoStatusRunning
-				_ = runner.save()
-				continue
-			}
-			runner.task.Stage = VideoStageConfirmSubs
-			runner.task.Run.Gates[VideoGateSubs] = videoGatePending
+			runner.task.Stage = VideoStageConfirmEdit
+			runner.task.Run.Gates[VideoGateEdit] = videoGatePending
 			runner.task.Status = VideoStatusWaiting
 			_ = runner.save()
 			return
@@ -1077,7 +1453,7 @@ func (a *App) runVideoPipeline(id, from, feedback string) {
 				_ = runner.save()
 				return
 			}
-			runner.task.Stage = VideoStageBuildSubs
+			runner.task.Stage = VideoStageBuildEdit
 			runner.task.Status = VideoStatusRunning
 			_ = runner.save()
 
@@ -1208,7 +1584,7 @@ func (r *videoRunner) runPromptStage() error {
 	}
 	r.task.Run.Plan = &plan
 
-	// 字幕不在这一阶段做：台词等 gate② 定稿，视频出来后才由 BUILD_SUBS 铺轴
+	// 字幕不在这一阶段做：台词等 gate② 定稿，视频出来后才由 BUILD_EDIT 铺轴
 	r.task.Run.Subtitles = nil
 	if r.task.Config.Subtitles {
 		r.logf("字幕将在视频生成后铺轴（真实片段的时长与声音为准，可在字幕关卡逐条调）")
@@ -1228,53 +1604,63 @@ func (r *videoRunner) runPromptStage() error {
 	return nil
 }
 
-// runSubtitleStage 字幕阶段：排在视频生成之后。
-// 先把合成前的剪辑预处理做完（选段/裁剪/拼接/画幅）拿到真实画布，再按片段实测时长 + 声学对齐铺轴；
-// 预处理结果缓在 run.Compose，合成阶段直接复用，既省一次重编码也让用户调好的字幕不会被重新切过的片段带偏。
-func (r *videoRunner) runSubtitleStage() error {
-	cfg := r.task.Config
-	if !cfg.Subtitles {
-		// 字幕默认关闭：不产出 SRT/ASS，成片也不烧录
-		r.task.Run.Subtitles = nil
-		r.logf("字幕未开启，跳过字幕阶段")
-		return nil
+// composeTotalS 当前预览画布的时长：优先用预处理缓存，测不到时退回任务目标时长。
+func composeTotalS(ctx context.Context, cfg VideoRunConfig, prep *VideoComposePrep) float64 {
+	if prep != nil && prep.DurationS > 0 {
+		return prep.DurationS
 	}
-
-	plan := r.task.Run.Plan
-	if plan == nil || len(plan.Segments) == 0 {
-		// 兜底：直接用已确认的提示词重建计划，免得旧任务卡在这一步
-		if len(r.task.Run.Prompts) == 0 {
-			return errors.New("缺少已确认的提示词，无法生成字幕")
+	if prep != nil && prep.CanvasPath != "" && fileExists(prep.CanvasPath) {
+		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		info, err := mediaProbe(probeCtx, prep.CanvasPath)
+		cancel()
+		if err == nil && info.Duration > 0 {
+			return round2(info.Duration)
 		}
-		_, adapter, provider, _, _ := r.app.resolveVideoAdapter(cfg)
-		rebuilt := buildVideoPlan(cfg, r.task.Run.Prompts, adapterCapabilities(adapter, provider.Model), r.task.Run.Adapter)
-		plan = &rebuilt
-		r.task.Run.Plan = plan
 	}
+	return float64(cfg.DurationS)
+}
 
+// runEditStage 剪辑阶段：生成默认剪辑计划 → 按计划重建预览画布 → 自动铺字幕。
+func (r *videoRunner) runEditStage() error {
+	cfg := r.task.Config
 	workDir, err := r.app.ensureTaskWorkDir(r.task.ID)
 	if err != nil {
 		return err
 	}
 
-	// 成片画布：已有预处理结果可用就直接复用（重渲过某段则重算）
-	prep := r.task.Run.Compose
-	if !composePrepUsable(prep, r.task.Run.Renders) {
+	if r.task.Run.Edit == nil || len(r.task.Run.Edit.Clips) == 0 {
+		edit, editWarnings, buildErr := buildDefaultVideoEditPlan(r.ctx, &r.task.Run)
+		for _, warning := range editWarnings {
+			r.warn("%s", warning)
+		}
+		if buildErr != nil {
+			return buildErr
+		}
+		r.task.Run.Edit = edit
+		r.logf("已生成默认剪辑计划：%d 个片段（渲染顺序、整段保留）", len(edit.Clips))
+	}
+
+	if !composePrepUsable(r.task.Run.Compose, &r.task.Run) {
 		built, prepWarnings, prepErr := prepareComposeCanvas(r.ctx, workDir, r.task.ID, cfg, &r.task.Run)
 		for _, warning := range prepWarnings {
 			r.warn("%s", warning)
 		}
 		if prepErr != nil {
-			// 预处理失败不阻断字幕：还能按片段实测铺轴，只是没有画布预览与声学对齐
-			r.warn("合成预处理失败，字幕改按片段时长铺轴: %v", prepErr)
-			prep = nil
-			r.task.Run.Compose = nil
-		} else {
-			prep = built
-			r.task.Run.Compose = prep
+			return fmt.Errorf("重建预览画布失败: %w", prepErr)
 		}
+		r.task.Run.Compose = built
+		r.logf("预览画布已就绪：%.1fs（%dx%d），可在剪辑页直接播放",
+			built.DurationS, built.CanvasWidth, built.CanvasHeight)
 	}
 
+	if !cfg.Subtitles {
+		r.task.Run.Subtitles = nil
+		r.task.Run.SubtitleIssues = nil
+		r.logf("该任务未开启字幕：仍可剪辑片段；需要字幕时可在此页一键开启")
+		return nil
+	}
+
+	prep := r.task.Run.Compose
 	canvas := ""
 	if prep != nil {
 		canvas = prep.CanvasPath
@@ -1283,20 +1669,23 @@ func (r *videoRunner) runSubtitleStage() error {
 	for _, warning := range measureWarnings {
 		r.warn("%s", warning)
 	}
-	if len(cues) == 0 {
+	total := composeTotalS(r.ctx, cfg, prep)
+	normalized, issues := normalizeSubtitleCues(cues, total, cfg)
+	if len(normalized) == 0 {
 		r.task.Run.Subtitles = nil
-		r.logf("本片没有需要字幕的台词，跳过字幕确认")
+		r.task.Run.SubtitleIssues = issues
+		r.logf("本片没有需要字幕的台词，字幕时间轴为空")
 		return nil
 	}
-
 	width, height := subtitleCanvasSize(cfg, prep)
-	subtitles, err := writeSubtitleFiles(workDir, r.task.ID, cfg, cues, timingSource, audioSource, width, height)
+	subtitles, err := writeSubtitleFiles(workDir, r.task.ID, cfg, normalized, timingSource, audioSource, width, height)
 	if err != nil {
 		return fmt.Errorf("生成字幕文件失败: %w", err)
 	}
 	r.task.Run.Subtitles = subtitles
-	r.logf("字幕已生成：%d 条，时间轴来源 %s（基于成片画布 %dx%d，可在字幕关卡里逐条改时间/位置/字号）",
-		len(subtitles.Cues), subtitles.TimingSource, width, height)
+	r.task.Run.SubtitleIssues = issues
+	r.logf("剪辑与字幕已生成：%d 个片段、%d 条字幕，时间轴来源 %s（可在剪辑页预览、裁剪、调时间轴）",
+		len(r.task.Run.Edit.Clips), len(normalized), subtitles.TimingSource)
 	if subtitles.TimingSource == "aligned" || subtitles.TimingSource == "measured" {
 		if measured := measuredSpeechRate(subtitles.Cues, cfg.Language); measured > 0 {
 			unit := "字"
@@ -1311,6 +1700,98 @@ func (r *videoRunner) runSubtitleStage() error {
 				measured, unit, configured)
 		}
 	}
+	return nil
+}
+
+// runApplyEditStage 应用剪辑计划：重建预览画布，并按新时间轴重映射字幕草稿。
+// 只改字幕（Revision 未变）时跳过重编码，也保留用户手工调整的 cue。
+func (r *videoRunner) runApplyEditStage() error {
+	cfg := r.task.Config
+	workDir, err := r.app.ensureTaskWorkDir(r.task.ID)
+	if err != nil {
+		return err
+	}
+	if r.task.Run.Edit == nil || len(r.task.Run.Edit.Clips) == 0 {
+		return errors.New("没有可应用的剪辑计划")
+	}
+	clips, clipWarnings, err := normalizeVideoEditClips(r.ctx, cfg, &r.task.Run, r.task.Run.Edit.Clips,
+		cfg.ContinuationMode == "last_frame")
+	for _, warning := range clipWarnings {
+		r.warn("%s", warning)
+	}
+	if err != nil {
+		return err
+	}
+	nextEdit := *r.task.Run.Edit
+	nextEdit.Clips = clips
+	nextEdit.UpdatedAt = time.Now().Format(time.RFC3339)
+	r.task.Run.Edit = &nextEdit
+
+	revisionChanged := r.task.Run.Compose == nil ||
+		r.task.Run.Compose.EditRevision != r.task.Run.Edit.Revision ||
+		!composePrepUsable(r.task.Run.Compose, &r.task.Run)
+	if revisionChanged {
+		built, prepWarnings, prepErr := prepareComposeCanvas(r.ctx, workDir, r.task.ID, cfg, &r.task.Run)
+		for _, warning := range prepWarnings {
+			r.warn("%s", warning)
+		}
+		if prepErr != nil {
+			return fmt.Errorf("重建预览画布失败: %w", prepErr)
+		}
+		r.task.Run.Compose = built
+		r.logf("预览画布已重建：%.1fs（%dx%d）", built.DurationS, built.CanvasWidth, built.CanvasHeight)
+	} else {
+		r.logf("剪辑版本未变化：沿用现有预览画布，保留当前字幕草稿")
+	}
+
+	if !cfg.Subtitles {
+		return nil
+	}
+	if !revisionChanged && r.task.Run.Subtitles != nil {
+		return nil
+	}
+	prep := r.task.Run.Compose
+	total := composeTotalS(r.ctx, cfg, prep)
+	var cues []VideoSubtitleCue
+	timingSource := "measured"
+	if r.task.Run.Subtitles != nil {
+		timingSource = firstNonEmpty(r.task.Run.Subtitles.TimingSource, "measured")
+		_, spans, spanErr := editSubtitleSpans(r.ctx, &r.task.Run)
+		if spanErr != nil {
+			return spanErr
+		}
+		// 旧时间轴由 SaveVideoEdit 按保存前的剪辑算好 OffsetS，这里按新段起点重映射
+		relayout, notes := relayoutSubtitleCues(r.task.Run.Subtitles.Cues, nil, spans, total, cfg)
+		for _, note := range notes {
+			r.warn("%s", note)
+		}
+		cues = relayout
+	} else {
+		canvas := ""
+		if prep != nil {
+			canvas = prep.CanvasPath
+		}
+		generated, source, audioSource, measureWarnings := measureSubtitleCues(r.ctx, workDir, cfg, &r.task.Run, canvas)
+		for _, warning := range measureWarnings {
+			r.warn("%s", warning)
+		}
+		cues, timingSource = generated, source
+		_ = audioSource
+	}
+	normalized, issues := normalizeSubtitleCues(cues, total, cfg)
+	r.task.Run.SubtitleIssues = issues
+	if len(normalized) == 0 {
+		r.task.Run.Subtitles = nil
+		r.logf("应用剪辑后没有剩余字幕")
+		return nil
+	}
+	width, height := subtitleCanvasSize(cfg, prep)
+	subtitles, err := writeSubtitleFiles(workDir, r.task.ID, cfg, normalized, timingSource, "", width, height)
+	if err != nil {
+		return fmt.Errorf("重写字幕文件失败: %w", err)
+	}
+	r.task.Run.Subtitles = subtitles
+	r.logf("剪辑已应用：字幕按新时间轴重映射为 %d 条（未确认前不会烧录）", len(normalized))
 	return nil
 }
 
@@ -1397,9 +1878,11 @@ func (r *videoRunner) runRenderStage() (bool, error) {
 	taskReview := cfg.segmentReviewEnabled()
 	r.task.Run.Renders = nil
 	r.task.Run.Output = nil
-	// 画面要重出了：旧画布与旧字幕时间轴都不再可信，渲完后 BUILD_SUBS 会重铺
+	// 画面要重出了：旧画布、旧剪辑计划与旧字幕时间轴都不再可信，渲完后 BUILD_EDIT 会重铺
 	r.task.Run.Compose = nil
 	r.task.Run.Subtitles = nil
+	r.task.Run.SubtitleIssues = nil
+	r.task.Run.Edit = nil
 
 	genCtx := videoGenContext{Provider: provider, Model: provider.Model, AdapterID: adapterID, WorkDir: workDir}
 	renders := make([]VideoRender, 0, len(segments))

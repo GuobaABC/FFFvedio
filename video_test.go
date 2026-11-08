@@ -605,14 +605,25 @@ func TestLocalScriptCoversTotalDuration(t *testing.T) {
 	}
 }
 
-// 字幕默认关闭：未显式开启时归一化结果仍为关闭。
-func TestSubtitlesDefaultOff(t *testing.T) {
-	cfg, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "字幕默认关闭", DurationS: 8})
+// 字幕默认开启：新任务创建后一定生成字幕；旧任务从库里读出的 false 保持不变。
+func TestSubtitlesDefaultOnForNewTask(t *testing.T) {
+	withTempVideoRoot(t)
+	app := newTestApp(t)
+	created, err := app.CreateVideoTask(VideoTaskInput{Config: VideoRunConfig{Topic: "字幕默认开启", DurationS: 8}})
+	if err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	if !created.Config.Subtitles {
+		t.Fatal("新任务应默认生成字幕")
+	}
+
+	// 旧任务：库里的 subtitles=false 不能再被归一化默默打开
+	legacy, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "旧任务字幕关闭", DurationS: 8})
 	if err != nil {
 		t.Fatalf("归一化失败: %v", err)
 	}
-	if cfg.Subtitles {
-		t.Fatal("字幕应默认关闭")
+	if legacy.Subtitles {
+		t.Fatal("旧任务的显式 false 应保持不变")
 	}
 
 	opened, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "显式开启字幕", DurationS: 8, Subtitles: true})
@@ -1477,17 +1488,36 @@ func TestSubtitleGeneratedOnlyAfterPromptConfirm(t *testing.T) {
 		t.Fatalf("日志要说明字幕延后到视频生成之后：%v", task.Run.Logs)
 	}
 
-	if err := runner.runSubtitleStage(); err != nil {
-		t.Fatalf("字幕阶段失败: %v", err)
+	// 视频出来后由 BUILD_EDIT 一并生成剪辑计划、预览画布与字幕
+	ffmpeg := bundledFFmpeg(t)
+	workDir, err := app.ensureTaskWorkDir(created.ID)
+	if err != nil {
+		t.Fatalf("创建任务目录失败: %v", err)
+	}
+	clip := filepath.Join(workDir, "clips", "01.mp4")
+	if err := os.MkdirAll(filepath.Dir(clip), 0o755); err != nil {
+		t.Fatalf("创建片段目录失败: %v", err)
+	}
+	makeTestClip(t, ffmpeg, clip, "1280x720", 2)
+	if task.Run.Plan == nil || len(task.Run.Plan.Segments) == 0 {
+		t.Fatalf("提示词阶段应产出渲染计划")
+	}
+	segmentID := task.Run.Plan.Segments[0].ID
+	task.Run.Renders = []VideoRender{{SegmentID: segmentID, ShotID: "s1", VideoURI: clip, Status: "succeeded", DurationS: 2}}
+	if err := runner.runEditStage(); err != nil {
+		t.Fatalf("剪辑阶段失败: %v", err)
+	}
+	if task.Run.Edit == nil || len(task.Run.Edit.Clips) == 0 {
+		t.Fatalf("视频生成后应产出剪辑计划：%+v", task.Run.Edit)
 	}
 	if task.Run.Subtitles == nil || len(task.Run.Subtitles.Cues) == 0 {
-		t.Fatalf("确认提示词后应产出字幕：%+v", task.Run.Subtitles)
+		t.Fatalf("剪辑阶段应产出字幕：%+v", task.Run.Subtitles)
 	}
 	if !fileExists(task.Run.Subtitles.SRTPath) {
 		t.Fatalf("SRT 没落盘: %s", task.Run.Subtitles.SRTPath)
 	}
-	if logs := strings.Join(task.Run.Logs, "\n"); !strings.Contains(logs, "字幕已生成") {
-		t.Fatalf("日志要留下字幕生成记录：%v", task.Run.Logs)
+	if logs := strings.Join(task.Run.Logs, "\n"); !strings.Contains(logs, "剪辑与字幕已生成") {
+		t.Fatalf("日志要留下剪辑与字幕生成记录：%v", task.Run.Logs)
 	}
 }
 
@@ -1609,11 +1639,18 @@ func TestSegmentEditSyncsBackToPrompt(t *testing.T) {
 }
 
 // v0.0.5 之前的任务存在 BUILD_PROMPT_SUBS 阶段，读取时要落回拆分后的提示词阶段。
+// v0.1.2 又把字幕阶段并入剪辑，旧 BUILD_SUBS / CONFIRM_SUBS 读时要映射到剪辑阶段。
 func TestLegacyBuildPromptStageAlias(t *testing.T) {
 	if got := normalizeVideoStage("BUILD_PROMPT_SUBS"); got != VideoStageBuildPrompt {
 		t.Fatalf("旧阶段名要映射到新阶段：%q", got)
 	}
-	if got := normalizeVideoStage(VideoStageBuildSubs); got != VideoStageBuildSubs {
+	if got := normalizeVideoStage("BUILD_SUBS"); got != VideoStageBuildEdit {
+		t.Fatalf("旧字幕生成阶段要映射到剪辑阶段：%q", got)
+	}
+	if got := normalizeVideoStage("CONFIRM_SUBS"); got != VideoStageConfirmEdit {
+		t.Fatalf("旧字幕确认阶段要映射到剪辑确认：%q", got)
+	}
+	if got := normalizeVideoStage(VideoStageBuildEdit); got != VideoStageBuildEdit {
 		t.Fatalf("当前阶段名不该被改写：%q", got)
 	}
 }
@@ -1862,18 +1899,19 @@ func TestAutoModeShotEditKeepsSegmentDurations(t *testing.T) {
 	}
 }
 
-// 用户提交的 cue：空文本丢弃、时长夹到最短、越界贴回片尾、非法布局值归零/夹住，最后按时间重排编号。
+// 用户提交的 cue：空文本丢弃、越界/过短逐条返回问题、非法布局值归零/夹住，最后按时间重排编号。
 func TestNormalizeSubtitleCuesClampsUserEdits(t *testing.T) {
-	cues, notes := normalizeSubtitleCues([]VideoSubtitleCue{
+	cues, issues := normalizeSubtitleCues([]VideoSubtitleCue{
 		{Start: 5, End: 5.1, Text: "太短要拉长"},
 		{Start: 0, End: 2, Text: "   "},
-		{Start: 9.8, End: 20, Text: "超出成片", Anchor: 12, MarginVPct: 200, FontSizePct: 99},
+		{Start: 11, End: 20, Text: "起始越界"},
+		{Start: 8.6, End: 20, Text: "尾部夹取", Anchor: 12, MarginVPct: 200, FontSizePct: 99},
 		{Start: 1, End: 2, Text: "排在前面", Anchor: 4},
-	}, 10)
+	}, 10, VideoRunConfig{})
 	if len(cues) != 3 {
-		t.Fatalf("空文本应被丢弃：%+v", cues)
+		t.Fatalf("空文本与起始越界应被丢弃：%+v", cues)
 	}
-	if cues[0].Text != "排在前面" || cues[1].Text != "太短要拉长" || cues[2].Text != "超出成片" {
+	if cues[0].Text != "排在前面" || cues[1].Text != "太短要拉长" || cues[2].Text != "尾部夹取" {
 		t.Fatalf("cue 应按起始时间排序：%+v", cues)
 	}
 	for index, cue := range cues {
@@ -1884,8 +1922,8 @@ func TestNormalizeSubtitleCuesClampsUserEdits(t *testing.T) {
 	if cues[1].End-cues[1].Start < subtitleCueMinS-1e-9 {
 		t.Fatalf("过短的 cue 应拉到最短停留：%.2f-%.2f", cues[1].Start, cues[1].End)
 	}
-	if cues[2].Start != 9.6 || cues[2].End != 10 {
-		t.Fatalf("超出成片的 cue 应贴到片尾：%.2f-%.2f", cues[2].Start, cues[2].End)
+	if cues[2].Start != 8.6 || cues[2].End != 10 {
+		t.Fatalf("超出成片的 cue 应夹到片尾：%.2f-%.2f", cues[2].Start, cues[2].End)
 	}
 	if cues[2].Anchor != 0 || cues[0].Anchor != 4 {
 		t.Fatalf("只有 1-9 的锚点能保留：%+v", cues)
@@ -1893,8 +1931,16 @@ func TestNormalizeSubtitleCuesClampsUserEdits(t *testing.T) {
 	if cues[2].MarginVPct != 90 || cues[2].FontSizePct != 30 {
 		t.Fatalf("留白与字号应夹到上限：%+v", cues[2])
 	}
-	if strings.Join(notes, "\n") == "" {
-		t.Fatal("越界与夹取要留下告警")
+	messages := make([]string, 0, len(issues))
+	hasError := false
+	for _, issue := range issues {
+		messages = append(messages, issue.Message)
+		if issue.Level == "error" {
+			hasError = true
+		}
+	}
+	if len(messages) == 0 || !hasError {
+		t.Fatalf("越界/空文本要留下 error 级问题：%+v", issues)
 	}
 }
 
@@ -1922,13 +1968,14 @@ func TestRenderASSAppliesPerCueLayout(t *testing.T) {
 	}
 }
 
-// 字幕阶段排在视频之后：产出时间轴后停在 CONFIRM_SUBS 等用户，确认后才进合成。
-func TestSubtitleStageStopsAtConfirmGate(t *testing.T) {
+// 剪辑阶段排在视频之后：产出剪辑计划与字幕时间轴后停在 CONFIRM_EDIT 等用户，确认后才进合成。
+func TestEditStageStopsAtConfirmGate(t *testing.T) {
+	ffmpeg := bundledFFmpeg(t)
 	withTempVideoRoot(t)
 	app := newTestApp(t)
 
 	created, err := app.CreateVideoTask(VideoTaskInput{Config: VideoRunConfig{
-		Topic: "字幕关卡流转", DurationS: 6, Adapter: "mock", Subtitles: true,
+		Topic: "剪辑关卡流转", DurationS: 2, Adapter: "mock", Subtitles: true, AspectRatio: "16:9",
 	}})
 	if err != nil {
 		t.Fatalf("创建任务失败: %v", err)
@@ -1937,50 +1984,66 @@ func TestSubtitleStageStopsAtConfirmGate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取任务失败: %v", err)
 	}
-	task.Stage = VideoStageBuildSubs
-	task.Run.Script = &VideoScript{Shots: []VideoShot{{ID: "s1", DurationS: 6, Dialogue: "第一句话。第二句话。"}}}
-	task.Run.Prompts = []VideoPromptItem{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: "第一句话。第二句话。", Start: 0, End: 6}}
+	task.Stage = VideoStageBuildEdit
+	task.Run.Script = &VideoScript{Shots: []VideoShot{{ID: "s1", DurationS: 2, Dialogue: "第一句话。第二句话。"}}}
+	task.Run.Prompts = []VideoPromptItem{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: "第一句话。第二句话。", Start: 0, End: 2}}
 	plan := buildVideoPlan(task.Config, task.Run.Prompts, defaultVideoCapabilities(), "mock")
 	task.Run.Plan = &plan
+	workDir, err := app.ensureTaskWorkDir(created.ID)
+	if err != nil {
+		t.Fatalf("创建任务目录失败: %v", err)
+	}
+	segmentID := plan.Segments[0].ID
+	clip := filepath.Join(workDir, "clips", "01-"+segmentID+".mp4")
+	if err := os.MkdirAll(filepath.Dir(clip), 0o755); err != nil {
+		t.Fatalf("创建片段目录失败: %v", err)
+	}
+	makeTestClip(t, ffmpeg, clip, "1280x720", 2)
+	task.Run.Renders = []VideoRender{{SegmentID: segmentID, ShotID: "s1", VideoURI: clip, Status: "succeeded", DurationS: 2}}
 	if err := app.updateVideoTaskRecord(task); err != nil {
 		t.Fatalf("写入任务失败: %v", err)
 	}
 
-	// 没有真实片段：铺轴退回预算时间轴，但流程仍要停在字幕关卡
-	app.runVideoPipeline(created.ID, VideoStageBuildSubs, "")
+	app.runVideoPipeline(created.ID, VideoStageBuildEdit, "")
 	gated, err := app.videoTaskByID(created.ID)
 	if err != nil {
 		t.Fatalf("读取任务失败: %v", err)
 	}
-	if gated.Stage != VideoStageConfirmSubs || gated.Status != VideoStatusWaiting {
-		t.Fatalf("字幕生成后应停在确认关卡：%s/%s", gated.Stage, gated.Status)
+	if gated.Stage != VideoStageConfirmEdit || gated.Status != VideoStatusWaiting {
+		t.Fatalf("剪辑生成后应停在确认关卡：%s/%s", gated.Stage, gated.Status)
+	}
+	if gated.Run.Edit == nil || len(gated.Run.Edit.Clips) == 0 {
+		t.Fatalf("剪辑关卡要有可编辑的片段计划：%+v", gated.Run.Edit)
+	}
+	if gated.Run.Compose == nil || gated.Run.Compose.CanvasUrl == "" {
+		t.Fatalf("剪辑关卡要有可预览的画布：%+v", gated.Run.Compose)
 	}
 	if gated.Run.Subtitles == nil || len(gated.Run.Subtitles.Cues) == 0 {
-		t.Fatalf("字幕关卡要有可编辑的 cue：%+v", gated.Run.Subtitles)
+		t.Fatalf("剪辑关卡要有可编辑的 cue：%+v", gated.Run.Subtitles)
 	}
 	if gated.Run.Subtitles.Confirmed {
 		t.Fatal("用户还没确认，不该标成已确认")
 	}
-	if gated.Run.Gates[VideoGateSubs] != videoGatePending {
-		t.Fatalf("字幕关卡状态应为 pending：%v", gated.Run.Gates)
+	if gated.Run.Gates[VideoGateEdit] != videoGatePending {
+		t.Fatalf("剪辑关卡状态应为 pending：%v", gated.Run.Gates)
 	}
 	if err := app.RunVideoTask(created.ID); err == nil || !strings.Contains(err.Error(), "人工确认关卡") {
-		t.Fatalf("停在字幕关卡时不能直接继续执行: %v", err)
+		t.Fatalf("停在剪辑关卡时不能直接继续执行: %v", err)
 	}
 
 	if err := app.ApproveVideoGate(created.ID); err != nil {
-		t.Fatalf("确认字幕失败: %v", err)
+		t.Fatalf("确认剪辑失败: %v", err)
 	}
 	advanced := waitForVideoTask(t, app, created.ID, func(item VideoTask) bool {
-		return item.Stage != VideoStageConfirmSubs
+		return item.Stage != VideoStageConfirmEdit
 	}, "确认后应进入合成")
 	if advanced.Run.Subtitles == nil || !advanced.Run.Subtitles.Confirmed {
 		t.Fatalf("确认后 cue 要钉成最终版：%+v", advanced.Run.Subtitles)
 	}
-	if advanced.Run.Gates[VideoGateSubs] != videoGateApproved {
-		t.Fatalf("字幕关卡应为 approved：%v", advanced.Run.Gates)
+	if advanced.Run.Gates[VideoGateEdit] != videoGateApproved {
+		t.Fatalf("剪辑关卡应为 approved：%v", advanced.Run.Gates)
 	}
-	if logs := strings.Join(advanced.Run.Logs, "\n"); !strings.Contains(logs, "字幕已确认") {
+	if logs := strings.Join(advanced.Run.Logs, "\n"); !strings.Contains(logs, "剪辑与字幕已确认") {
 		t.Fatalf("日志要留下确认记录：%v", advanced.Run.Logs)
 	}
 }
@@ -2004,7 +2067,7 @@ func TestConfirmedSubtitlesSurviveCompose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取任务失败: %v", err)
 	}
-	task.Stage = VideoStageConfirmSubs
+	task.Stage = VideoStageConfirmEdit
 	task.Status = VideoStatusWaiting
 	task.Run.Plan = &VideoPlan{Segments: []VideoSegment{{ID: "a", ShotID: "s1", Index: 0, DurationS: 2, Dialogue: "模型写的台词"}}}
 	task.Run.Renders = []VideoRender{{SegmentID: "a", VideoURI: clip, Status: "succeeded"}}
@@ -2078,7 +2141,7 @@ func TestRemovingAllSubtitlesStaysRemoved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取任务失败: %v", err)
 	}
-	task.Stage = VideoStageConfirmSubs
+	task.Stage = VideoStageConfirmEdit
 	task.Status = VideoStatusWaiting
 	task.Run.Plan = &VideoPlan{Segments: []VideoSegment{{ID: "a", ShotID: "s1", Index: 0, DurationS: 2, Dialogue: "旧字幕"}}}
 	task.Run.Renders = []VideoRender{{SegmentID: "a", VideoURI: clip, Status: "succeeded"}}

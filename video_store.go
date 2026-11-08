@@ -129,6 +129,8 @@ func (a *App) CreateVideoTask(input VideoTaskInput) (VideoTask, error) {
 	if err != nil {
 		return VideoTask{}, err
 	}
+	// 0.1.2 起新任务默认生成字幕；旧任务从库里读出的 subtitles=false 保持不变。
+	cfg.Subtitles = true
 	warnings = append(templateWarnings, warnings...)
 
 	templateID := ""

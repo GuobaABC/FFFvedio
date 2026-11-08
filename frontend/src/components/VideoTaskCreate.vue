@@ -1620,20 +1620,16 @@ async function submit() {
 
       <section class="ui-card block">
         <div class="block__head">
-          <h3 class="ui-h3">7. 字幕（默认不生成）</h3>
-          <label class="check check--inline">
-            <input v-model="form.subtitles" type="checkbox" />
-            生成字幕并烧录
-          </label>
+          <h3 class="ui-h3">7. 字幕（默认生成）</h3>
         </div>
         <p class="hint">
-          默认不生成字幕：成片不带字幕，也不产出 SRT / ASS 文件；画面提示词始终要求模型不把文字画进画面。
-          需要字幕时勾选左侧开关，按下面的样式烧录。
+          新任务默认生成字幕：视频生成后自动铺时间轴，可在剪辑页预览、逐条调整时间与位置，确认后再烧录。
+          画面提示词始终要求模型不把文字画进画面。旧任务若曾关闭字幕，可在剪辑页为本次开启。
         </p>
-        <div class="grid grid--3" :class="{ 'subs--off': !form.subtitles }">
+        <div class="grid grid--3">
           <label class="ui-field">
-            <span class="ui-label">字体（需系统中存在的中文字体）</span>
-            <input v-model="form.subtitleStyle.fontName" class="ui-input" type="text" placeholder="思源黑体" />
+            <span class="ui-label">字体（内置 Noto Sans SC，跨机器可用）</span>
+            <input v-model="form.subtitleStyle.fontName" class="ui-input" type="text" placeholder="Noto Sans SC" />
           </label>
           <label class="ui-field">
             <span class="ui-label">字号（画面高度 %）</span>
