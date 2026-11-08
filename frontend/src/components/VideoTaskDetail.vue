@@ -22,6 +22,7 @@ import {
   formatClock,
   formatSeconds,
   type TailFrameAsset,
+  type VideoDialogueLine,
   type VideoPromptEdit,
   type VideoSegment,
   type VideoShot,
@@ -57,11 +58,19 @@ const metaPlatforms = ref<string[]>([])
 const metaFeedback = ref('')
 
 function cloneShots(source: VideoShot[]): VideoShot[] {
-  return source.map((shot) => ({
-    ...shot,
-    timeRange: [shot.timeRange?.[0] ?? 0, shot.timeRange?.[1] ?? 0] as [number, number],
-    roles: [...(shot.roles ?? [])],
-  }))
+  return source.map((shot) => {
+    const dialogueLines = (shot.dialogueLines ?? []).map((line) => ({ ...line }))
+    // 旧任务只有 dialogue/speaker：升级成一行，编辑时不再分叉成两套数据
+    if (dialogueLines.length === 0 && (shot.dialogue ?? '').trim()) {
+      dialogueLines.push({ speaker: shot.speaker ?? '', text: (shot.dialogue ?? '').trim() })
+    }
+    return {
+      ...shot,
+      timeRange: [shot.timeRange?.[0] ?? 0, shot.timeRange?.[1] ?? 0] as [number, number],
+      roles: [...(shot.roles ?? [])],
+      dialogueLines,
+    }
+  })
 }
 
 function cloneCues(source: VideoSubtitleCue[]): VideoSubtitleCue[] {
@@ -84,6 +93,8 @@ function syncDrafts() {
     visualPrompt: item.visualPrompt,
     dialogue: item.dialogue,
     speaker: item.speaker ?? '',
+    dialogueLines: (item.dialogueLines ?? []).map((line) => ({ ...line })),
+    durationS: Math.max(0, (item.end ?? 0) - (item.start ?? 0)),
   }))
 
   const meta = props.task.run?.publishMeta ?? null
@@ -116,6 +127,66 @@ function speakerLabelOf(speaker?: string): string {
   if (speaker === 'narration') return '旁白'
   const ref = (props.task.config?.characterRefs ?? []).find((item) => item.roleId === speaker)
   return ref?.name || speaker
+}
+
+type DialogueCarrier = { dialogue?: string; speaker?: string; dialogueLines?: VideoDialogueLine[] }
+
+/** 取台词行：以 dialogueLines 为准，旧数据回落到 dialogue/speaker。 */
+function dialogueLinesOf(target: DialogueCarrier): VideoDialogueLine[] {
+  if (!target.dialogueLines) {
+    target.dialogueLines = []
+  }
+  if (target.dialogueLines.length === 0 && (target.dialogue ?? '').trim()) {
+    target.dialogueLines.push({ speaker: target.speaker ?? '', text: (target.dialogue ?? '').trim() })
+  }
+  return target.dialogueLines
+}
+
+/** 当前编辑中的台词全文：预算估算与保存都以它为准。 */
+function dialogueTextOf(target: DialogueCarrier): string {
+  const lines = (target.dialogueLines ?? []).map((line) => (line.text ?? '').trim()).filter(Boolean)
+  return lines.length > 0 ? lines.join('\n') : (target.dialogue ?? '')
+}
+
+/** 台词行同步回兼容字段：dialogue 是全文，speaker 只在单说话人时保留。 */
+function syncDialogueCompat(target: DialogueCarrier) {
+  const lines = (target.dialogueLines ?? [])
+    .map((line) => ({ speaker: (line.speaker ?? '').trim(), text: (line.text ?? '').trim() }))
+    .filter((line) => line.text)
+  target.dialogueLines = lines
+  target.dialogue = lines.map((line) => line.text).join('\n')
+  target.speaker = lines.length === 1 ? lines[0].speaker : ''
+}
+
+/** 一款多说话人台词编辑器：加一行 / 删一行，段与提示词关卡共用。 */
+function addDialogueLine(target: DialogueCarrier, fallbackRoles: string[] = []) {
+  const lines = dialogueLinesOf(target)
+  const fallback = fallbackRoles.length === 1 ? fallbackRoles[0] : ''
+  lines.push({ speaker: fallback, text: '' })
+}
+
+function removeDialogueLine(target: DialogueCarrier, index: number) {
+  dialogueLinesOf(target).splice(index, 1)
+  syncDialogueCompat(target)
+}
+
+function onDialogueEdited(target: DialogueCarrier) {
+  syncDialogueCompat(target)
+}
+
+/** 多说话人的可读归属：多个用“、”连接，避免只显示兼容字段的空值。 */
+function dialogueSpeakerLabelOf(target: DialogueCarrier): string {
+  const speakers = [
+    ...new Set(
+      (target.dialogueLines ?? [])
+        .map((line) => (line.speaker ?? '').trim())
+        .filter(Boolean),
+    ),
+  ]
+  if (speakers.length === 0) {
+    return speakerLabelOf(target.speaker)
+  }
+  return speakers.map((speaker) => speakerLabelOf(speaker)).join('、')
 }
 
 const run = computed(() => props.task.run)
@@ -215,7 +286,7 @@ const summaryRows = computed(() => [
               const images = item.images ?? []
               const source =
                 item.imageSource === 'template' ? '模板定妆图' : item.imageSource === 'user' ? '用户上传' : '未标注来源'
-              return `${item.name || item.roleId}（${source}，${images.length} 张）`
+              return `${item.name || item.roleId}（${source}，${images.length} 张${item.appearanceBlock ? '，有外观锚点' : ''}）`
             })
             .join('、')
         : '无',
@@ -223,7 +294,7 @@ const summaryRows = computed(() => [
 ])
 
 function shotBudget(shot: VideoShot) {
-  const estimate = estimateSpeech(shot.dialogue, config.value)
+  const estimate = estimateSpeech(dialogueTextOf(shot), config.value)
   const slot = Math.max(0, (shot.timeRange?.[1] ?? 0) - (shot.timeRange?.[0] ?? 0))
   return { units: estimate.units, seconds: estimate.seconds, window: slot, fits: estimate.seconds <= slot + 0.1 }
 }
@@ -246,6 +317,26 @@ function timingSourceLabel(source: string): string {
 
 function promptNote(shotId: string): string {
   return promptRows.value.find((item) => item.shotId === shotId)?.note ?? ''
+}
+
+/** 该镜头在当前渲染计划里实际占用的时长（模型档位取整后） */
+function promptPlanDuration(shotId: string): number {
+  return (plan.value?.segments ?? [])
+    .filter((segment) => segment.shotId === shotId)
+    .reduce((sum, segment) => sum + segment.durationS, 0)
+}
+
+/** 提示词关卡里加台词行时的默认说话人：本镜头只有一个角色就直接选他。 */
+function shotRolesForPrompt(shotId: string): string[] {
+  return shotDrafts.value.find((shot) => shot.id === shotId)?.roles ?? []
+}
+
+/** 生成前展示本段的起片来源：用户首帧 / 上一段尾帧 / 无首帧 */
+function segmentFirstFrameSource(segment: VideoSegment): string {
+  if (segment.index > 0 && config.value.continuationMode === 'last_frame') {
+    return '上一段尾帧'
+  }
+  return config.value.firstFrame ? '用户首帧' : '无首帧（文生视频）'
 }
 
 function setRoles(shot: VideoShot, value: string) {
@@ -308,6 +399,9 @@ function regenerate() {
 
 function saveShots() {
   void guard('save-shots', async () => {
+    for (const shot of shotDrafts.value) {
+      syncDialogueCompat(shot)
+    }
     await backend.saveVideoStageEdits(props.task.id, { shots: shotDrafts.value, prompts: [] })
     actionInfo.value = '分镜已保存，提示词 / 渲染结果已失效并等待重算'
   })
@@ -315,8 +409,11 @@ function saveShots() {
 
 function savePrompts() {
   void guard('save-prompts', async () => {
+    for (const prompt of promptDrafts.value) {
+      syncDialogueCompat(prompt)
+    }
     await backend.saveVideoStageEdits(props.task.id, { shots: [], prompts: promptDrafts.value })
-    actionInfo.value = '提示词已保存，渲染计划已重算'
+    actionInfo.value = '提示词与段时长已保存；请核对下方计划，再点「确认并开始生成视频」'
   })
 }
 
@@ -433,7 +530,7 @@ function removeTask() {
 
 /* ---------------- 逐段确认关卡 ---------------- */
 const segPromptDraft = ref('')
-const segDialogueDraft = ref('')
+const segDialogueDrafts = ref<VideoDialogueLine[]>([])
 const segFeedbackDraft = ref('')
 
 /** 待确认的片段（开启逐段确认且本段新渲染成功） */
@@ -445,9 +542,18 @@ const reviewPendingSegment = computed<VideoSegment | null>(() => {
   return (plan.value?.segments ?? []).find((segment) => segment.id === pendingId) ?? null
 })
 
+/** 生成前的提示词确认：下一段尚未提交视频模型，先让用户过目/改写（需求 11） */
+const pendingPromptSegment = computed<VideoSegment | null>(() => {
+  const pendingId = run.value?.reviewPendingPromptSegment ?? ''
+  if (!pendingId || props.task.stage !== 'RENDER_VIDEO') {
+    return null
+  }
+  return (plan.value?.segments ?? []).find((segment) => segment.id === pendingId) ?? null
+})
+
 /** 渲染失败的片段：同样支持改提示词后只重试这一段 */
 const failedSegment = computed<VideoSegment | null>(() => {
-  if (reviewPendingSegment.value || props.task.stage !== 'RENDER_VIDEO') {
+  if (reviewPendingSegment.value || pendingPromptSegment.value || props.task.stage !== 'RENDER_VIDEO') {
     return null
   }
   const failedRender = (run.value?.renders ?? []).find((render) => render.status === 'failed')
@@ -458,25 +564,86 @@ const failedSegment = computed<VideoSegment | null>(() => {
 })
 
 const reviewSegment = computed(() => reviewPendingSegment.value ?? failedSegment.value)
+/** 当前正在审核的片段：生成后确认优先，否则只是生成前的提示词确认 */
+const activeReviewSegment = computed(() => reviewSegment.value ?? pendingPromptSegment.value)
 const reviewIsLast = computed(
   () => reviewSegment.value != null && reviewSegment.value.index >= (plan.value?.clipCount ?? 1) - 1,
 )
 
-/* 切换待审片段时才重置草稿，避免 2s 轮询覆盖用户正在输入的内容 */
+/** 长镜头被拆成多段时，台词只属于首段：后续段不允许再填台词。 */
+const segIsFirstOfShot = computed(() => {
+  const segment = activeReviewSegment.value
+  if (!segment) {
+    return false
+  }
+  return !(plan.value?.segments ?? []).some(
+    (item) => item.shotId === segment.shotId && item.index < segment.index,
+  )
+})
+
+/** 切换待审片段时才重置草稿，避免 2s 轮询覆盖用户正在输入的内容 */
 watch(
-  () => `${props.task.id}:${reviewSegment.value?.id ?? ''}`,
+  () => `${props.task.id}:${activeReviewSegment.value?.id ?? ''}:${reviewPendingSegment.value ? 'after' : 'before'}`,
   () => {
-    segPromptDraft.value = reviewSegment.value?.prompt ?? ''
-    segDialogueDraft.value = reviewSegment.value?.dialogue ?? ''
+    const segment = activeReviewSegment.value
+    segPromptDraft.value = segment?.prompt ?? ''
+    segDialogueDrafts.value = segment
+      ? (segment.dialogueLines ?? []).length > 0
+        ? (segment.dialogueLines ?? []).map((line) => ({ ...line }))
+        : (segment.dialogue ?? '').trim()
+          ? [{ speaker: segment.speaker ?? '', text: (segment.dialogue ?? '').trim() }]
+          : []
+      : []
     segFeedbackDraft.value = ''
   },
   { immediate: true },
 )
 
+/** 提交给后端的台词载荷：只保留有文本的行，并同步兼容字段。 */
+function segmentDialoguePayload(): { dialogue: string; dialogueLines: VideoDialogueLine[]; speaker: string } {
+  const lines = segIsFirstOfShot.value
+    ? segDialogueDrafts.value
+        .map((line) => ({ speaker: (line.speaker ?? '').trim(), text: (line.text ?? '').trim() }))
+        .filter((line) => line.text)
+    : []
+  return {
+    dialogue: lines.map((line) => line.text).join('\n'),
+    dialogueLines: lines,
+    speaker: lines.length === 1 ? lines[0].speaker : '',
+  }
+}
+
+function addSegmentDialogueLine() {
+  if (!segIsFirstOfShot.value) {
+    return
+  }
+  segDialogueDrafts.value.push({ speaker: '', text: '' })
+}
+
+function removeSegmentDialogueLine(index: number) {
+  segDialogueDrafts.value.splice(index, 1)
+}
+
 function approveSegment() {
   void guard('approve-segment', async () => {
     await backend.approveVideoSegment(props.task.id)
     actionInfo.value = reviewIsLast.value ? '片段已确认，进入合成阶段' : '片段已确认，开始生成下一段'
+  })
+}
+
+/** 生成前确认提示词：可原样放行，也可先在面板里改写再提交模型 */
+function approveSegmentPrompt() {
+  const segment = pendingPromptSegment.value
+  if (!segment) {
+    return
+  }
+  void guard('approve-prompt', async () => {
+    await backend.approveVideoSegmentPrompt(props.task.id, {
+      segmentId: segment.id,
+      visualPrompt: segPromptDraft.value.trim(),
+      ...segmentDialoguePayload(),
+    })
+    actionInfo.value = `第 ${segment.index + 1} 段提示词已确认，开始生成本段`
   })
 }
 
@@ -489,7 +656,7 @@ function regenerateSegment() {
     await backend.regenerateVideoSegment(props.task.id, {
       segmentId: segment.id,
       visualPrompt: segPromptDraft.value.trim(),
-      dialogue: segDialogueDraft.value.trim(),
+      ...segmentDialoguePayload(),
     })
     segFeedbackDraft.value = ''
     actionInfo.value = '已按修改后的提示词重新生成该段'
@@ -497,7 +664,7 @@ function regenerateSegment() {
 }
 
 function suggestSegmentPrompt() {
-  const segment = reviewSegment.value
+  const segment = activeReviewSegment.value
   if (!segment) {
     return
   }
@@ -508,7 +675,7 @@ function suggestSegmentPrompt() {
       segFeedbackDraft.value.trim(),
     )
     segPromptDraft.value = suggestion
-    actionInfo.value = 'AI 已按意见重写提示词，可直接重生成该段或继续微调'
+    actionInfo.value = 'AI 已按意见重写提示词，可直接确认生成或继续微调'
   })
 }
 
@@ -649,6 +816,29 @@ function revealOutput() {
       </dl>
     </section>
 
+    <!-- 角色档案：角色库 / 模板快照都会在任务创建时固化，审查时可直接核对外观锚点 -->
+    <section v-if="(config?.characterRefs ?? []).length > 0" class="block">
+      <header class="block__head">
+        <h4 class="block__title">角色档案</h4>
+        <span class="ui-chip">{{ config.characterRefs.length }} 个角色</span>
+      </header>
+      <p class="hint">
+        外观锚点会统一写进 Agent1 / Agent2 与本地兜底；任务保存的是创建时的档案快照，之后修改角色库不会改写本任务。
+      </p>
+      <div class="roles">
+        <div v-for="ref in config.characterRefs" :key="ref.roleId" class="role">
+          <span class="role__name">{{ ref.name || ref.roleId }}</span>
+          <span class="role__meta">{{ ref.roleId }}</span>
+          <span class="role__meta">{{ (ref.images ?? []).length }} 张定妆图</span>
+          <span v-if="ref.characterId" class="ui-chip ui-chip--ok">角色库快照</span>
+          <span v-if="ref.appearanceBlock" class="role__block">外观：{{ ref.appearanceBlock }}</span>
+          <span v-if="ref.persona" class="role__block">人设：{{ ref.persona }}</span>
+          <span v-if="ref.negativePrompt" class="role__block">禁止：{{ ref.negativePrompt }}</span>
+          <span v-if="ref.voiceHint" class="role__meta">声音：{{ ref.voiceHint }}</span>
+        </div>
+      </div>
+    </section>
+
     <!-- 关卡 ①：分镜确认 -->
     <section v-if="task.stage === 'CONFIRM_SCRIPT'" class="block">
       <header class="block__head">
@@ -676,22 +866,54 @@ function revealOutput() {
           <span class="ui-chip" :class="shotBudget(shot).fits ? 'ui-chip--ok' : 'ui-chip--error'">
             台词 ≈ {{ shotBudget(shot).seconds }}s / {{ formatSeconds(shotBudget(shot).window) }}
           </span>
-          <span class="ui-chip">{{ speakerLabelOf(shot.speaker) }}</span>
+          <span class="ui-chip">{{ dialogueSpeakerLabelOf(shot) }}</span>
         </header>
         <div class="grid grid--2">
           <label class="ui-field">
             <span class="ui-label">场景意图</span>
             <textarea v-model="shot.sceneIntent" class="ui-textarea" rows="2" :disabled="!canEditShots"></textarea>
           </label>
-          <label class="ui-field">
-            <span class="ui-label">台词（语速预算内）</span>
-            <textarea v-model="shot.dialogue" class="ui-textarea" rows="2" :disabled="!canEditShots"></textarea>
-            <select v-model="shot.speaker" class="ui-input" :disabled="!canEditShots || !shot.dialogue.trim()">
-              <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
-                {{ option.label }}
-              </option>
-            </select>
-          </label>
+          <div class="ui-field">
+            <div class="block__head">
+              <span class="ui-label">台词与说话人（语速预算内，可多行）</span>
+              <button
+                class="ui-btn ui-btn--ghost"
+                type="button"
+                :disabled="!canEditShots"
+                @click="addDialogueLine(shot, shot.roles ?? [])"
+              >+ 加一句</button>
+            </div>
+            <p v-if="dialogueLinesOf(shot).length === 0" class="hint">
+              本段无台词：画面内不会安排任何对口型动作。
+            </p>
+            <div v-for="(line, lineIndex) in dialogueLinesOf(shot)" :key="lineIndex" class="row dialogue-line">
+              <select
+                v-model="line.speaker"
+                class="ui-select"
+                :disabled="!canEditShots"
+                @change="onDialogueEdited(shot)"
+              >
+                <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
+              </select>
+              <input
+                v-model="line.text"
+                class="ui-input"
+                type="text"
+                :disabled="!canEditShots"
+                placeholder="这一句台词"
+                @input="onDialogueEdited(shot)"
+              />
+              <button
+                class="ui-btn ui-btn--ghost"
+                type="button"
+                :disabled="!canEditShots"
+                @click="removeDialogueLine(shot, lineIndex)"
+              >删除</button>
+            </div>
+            <span class="hint">按开口顺序排列；轮到谁开口，镜头就给到谁，其他角色嘴唇闭合。</span>
+          </div>
           <label class="ui-field">
             <span class="ui-label">角色（顿号 / 逗号分隔）</span>
             <input
@@ -771,8 +993,12 @@ function revealOutput() {
 
       <div v-if="plan" class="cost">
         <span class="ui-chip">适配器 {{ plan.adapter }}</span>
+        <span class="ui-chip">目标 {{ config.durationS }}s</span>
         <span class="ui-chip">分段 {{ plan.clipCount }}</span>
         <span class="ui-chip">预计时长 {{ plan.totalS }}s</span>
+        <span v-if="Math.abs(plan.totalS - config.durationS) >= 0.5" class="ui-chip ui-chip--warn">
+          档位差额 {{ (plan.totalS - config.durationS).toFixed(1) }}s
+        </span>
         <span class="ui-chip">{{ plan.serial ? '串行生成' : '可并行' }}</span>
         <span class="ui-chip">预计积分 {{ plan.estCredits }}</span>
       </div>
@@ -780,7 +1006,7 @@ function revealOutput() {
       <div v-for="(prompt, index) in promptDrafts" :key="prompt.shotId || index" class="prompt">
         <header class="prompt__head">
           <span class="shot__name">{{ prompt.shotId }}</span>
-          <span class="ui-chip">{{ speakerLabelOf(prompt.speaker) }}</span>
+          <span class="ui-chip">{{ dialogueSpeakerLabelOf(prompt) }}</span>
           <span v-if="promptNote(prompt.shotId)" class="ui-chip ui-chip--error">{{ promptNote(prompt.shotId) }}</span>
         </header>
         <label class="ui-field">
@@ -792,17 +1018,61 @@ function revealOutput() {
             :disabled="!canEditPrompts"
           ></textarea>
         </label>
+        <div class="ui-field">
+          <div class="block__head">
+            <span class="ui-label">台词与说话人（可多行，按开口顺序排列）</span>
+            <button
+              class="ui-btn ui-btn--ghost"
+              type="button"
+              :disabled="!canEditPrompts"
+              @click="addDialogueLine(prompt, shotRolesForPrompt(prompt.shotId))"
+            >+ 加一句</button>
+          </div>
+          <p v-if="dialogueLinesOf(prompt).length === 0" class="hint">
+            本段无台词：画面内不会安排任何对口型动作。
+          </p>
+          <div v-for="(line, lineIndex) in dialogueLinesOf(prompt)" :key="lineIndex" class="row dialogue-line">
+            <select
+              v-model="line.speaker"
+              class="ui-select"
+              :disabled="!canEditPrompts"
+              @change="onDialogueEdited(prompt)"
+            >
+              <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
+                {{ option.label }}
+              </option>
+            </select>
+            <input
+              v-model="line.text"
+              class="ui-input"
+              type="text"
+              :disabled="!canEditPrompts"
+              placeholder="这一句台词"
+              @input="onDialogueEdited(prompt)"
+            />
+            <button
+              class="ui-btn ui-btn--ghost"
+              type="button"
+              :disabled="!canEditPrompts"
+              @click="removeDialogueLine(prompt, lineIndex)"
+            >删除</button>
+          </div>
+          <span class="hint">轮到谁开口，镜头就给到谁；旁白段会在提示词里显式写明“画面内无人开口”。</span>
+        </div>
         <label class="ui-field">
-          <span class="ui-label">台词</span>
-          <textarea v-model="prompt.dialogue" class="ui-textarea" rows="2" :disabled="!canEditPrompts"></textarea>
-        </label>
-        <label class="ui-field">
-          <span class="ui-label">台词归属（决定镜头要不要给到说话人）</span>
-          <select v-model="prompt.speaker" class="ui-input" :disabled="!canEditPrompts || !prompt.dialogue.trim()">
-            <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
-              {{ option.label }}
-            </option>
-          </select>
+          <span class="ui-label">
+            本段时长（秒）· 当前计划 {{ promptPlanDuration(prompt.shotId) }}s
+          </span>
+          <input
+            v-model.number="prompt.durationS"
+            class="ui-input"
+            type="number"
+            min="0.5"
+            max="600"
+            step="0.5"
+            :disabled="!canEditPrompts"
+          />
+          <span class="hint">保存后按模型档位切分；实际总时长与档位差额会显示在计划里。</span>
         </label>
       </div>
 
@@ -827,6 +1097,7 @@ function revealOutput() {
         <button class="ui-btn" type="button" :disabled="busy !== ''" @click="regenerate">
           {{ busy === 'regenerate' ? '重算中…' : '按意见重新生成提示词' }}
         </button>
+        <p class="hint">整批重新生成会覆盖你在上面手工改过的提示词；只想改某一段时优先用逐段确认里的单段重渲。</p>
       </div>
     </section>
 
@@ -963,11 +1234,94 @@ function revealOutput() {
         <span v-if="reviewPendingSegment" class="ui-chip ui-chip--warn">
           第 {{ reviewPendingSegment.index + 1 }} 段待确认
         </span>
+        <span v-if="pendingPromptSegment" class="ui-chip ui-chip--warn">
+          第 {{ pendingPromptSegment.index + 1 }} 段待生成
+        </span>
       </header>
       <p v-if="renders.length === 0" class="hint">尚未产生片段；确认提示词后开始逐段生成。</p>
       <p v-if="reviewPendingSegment" class="ui-notice ui-notice--warn">
         逐段确认已开启：第 {{ reviewPendingSegment.index + 1 }} 段已生成，确认后才开始生成下一段；效果不佳可修改提示词（或让 AI 重写）后只重生成这一段。
       </p>
+
+      <!-- 生成前提示词确认（需求 11）：本段尚未提交视频模型，先确认再花钱 -->
+      <div v-if="pendingPromptSegment" class="review review--before">
+        <p class="review__title">
+          第 {{ pendingPromptSegment.index + 1 }} / {{ plan?.clipCount ?? 1 }} 段生成前确认 · 本段尚未提交视频模型，不会消耗额度
+        </p>
+        <div class="cost">
+          <span class="ui-chip">{{ pendingPromptSegment.durationS }}s</span>
+          <span class="ui-chip">起片来源：{{ segmentFirstFrameSource(pendingPromptSegment) }}</span>
+        </div>
+        <p class="hint">
+          下面就是即将发给视频模型的画面提示词。可直接确认生成，也可先改写提示词/台词（台词改动只影响本段）；生成后如需返工仍可逐段重渲。
+        </p>
+        <label class="ui-field">
+          <span class="ui-label">画面提示词</span>
+          <textarea v-model="segPromptDraft" class="ui-textarea" rows="4"></textarea>
+        </label>
+        <div class="ui-field">
+          <div class="block__head">
+            <span class="ui-label">台词与说话人（改动后该段重渲，字幕时间轴在视频生成后重铺）</span>
+            <button
+              class="ui-btn ui-btn--ghost"
+              type="button"
+              :disabled="!segIsFirstOfShot"
+              @click="addSegmentDialogueLine"
+            >+ 加一句</button>
+          </div>
+          <p v-if="!segIsFirstOfShot" class="hint">
+            本段属于长镜头的后续段：台词只属于镜头首段，不能在这里单独增改。
+          </p>
+          <p v-else-if="segDialogueDrafts.length === 0" class="hint">
+            本段无台词：画面内不会安排任何对口型动作。
+          </p>
+          <div v-for="(line, lineIndex) in segDialogueDrafts" :key="lineIndex" class="row dialogue-line">
+            <select v-model="line.speaker" class="ui-select" :disabled="!segIsFirstOfShot">
+              <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
+                {{ option.label }}
+              </option>
+            </select>
+            <input
+              v-model="line.text"
+              class="ui-input"
+              type="text"
+              :disabled="!segIsFirstOfShot"
+              placeholder="这一句台词"
+            />
+            <button
+              class="ui-btn ui-btn--ghost"
+              type="button"
+              :disabled="!segIsFirstOfShot"
+              @click="removeSegmentDialogueLine(lineIndex)"
+            >删除</button>
+          </div>
+        </div>
+        <div class="feedback">
+          <label class="ui-field">
+            <span class="ui-label">哪里想调整？（供 AI 重写提示词参考）</span>
+            <input
+              v-model="segFeedbackDraft"
+              class="ui-input"
+              type="text"
+              placeholder="例：主体动作更克制 / 光线更暖 / 镜头推进慢一点"
+            />
+          </label>
+          <button class="ui-btn" type="button" :disabled="busy !== ''" @click="suggestSegmentPrompt">
+            {{ busy === 'ai-suggest' ? 'AI 撰写中…' : 'AI 优化提示词' }}
+          </button>
+        </div>
+        <div class="actions">
+          <button
+            class="ui-btn ui-btn--primary"
+            type="button"
+            :disabled="busy !== '' || !segPromptDraft.trim()"
+            @click="approveSegmentPrompt"
+          >
+            {{ busy === 'approve-prompt' ? '提交中…' : '确认提示词，生成本段' }}
+          </button>
+        </div>
+      </div>
+
       <div v-for="row in renders" :key="row.render.segmentId" class="render">
         <header class="render__head">
           <span class="shot__name">
@@ -991,10 +1345,43 @@ function revealOutput() {
             <span class="ui-label">画面提示词</span>
             <textarea v-model="segPromptDraft" class="ui-textarea" rows="4"></textarea>
           </label>
-          <label class="ui-field">
-            <span class="ui-label">台词（改动后该段重渲，字幕时间轴在视频生成后重铺）</span>
-            <textarea v-model="segDialogueDraft" class="ui-textarea" rows="2"></textarea>
-          </label>
+          <div class="ui-field">
+            <div class="block__head">
+              <span class="ui-label">台词与说话人（改动后该段重渲，字幕时间轴在视频生成后重铺）</span>
+              <button
+                class="ui-btn ui-btn--ghost"
+                type="button"
+                :disabled="!segIsFirstOfShot"
+                @click="addSegmentDialogueLine"
+              >+ 加一句</button>
+            </div>
+            <p v-if="!segIsFirstOfShot" class="hint">
+              本段属于长镜头的后续段：台词只属于镜头首段，不能在这里单独增改。
+            </p>
+            <p v-else-if="segDialogueDrafts.length === 0" class="hint">
+              本段无台词：画面内不会安排任何对口型动作。
+            </p>
+            <div v-for="(line, lineIndex) in segDialogueDrafts" :key="lineIndex" class="row dialogue-line">
+              <select v-model="line.speaker" class="ui-select" :disabled="!segIsFirstOfShot">
+                <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
+              </select>
+              <input
+                v-model="line.text"
+                class="ui-input"
+                type="text"
+                :disabled="!segIsFirstOfShot"
+                placeholder="这一句台词"
+              />
+              <button
+                class="ui-btn ui-btn--ghost"
+                type="button"
+                :disabled="!segIsFirstOfShot"
+                @click="removeSegmentDialogueLine(lineIndex)"
+              >删除</button>
+            </div>
+          </div>
           <div class="feedback">
             <label class="ui-field">
               <span class="ui-label">哪里不满意？（供 AI 重写提示词参考）</span>
@@ -1260,6 +1647,26 @@ function revealOutput() {
   flex-direction: column;
   gap: 12px;
   padding-bottom: 12px;
+}
+
+/* 台词行：说话人选择固定宽度，台词输入吃掉剩余空间 */
+.dialogue-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.dialogue-line .ui-select {
+  flex: 0 0 190px;
+}
+
+.dialogue-line .ui-input {
+  flex: 1 1 auto;
+}
+
+.dialogue-line .ui-btn {
+  flex: 0 0 auto;
 }
 
 .head {

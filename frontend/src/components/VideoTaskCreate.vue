@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 
 import { consumeCrawlDraft, type CrawlVideoDraft } from '../composables/crawlNav'
 import { consumePendingTemplate } from '../composables/templateNav'
@@ -29,9 +29,12 @@ import {
   formatClock,
   type ScriptMode,
   type TailFrameAsset,
+  type VideoCharacter,
+  type VideoDialogueLine,
   type VideoEnvironment,
   type VideoProject,
   type VideoRunConfig,
+  type VideoShot,
 } from '../types/video'
 
 const emit = defineEmits<{ (event: 'created', taskId: string): void }>()
@@ -58,6 +61,79 @@ const characterImagesText = ref<string[]>([])
 /** 模板带进来的那一份图路径：用来区分「模板定妆图」与「我自己选的图」 */
 const templateCharacterImages = ref<string[]>([])
 const characterUploadNote = ref('')
+
+/* ---------------- 角色库：跨任务复用角色档案 ---------------- */
+const characterLibrary = ref<VideoCharacter[]>([])
+const characterLibraryError = ref('')
+const characterLibraryId = ref('')
+
+async function loadCharacterLibrary() {
+  try {
+    characterLibrary.value = await backend.listVideoCharacters()
+    characterLibraryError.value = ''
+  } catch (error) {
+    characterLibrary.value = []
+    characterLibraryError.value = errorText(error)
+  }
+}
+
+/** 把角色库档案加入本任务：留空字段由后端再按角色库补全，这里先填好便于确认。 */
+function addCharacterFromLibrary() {
+  const character = characterLibrary.value.find((item) => item.id === characterLibraryId.value)
+  if (!character) {
+    return
+  }
+  form.characterRefs.push({
+    characterId: character.id,
+    roleId: character.roleId || character.id,
+    name: character.name,
+    images: [...(character.images ?? [])],
+    imageSource: (character.images ?? []).length > 0 ? 'user' : '',
+    appearanceBlock: character.appearanceBlock,
+    persona: character.persona,
+    negativePrompt: character.negativePrompt,
+    perspective: character.perspective,
+    voiceHint: character.voiceHint,
+    voiceProfile: character.voiceProfile ? { ...character.voiceProfile } : null,
+  })
+  characterImagesText.value.push((character.images ?? []).join(';'))
+  // 角色库的图是用户维护的权威定妆图，不参与「模板图被覆盖」的提示
+  templateCharacterImages.value.push('')
+  syncRoleIDSnapshot()
+  characterUploadNote.value = `已从角色库加入「${character.name}」：外观锚点、人设、负向约束与音色会随任务一起快照。`
+}
+
+/** 把当前任务里的角色设定存回角色库，便于下次直接复用。 */
+async function saveCharacterToLibrary(index: number) {
+  const ref = form.characterRefs[index]
+  if (!ref || !ref.name.trim()) {
+    characterLibraryError.value = '保存到角色库前请先填写角色名称'
+    return
+  }
+  try {
+    const saved = await backend.saveVideoCharacter({
+      id: ref.characterId ?? '',
+      name: ref.name.trim(),
+      roleId: ref.roleId.trim(),
+      appearanceBlock: (ref.appearanceBlock ?? '').trim(),
+      persona: (ref.persona ?? '').trim(),
+      negativePrompt: (ref.negativePrompt ?? '').trim(),
+      voiceHint: ref.voiceHint.trim(),
+      voiceProfile: ref.voiceProfile ?? null,
+      perspective: (ref.perspective ?? '').trim(),
+      images: splitImages(characterImagesText.value[index] ?? ''),
+      tags: [],
+      note: '',
+      createdAt: '',
+      updatedAt: '',
+    })
+    ref.characterId = saved.id
+    await loadCharacterLibrary()
+    characterUploadNote.value = `角色「${saved.name}」已保存到角色库，下次新建任务可直接选择。`
+  } catch (error) {
+    characterLibraryError.value = errorText(error)
+  }
+}
 
 /* ---------------- 尾帧资产：历史任务的尾帧可直接选作本任务首帧 ---------------- */
 const tailAssets = ref<TailFrameAsset[]>([])
@@ -147,7 +223,13 @@ function readPath(path: string): string {
     const images = form.characterRefs
       .map((_, index) => characterImagesText.value[index] ?? '')
       .join(';')
-    return `${names}|${images}`
+    // 档案字段也算“改过”：模板带外观、用户改人设时不能误判成没动过
+    const profiles = form.characterRefs
+      .map((ref) =>
+        [ref.appearanceBlock ?? '', ref.persona ?? '', ref.negativePrompt ?? '', ref.perspective ?? '', ref.voiceHint].join('|'),
+      )
+      .join('、')
+    return `${names}|${images}|${profiles}`
   }
   const [head, tail] = path.split('.')
   const record = form as unknown as Record<string, unknown>
@@ -331,10 +413,15 @@ function applyTemplate(template: VideoTemplate) {
       roleId: character.roleId || `char_${index + 1}`,
       name: character.name,
       images: [...(character.images ?? [])],
+      appearanceBlock: character.appearanceBlock,
+      persona: '',
+      negativePrompt: '',
+      perspective: character.perspective,
       voiceHint: character.voiceHint,
     }))
     characterImagesText.value = form.characterRefs.map((ref) => ref.images.join(';'))
     templateCharacterImages.value = [...characterImagesText.value]
+    syncRoleIDSnapshot()
     mark('characterRefs')
   }
 
@@ -537,17 +624,23 @@ onMounted(async () => {
   } catch (error) {
     loadError.value = errorText(error)
   }
+  await loadCharacterLibrary()
 })
 
 function addCharacter() {
   form.characterRefs.push({
-    roleId: `char_${form.characterRefs.length + 1}`,
+    roleId: nextCharacterRoleID(),
     name: '',
     images: [],
+    appearanceBlock: '',
+    persona: '',
+    negativePrompt: '',
+    perspective: '',
     voiceHint: '',
   })
   characterImagesText.value.push('')
   templateCharacterImages.value.push('')
+  syncRoleIDSnapshot()
 }
 
 /** 一个角色的图到底是谁给的：上传图优先，模板生成图只作退路 */
@@ -566,9 +659,161 @@ function characterImageBadgeClass(index: number): string {
 }
 
 function removeCharacter(index: number) {
+  const removed = (form.characterRefs[index]?.roleId ?? '').trim()
   form.characterRefs.splice(index, 1)
   characterImagesText.value.splice(index, 1)
   templateCharacterImages.value.splice(index, 1)
+  if (removed) {
+    // 角色被删掉后手动分段里不能还留着他的台词归属与出场勾选
+    for (const shot of form.manualShots ?? []) {
+      shot.roles = shot.roles.filter((role) => role !== removed)
+      if (shot.dialogueLines) {
+        shot.dialogueLines = shot.dialogueLines.filter((line) => line.speaker !== removed)
+      }
+      if ((shot.speaker ?? '') === removed) {
+        shot.speaker = ''
+      }
+      syncShotDialogue(shot)
+    }
+  }
+  syncRoleIDSnapshot()
+}
+
+/* ---------------- 角色标识：唯一性与引用同步 ---------------- */
+
+/** 下一个可用的角色标识：扫描已有 char_N 的最大后缀，删除后再添加不会撞号。 */
+function nextCharacterRoleID(): string {
+  let max = 0
+  for (const ref of form.characterRefs) {
+    const match = /^char_(\d+)$/i.exec((ref.roleId ?? '').trim())
+    if (match) {
+      max = Math.max(max, Number(match[1]))
+    }
+  }
+  const used = new Set(
+    form.characterRefs.map((ref) => (ref.roleId ?? '').trim().toLowerCase()).filter(Boolean),
+  )
+  let candidate = `char_${max + 1}`
+  while (used.has(candidate.toLowerCase())) {
+    max += 1
+    candidate = `char_${max + 1}`
+  }
+  return candidate
+}
+
+/** 角色标识重复清单：重复会让台词归属永远绑不到确定的人，提交前必须挡住。 */
+const duplicateRoleIDs = computed(() => {
+  const seen = new Set<string>()
+  const duplicates = new Set<string>()
+  for (const ref of form.characterRefs) {
+    const roleId = (ref.roleId ?? '').trim().toLowerCase()
+    if (!roleId) {
+      continue
+    }
+    if (seen.has(roleId)) {
+      duplicates.add(roleId)
+    }
+    seen.add(roleId)
+  }
+  return [...duplicates]
+})
+
+/** 角色标识改名前后的快照：用户直接编辑输入框时，把引用一起搬走。 */
+const roleIDSnapshot = ref<string[]>([])
+
+function syncRoleIDSnapshot() {
+  roleIDSnapshot.value = form.characterRefs.map((ref) => (ref.roleId ?? '').trim())
+}
+
+function retargetRole(oldRoleID: string, newRoleID: string) {
+  if (!oldRoleID || !newRoleID || oldRoleID === newRoleID) {
+    return
+  }
+  for (const shot of form.manualShots ?? []) {
+    shot.roles = [...new Set(shot.roles.map((role) => (role === oldRoleID ? newRoleID : role)))]
+    for (const line of shotDialogueLines(shot)) {
+      if (line.speaker === oldRoleID) {
+        line.speaker = newRoleID
+      }
+    }
+    if ((shot.speaker ?? '') === oldRoleID) {
+      shot.speaker = newRoleID
+    }
+    syncShotDialogue(shot)
+  }
+}
+
+watch(
+  () => form.characterRefs.map((ref) => ref.roleId),
+  (next) => {
+    const previous = roleIDSnapshot.value
+    next.forEach((roleId, index) => {
+      const old = (previous[index] ?? '').trim()
+      const current = (roleId ?? '').trim()
+      if (old && old !== current) {
+        retargetRole(old, current)
+      }
+    })
+    roleIDSnapshot.value = next.map((roleId) => (roleId ?? '').trim())
+  },
+)
+
+/* ---------------- 手动分段：多说话人台词 ---------------- */
+
+/** 取某段的台词行；旧路径只有 dialogue/speaker 时自动升级成一行。 */
+function shotDialogueLines(shot: VideoShot): VideoDialogueLine[] {
+  if (!shot.dialogueLines) {
+    shot.dialogueLines = []
+  }
+  if (shot.dialogueLines.length === 0 && (shot.dialogue ?? '').trim()) {
+    shot.dialogueLines.push({ speaker: (shot.speaker ?? '').trim(), text: (shot.dialogue ?? '').trim() })
+  }
+  return shot.dialogueLines
+}
+
+/** 把台词行同步回兼容字段：dialogue 是全部文本，speaker 只在单说话人时保留。 */
+function syncShotDialogue(shot: VideoShot) {
+  const lines = (shot.dialogueLines ?? [])
+    .map((line) => ({ speaker: (line.speaker ?? '').trim(), text: (line.text ?? '').trim() }))
+    .filter((line) => line.text)
+  shot.dialogueLines = lines
+  shot.dialogue = lines.map((line) => line.text).join('\n')
+  shot.speaker = lines.length === 1 ? lines[0].speaker : ''
+  // 角色开口就必须算作出场，否则参考图与提示词都找不到这张脸。
+  for (const line of lines) {
+    if (!line.speaker || line.speaker === 'narration') {
+      continue
+    }
+    if (!shot.roles.includes(line.speaker)) {
+      shot.roles.push(line.speaker)
+    }
+  }
+}
+
+function addDialogueLine(index: number) {
+  const shot = form.manualShots?.[index]
+  if (!shot) {
+    return
+  }
+  const lines = shotDialogueLines(shot)
+  const fallbackSpeaker = shot.roles.length === 1 ? shot.roles[0] : ''
+  lines.push({ speaker: fallbackSpeaker, text: '' })
+}
+
+function removeDialogueLine(index: number, lineIndex: number) {
+  const shot = form.manualShots?.[index]
+  if (!shot) {
+    return
+  }
+  shotDialogueLines(shot).splice(lineIndex, 1)
+  syncShotDialogue(shot)
+}
+
+function onDialogueSpeakerChange(index: number) {
+  const shot = form.manualShots?.[index]
+  if (shot) {
+    syncShotDialogue(shot)
+  }
 }
 
 async function pickFirstFrame() {
@@ -717,6 +962,21 @@ async function submit() {
       submitError.value = `第 ${missing + 1} 段还没写画面内容（分段必填）`
       return
     }
+    // 台词行与兼容字段先对齐，免得提交的还是上一版文本
+    for (const shot of shots) {
+      syncShotDialogue(shot)
+    }
+  }
+
+  // 空标识先补成不撞号的 char_N，再做唯一性校验
+  for (const ref of form.characterRefs) {
+    if (!(ref.roleId ?? '').trim()) {
+      ref.roleId = nextCharacterRoleID()
+    }
+  }
+  if (duplicateRoleIDs.value.length > 0) {
+    submitError.value = `角色标识重复：${duplicateRoleIDs.value.join('、')}。每个角色的 role_id 必须唯一，否则台词归属绑不到确定的人`
+    return
   }
 
   const config: VideoRunConfig = {
@@ -735,7 +995,7 @@ async function submit() {
         return {
           ...ref,
           name: ref.name.trim(),
-          roleId: ref.roleId.trim() || `char_${index + 1}`,
+          roleId: ref.roleId.trim() || nextCharacterRoleID(),
           images,
           imageSource: images.length > 0 ? (inherited ? 'template' : 'user') : '',
         }
@@ -979,6 +1239,22 @@ async function submit() {
             当前没有首帧或角色参考图：出镜主体默认使用猫 / 狗 / 猪 / 鸡等动物（可拟人化），避开真人形象。
           </template>
         </p>
+        <div v-if="characterLibrary.length > 0" class="character-picker">
+          <select v-model="characterLibraryId" class="ui-select">
+            <option value="">从角色库选择…</option>
+            <option v-for="character in characterLibrary" :key="character.id" :value="character.id">
+              {{ character.name }}（{{ character.roleId }}）
+            </option>
+          </select>
+          <button class="ui-btn" type="button" :disabled="!characterLibraryId" @click="addCharacterFromLibrary">
+            加入本任务
+          </button>
+          <span class="hint">选中后会把外观锚点、人设、负向约束、音色与默认定妆图一起带入。</span>
+        </div>
+        <p v-else class="hint">
+          角色库为空：可先到「视频生成 → 角色库」沉淀常驻角色，或直接在下面添加并存回角色库。
+        </p>
+        <p v-if="characterLibraryError" class="hint hint--warn">{{ characterLibraryError }}</p>
         <div v-for="(ref, index) in form.characterRefs" :key="index" class="character">
           <input v-model="ref.name" class="ui-input" type="text" placeholder="角色名称，如 橘座（猫）" />
           <input
@@ -993,7 +1269,58 @@ async function submit() {
           }}</span>
           <button class="ui-btn" type="button" @click="pickCharacterImages(index)">选择…</button>
           <button class="ui-btn ui-btn--ghost" type="button" @click="removeCharacter(index)">移除</button>
+          <details class="character__profile">
+            <summary>角色档案：外观锚点 / 人设 / 负向约束 / 声音</summary>
+            <label class="ui-field">
+              <span class="ui-label">外观锚点（会写进每段提示词；有上传图时以图为准）</span>
+              <textarea
+                v-model="ref.appearanceBlock"
+                class="ui-textarea"
+                rows="2"
+                placeholder="成年橘色短毛猫，圆脸，耳尖一小撮白毛，脖子系米白色针织围巾"
+              ></textarea>
+            </label>
+            <label class="ui-field">
+              <span class="ui-label">人设 / 口吻</span>
+              <textarea
+                v-model="ref.persona"
+                class="ui-textarea"
+                rows="2"
+                placeholder="慢热、嘴硬心软；说话短句，不堆成语"
+              ></textarea>
+            </label>
+            <div class="grid grid--2">
+              <label class="ui-field">
+                <span class="ui-label">角色负向约束</span>
+                <input
+                  v-model="ref.negativePrompt"
+                  class="ui-input"
+                  type="text"
+                  placeholder="不要出现项圈铃铛"
+                />
+              </label>
+              <label class="ui-field">
+                <span class="ui-label">声音提示</span>
+                <input v-model="ref.voiceHint" class="ui-input" type="text" placeholder="温暖中音，4.2 字/秒" />
+              </label>
+              <label class="ui-field">
+                <span class="ui-label">视角约定</span>
+                <input v-model="ref.perspective" class="ui-input" type="text" placeholder="主视角，正对镜头半身" />
+              </label>
+              <label class="ui-field">
+                <span class="ui-label">分镜角色标识（role_id）</span>
+                <input v-model="ref.roleId" class="ui-input" type="text" placeholder="host" />
+              </label>
+            </div>
+            <div class="character__actions">
+              <span v-if="ref.characterId" class="ui-chip ui-chip--ok">已绑定角色库</span>
+              <button class="ui-btn" type="button" @click="saveCharacterToLibrary(index)">保存到角色库</button>
+            </div>
+          </details>
         </div>
+        <p v-if="duplicateRoleIDs.length > 0" class="ui-notice ui-notice--error">
+          角色标识重复：{{ duplicateRoleIDs.join('、') }}。每个角色的 role_id 必须唯一，否则台词归属绑不到确定的人。
+        </p>
         <p v-if="characterUploadNote" class="hint">{{ characterUploadNote }}</p>
         <p v-if="form.characterRefs.length > 0" class="hint">
           默认严格锁帧：有首帧（含上一段尾帧延续出的首帧）的片段按「图生视频-首帧」提交，角色图会让位（官方规则：首帧与参考图两类任务互斥），
@@ -1108,7 +1435,7 @@ async function submit() {
         </p>
         <template v-if="scriptMode === 'manual'">
           <div class="block__head">
-            <span class="hint">画面内容是必填项；角色只表示「本段出场」，要说话请在「说话人」里选。</span>
+            <span class="hint">画面内容是必填项；角色只表示「本段出场」，台词按开口顺序一行一句，可以多个人轮流说。</span>
             <button class="ui-btn" type="button" @click="addManualShot">+ 添加一段</button>
           </div>
           <div v-for="(shot, index) in manualShots" :key="index" class="manual">
@@ -1150,17 +1477,38 @@ async function submit() {
                 placeholder="例：清晨窗边，橘座伸爪推开窗帘，光斑落在木桌上"
               ></textarea>
             </label>
-            <div class="grid grid--2">
-              <label class="ui-field">
-                <span class="ui-label">台词（可空）</span>
-                <textarea v-model="shot.dialogue" class="ui-textarea" rows="2" placeholder="例：今天也要好好喝一杯"></textarea>
-              </label>
-              <label class="ui-field">
-                <span class="ui-label">说话人</span>
-                <select v-model="shot.speaker" class="ui-select">
-                  <option v-for="option in speakerOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+            <div class="ui-field">
+              <div class="block__head">
+                <span class="ui-label">台词与说话人（可空，可多行）</span>
+                <button class="ui-btn ui-btn--ghost" type="button" @click="addDialogueLine(index)">+ 加一句</button>
+              </div>
+              <p v-if="shotDialogueLines(shot).length === 0" class="hint">
+                本段无台词：画面内不会安排任何对口型动作。
+              </p>
+              <div v-for="(line, lineIndex) in shotDialogueLines(shot)" :key="lineIndex" class="row dialogue-line">
+                <select
+                  v-model="line.speaker"
+                  class="ui-select"
+                  @change="onDialogueSpeakerChange(index)"
+                >
+                  <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
+                    {{ option.label }}
+                  </option>
                 </select>
-              </label>
+                <input
+                  v-model="line.text"
+                  class="ui-input"
+                  type="text"
+                  placeholder="这一句台词"
+                  @input="syncShotDialogue(shot)"
+                />
+                <button
+                  class="ui-btn ui-btn--ghost"
+                  type="button"
+                  @click="removeDialogueLine(index, lineIndex)"
+                >删除</button>
+              </div>
+              <span class="hint">按开口顺序排列；轮到谁开口，镜头就给到谁，其他角色嘴唇闭合。</span>
             </div>
             <div class="ui-field">
               <span class="ui-label">本段出场角色（勾了就算出场：参考图与提示词会带上）</span>
@@ -1196,7 +1544,8 @@ async function submit() {
             </div>
           </div>
           <p class="hint">
-            只填台词不选说话人时：本段唯一角色自动当说话人，否则按旁白处理。台词与角色都填了却缺画面内容，会在后端创建任务时直接报错。
+            说话人留空时：本段唯一角色自动当说话人，否则按旁白处理。每行台词独立归属，一段可以有多个角色轮流开口；
+            纯旁白段落会在提示词里显式写明“画面内无人开口”。台词与角色都填了却缺画面内容，会在后端创建任务时直接报错。
           </p>
         </template>
       </section>
@@ -1476,12 +1825,58 @@ async function submit() {
   min-width: 0;
 }
 
+/* 台词行：说话人选择固定宽度，台词输入吃掉剩余空间 */
+.dialogue-line .ui-select {
+  flex: 0 0 190px;
+}
+
+.dialogue-line .ui-input {
+  flex: 1 1 auto;
+}
+
+.dialogue-line .ui-btn {
+  flex: 0 0 auto;
+}
+
 .character {
   display: grid;
   /* 新增一列给来源标签：没图时 v-if 不渲染，auto 轨道自然为 0 */
   grid-template-columns: minmax(120px, 0.6fr) minmax(220px, 2fr) auto auto auto;
   gap: 8px;
   align-items: center;
+}
+
+.character-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.character__profile {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 2px;
+  padding: 10px;
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.character__profile summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.character__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 /* 手动分段：一段一张卡片，段头放时长与排序 */

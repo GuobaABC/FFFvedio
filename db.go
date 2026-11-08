@@ -95,6 +95,17 @@ CREATE TABLE IF NOT EXISTS video_templates (
 );
 CREATE INDEX IF NOT EXISTS idx_video_templates_scope ON video_templates (scope, updated_at);
 
+-- 视频角色库：跨任务复用的角色档案（外观锚点 / 人设 / 负向约束 / 音色 / 默认定妆图）
+CREATE TABLE IF NOT EXISTS video_characters (
+	id           TEXT PRIMARY KEY,
+	name         TEXT NOT NULL,
+	tags_json    TEXT NOT NULL DEFAULT '[]',
+	payload_json TEXT NOT NULL,
+	created_at   TEXT NOT NULL,
+	updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_video_characters_updated ON video_characters (updated_at);
+
 -- 热点爬取任务：config_json 存输入契约，context_json 存 URL 结果/条目/统计
 CREATE TABLE IF NOT EXISTS crawl_tasks (
 	id           TEXT PRIMARY KEY,

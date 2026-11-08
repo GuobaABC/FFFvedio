@@ -116,6 +116,90 @@ func TestBuildVideoPlanSplitsLongShot(t *testing.T) {
 	}
 }
 
+// 切分要尽量贴近用户要求的时长：21s 在 [5,10] 档位下应组合成 20s（10+5+5），
+// 而不是平均成 3×7 再逐段就近取 5、最后只剩 15s。
+func TestSplitShotDurationsKeepsRemainder(t *testing.T) {
+	got := splitShotDurations(21, []int{5, 10}, 10)
+	if len(got) != 3 {
+		t.Fatalf("21s 应切成 3 段，实际 %d 段：%v", len(got), got)
+	}
+	sum := 0
+	for _, part := range got {
+		sum += part
+	}
+	if sum != 20 {
+		t.Fatalf("21s 按档位组合应接近 20s，实际 %ds：%v", sum, got)
+	}
+	if got[0] != 10 {
+		t.Fatalf("长段应排在前面，实际 %v", got)
+	}
+}
+
+// 关卡②改段时长要真正生效：本段变长，后面的镜头整体顺延，任务目标时长跟着重算。
+func TestPromptEditsChangeDurationAndReflow(t *testing.T) {
+	cfg, _, err := normalizeVideoConfig(VideoRunConfig{Topic: "测试主题", DurationS: 12})
+	if err != nil {
+		t.Fatalf("归一化失败: %v", err)
+	}
+	prompts := []VideoPromptItem{
+		{ShotID: "s1", VisualPrompt: "推镜", Start: 0, End: 6},
+		{ShotID: "s2", VisualPrompt: "拉远", Start: 6, End: 12},
+	}
+	if err := applyPromptEdits(prompts, []VideoPromptEdit{
+		{ShotID: "s1", VisualPrompt: "推镜", DurationS: 8},
+	}, cfg, defaultVideoCapabilities()); err != nil {
+		t.Fatalf("保存提示词失败: %v", err)
+	}
+	if prompts[0].End-prompts[0].Start != 8 {
+		t.Fatalf("第 1 段时长应改为 8s，实际 %.1f", prompts[0].End-prompts[0].Start)
+	}
+	if prompts[1].Start != 8 || prompts[1].End != 14 {
+		t.Fatalf("后续镜头应顺延到 8~14s，实际 %.1f~%.1f", prompts[1].Start, prompts[1].End)
+	}
+	if total := promptTotalSeconds(prompts); total != 14 {
+		t.Fatalf("时间轴总长应为 14s，实际 %.1f", total)
+	}
+	script := &VideoScript{Shots: []VideoShot{
+		{ID: "s1", DurationS: 6, TimeRange: [2]float64{0, 6}},
+		{ID: "s2", DurationS: 6, TimeRange: [2]float64{6, 12}},
+	}}
+	updatedCfg := cfg
+	syncPromptTimelineToScript(&updatedCfg, script, prompts)
+	if script.Shots[0].DurationS != 8 || script.Shots[1].TimeRange != [2]float64{8, 14} {
+		t.Fatalf("改过的时长应写回分镜，实际 %+v", script.Shots)
+	}
+}
+
+// 提交了不存在的 shotId 不能再静默忽略：否则用户以为保存成功，实际整条修改被丢掉。
+func TestPromptEditsRejectUnknownShot(t *testing.T) {
+	cfg, _, _ := normalizeVideoConfig(VideoRunConfig{Topic: "测试主题", DurationS: 6})
+	prompts := []VideoPromptItem{{ShotID: "s1", VisualPrompt: "推镜", Start: 0, End: 6}}
+	if err := applyPromptEdits(prompts, []VideoPromptEdit{
+		{ShotID: "s99", VisualPrompt: "推镜"},
+	}, cfg, defaultVideoCapabilities()); err == nil {
+		t.Fatal("不存在的 shotId 应该报错")
+	}
+	if err := applyPromptEdits(prompts, []VideoPromptEdit{
+		{ShotID: "s1", VisualPrompt: "  "},
+	}, cfg, defaultVideoCapabilities()); err == nil {
+		t.Fatal("空提示词应该报错")
+	}
+}
+
+// 裁剪台词的预算必须与估算公式一致：（时长 - 0.3）× 语速。
+func TestTrimDialogueUsesSameBudgetAsEstimate(t *testing.T) {
+	if budget := speechUnitBudget(6, 4, "zh-CN"); budget != 22 {
+		t.Fatalf("6s × 4 字/秒应先扣 0.3s 缓冲，预算应为 22 字，实际 %d", budget)
+	}
+	trimmed := trimDialogueToBudget(strings.Repeat("字", 30), 6, 4, "zh-CN")
+	if units := speechUnitCount(trimmed, "zh-CN"); units > 22 {
+		t.Fatalf("裁剪后不应超过预算 22 字，实际 %d 字", units)
+	}
+	if estimate := estimateSpeechSeconds(trimmed, "zh-CN", 4); estimate > 6+0.1 {
+		t.Fatalf("裁剪后的台词不应再被判超时，估算 %.2fs", estimate)
+	}
+}
+
 func TestSubtitleCuesAlignedWithSegments(t *testing.T) {
 	cfg, _, _ := normalizeVideoConfig(VideoRunConfig{Topic: "测试", DurationS: 10, SpeechRate: 4})
 	plan := VideoPlan{Segments: []VideoSegment{
@@ -636,9 +720,39 @@ func TestPromptEditsPreserveUserText(t *testing.T) {
 		t.Fatalf("归一化失败: %v", err)
 	}
 	edited := []VideoPromptItem{{ShotID: "s1", VisualPrompt: "固定机位，真人推开店门", Start: 0, End: 6}}
-	applyPromptEdits(edited, []VideoPromptEdit{{ShotID: "s1", VisualPrompt: "固定机位，真人推开店门"}}, cfg)
+	if err := applyPromptEdits(edited, []VideoPromptEdit{{ShotID: "s1", VisualPrompt: "固定机位，真人推开店门"}}, cfg, defaultVideoCapabilities()); err != nil {
+		t.Fatalf("保存提示词失败: %v", err)
+	}
 	if edited[0].VisualPrompt != "固定机位，真人推开店门" {
 		t.Fatalf("用户改写应原样保留: %q", edited[0].VisualPrompt)
+	}
+}
+
+// 首帧只是起点：有首帧时提示词要说明“后续变化优先、只保持主体身份连续”；
+// 没有首帧时不能凭空多出这层约束。
+func TestFirstFrameSemanticsOnlyWhenFirstFrameGiven(t *testing.T) {
+	caps := defaultVideoCapabilities()
+	without := VideoRunConfig{Topic: "无首帧", DurationS: 6}
+	if strings.Contains(promptSystemPrompt(without, caps), "首帧是起始状态") {
+		t.Fatal("没有首帧时不应出现首帧语义约束")
+	}
+	if local := localVisualPrompt(without, VideoShot{SceneIntent: "推门进店"}, caps); strings.Contains(local, "首帧") {
+		t.Fatalf("没有首帧时本地提示词不应提首帧: %s", local)
+	}
+
+	with := VideoRunConfig{Topic: "有首帧", DurationS: 6, FirstFrame: "https://example.com/first.png"}
+	prompt := promptSystemPrompt(with, caps)
+	if !strings.Contains(prompt, "首帧是起始状态") || !strings.Contains(prompt, "以提示词的新画面为准") {
+		t.Fatalf("有首帧时 Agent2 提示词应说明首帧只是起点:\n%s", prompt)
+	}
+	if !strings.Contains(scriptSystemPrompt(with), "首帧只是起点") {
+		t.Fatal("有首帧时 Agent1 也不该把首帧当成最终画面锁死")
+	}
+	if local := localVisualPrompt(with, VideoShot{SceneIntent: "推门进店"}, caps); !strings.Contains(local, "不锁死首帧背景与机位") {
+		t.Fatalf("关闭文本模型时本地兜底也要遵守首帧语义: %s", local)
+	}
+	if suggest := segmentPromptSuggestSystemPrompt(with, caps); !strings.Contains(suggest, "首帧是起始状态") {
+		t.Fatalf("单段 AI 优化也要遵守首帧语义:\n%s", suggest)
 	}
 }
 
@@ -1281,12 +1395,15 @@ func TestDialogueSpeakerReachesRenderPrompt(t *testing.T) {
 		t.Fatalf("角色台词应带显示名，得到 %q", plan.Segments[0].SpeakerName)
 	}
 
-	first := composeRenderPrompt(plan.Segments[0], caps)
+	first := composeRenderPrompt(plan.Segments[0], caps, cfg)
 	if !strings.Contains(first, "主理人（橘猫） 说") || !strings.Contains(first, "今日开业") {
 		t.Fatalf("角色台词没绑定到说话人：\n%s", first)
 	}
+	if !strings.Contains(first, "语速约 4.0 字/秒") {
+		t.Fatalf("原生音频通道应把用户设置的语速写进提示词：\n%s", first)
+	}
 
-	narration := composeRenderPrompt(plan.Segments[1], caps)
+	narration := composeRenderPrompt(plan.Segments[1], caps, cfg)
 	if !strings.Contains(narration, "旁白（画外音") || strings.Contains(narration, "说（只允许") {
 		t.Fatalf("旁白不该要求主体对口型：\n%s", narration)
 	}
@@ -1305,19 +1422,26 @@ func TestSpeakerRoleBringsCharacterImage(t *testing.T) {
 // 关卡②里改台词归属要真的生效，清空台词则归属一并清空。
 func TestPromptEditorCanRebindSpeaker(t *testing.T) {
 	cfg := speakerTestConfig()
+	caps := defaultVideoCapabilities()
 	prompts := []VideoPromptItem{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: "谢谢惠顾", Speaker: "host"}}
 
-	applyPromptEdits(prompts, []VideoPromptEdit{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: "谢谢惠顾", Speaker: "画外音"}}, cfg)
+	if err := applyPromptEdits(prompts, []VideoPromptEdit{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: "谢谢惠顾", Speaker: "画外音"}}, cfg, caps); err != nil {
+		t.Fatalf("保存提示词失败: %v", err)
+	}
 	if prompts[0].Speaker != VideoSpeakerNarration {
 		t.Fatalf("改成旁白应归一成 narration，得到 %q", prompts[0].Speaker)
 	}
 
-	applyPromptEdits(prompts, []VideoPromptEdit{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: "谢谢惠顾", Speaker: "客人"}}, cfg)
+	if err := applyPromptEdits(prompts, []VideoPromptEdit{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: "谢谢惠顾", Speaker: "客人"}}, cfg, caps); err != nil {
+		t.Fatalf("保存提示词失败: %v", err)
+	}
 	if prompts[0].Speaker != "guest" {
 		t.Fatalf("按角色名改归属应归一成 role_id，得到 %q", prompts[0].Speaker)
 	}
 
-	applyPromptEdits(prompts, []VideoPromptEdit{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: ""}}, cfg)
+	if err := applyPromptEdits(prompts, []VideoPromptEdit{{ShotID: "s1", VisualPrompt: "推镜", Dialogue: ""}}, cfg, caps); err != nil {
+		t.Fatalf("保存提示词失败: %v", err)
+	}
 	if prompts[0].Speaker != "" {
 		t.Fatalf("台词清空后归属应跟着清空，得到 %q", prompts[0].Speaker)
 	}
@@ -1402,6 +1526,85 @@ func TestPromptStageEditClearsSubtitlesInsteadOfRebuilding(t *testing.T) {
 	}
 	if logs := strings.Join(saved.Run.Logs, "\n"); !strings.Contains(logs, "字幕将在视频生成后重铺") {
 		t.Fatalf("日志要说明字幕等视频出来后重生：%v", saved.Run.Logs)
+	}
+}
+
+// 关卡②改段时长要一路写回分镜与目标时长，重算计划不能把用户改的数字丢掉。
+func TestPromptStageEditPersistsDuration(t *testing.T) {
+	withTempVideoRoot(t)
+	app := newTestApp(t)
+
+	created, err := app.CreateVideoTask(VideoTaskInput{Config: VideoRunConfig{
+		Topic: "改时长", DurationS: 12, Adapter: "mock",
+	}})
+	if err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	task, err := app.videoTaskByID(created.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	task.Stage = VideoStageConfirmPrompt
+	task.Status = VideoStatusWaiting
+	task.Config.DurationS = 12
+	task.Run.Script = &VideoScript{Shots: []VideoShot{
+		{ID: "s1", TimeRange: [2]float64{0, 6}, DurationS: 6},
+		{ID: "s2", TimeRange: [2]float64{6, 12}, DurationS: 6},
+	}}
+	task.Run.Prompts = []VideoPromptItem{
+		{ShotID: "s1", VisualPrompt: "推镜", Start: 0, End: 6},
+		{ShotID: "s2", VisualPrompt: "拉远", Start: 6, End: 12},
+	}
+	if err := app.updateVideoTaskRecord(task); err != nil {
+		t.Fatalf("写入任务失败: %v", err)
+	}
+
+	saved, err := app.SaveVideoStageEdits(created.ID, VideoGateEdits{
+		Prompts: []VideoPromptEdit{
+			{ShotID: "s1", VisualPrompt: "推镜", DurationS: 8},
+			{ShotID: "s2", VisualPrompt: "拉远"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("保存时长修改失败: %v", err)
+	}
+	if saved.Config.DurationS != 14 {
+		t.Fatalf("目标时长应跟着段时长变为 14s，实际 %ds", saved.Config.DurationS)
+	}
+	if got := saved.Run.Script.Shots[0].DurationS; got != 8 {
+		t.Fatalf("改过的时长应写回分镜，实际 %.1fs", got)
+	}
+	if saved.Run.Prompts[1].Start != 8 || saved.Run.Prompts[1].End != 14 {
+		t.Fatalf("后续镜头应顺延，实际 %.1f~%.1f", saved.Run.Prompts[1].Start, saved.Run.Prompts[1].End)
+	}
+	if saved.Run.Plan == nil || saved.Run.Plan.ClipCount == 0 {
+		t.Fatalf("保存后应重算渲染计划：%+v", saved.Run.Plan)
+	}
+}
+
+// 逐段重渲改过的提示词要回写关卡②的权威提示词，否则重算计划时会被旧稿覆盖。
+func TestSegmentEditSyncsBackToPrompt(t *testing.T) {
+	cfg := speakerTestConfig()
+	run := &VideoRunContext{
+		Prompts: []VideoPromptItem{{ShotID: "s1", VisualPrompt: "旧提示词", Dialogue: "旧台词", Start: 0, End: 10}},
+		Plan: &VideoPlan{Segments: []VideoSegment{
+			{ID: "s1-1", ShotID: "s1", Prompt: "新提示词", Dialogue: "新台词", Start: 0, End: 5, DurationS: 5},
+			{ID: "s1-2", ShotID: "s1", Prompt: "新提示词", Dialogue: "", Start: 5, End: 10, DurationS: 5},
+		}},
+	}
+	if err := syncSegmentEditToPrompt(run, 0, cfg); err != nil {
+		t.Fatalf("同步单段修改失败: %v", err)
+	}
+	if run.Prompts[0].VisualPrompt != "新提示词" || run.Prompts[0].Dialogue != "新台词" {
+		t.Fatalf("首段修改应回写提示词：%+v", run.Prompts[0])
+	}
+
+	// 同一镜头的第 2 段没有台词：不能把首段刚写回的台词清空。
+	if err := syncSegmentEditToPrompt(run, 1, cfg); err != nil {
+		t.Fatalf("同步单段修改失败: %v", err)
+	}
+	if run.Prompts[0].Dialogue != "新台词" {
+		t.Fatalf("第 2 段不该清空镜头级台词，实际 %q", run.Prompts[0].Dialogue)
 	}
 }
 

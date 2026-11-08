@@ -9,6 +9,7 @@ import type {
 } from '../types/crawl'
 import type {
   TailFrameAsset,
+  VideoCharacter,
   VideoEnvironment,
   VideoGateEdits,
   VideoProject,
@@ -48,6 +49,7 @@ interface AppBindings {
 
   /* 逐段确认关卡 + 尾帧资产 */
   ApproveVideoSegment(id: string): Promise<void>
+  ApproveVideoSegmentPrompt(id: string, edit: VideoSegmentRegen): Promise<void>
   RegenerateVideoSegment(id: string, edit: VideoSegmentRegen): Promise<void>
   SuggestSegmentPrompt(id: string, segmentId: string, feedback: string): Promise<string>
   ListTailFrameAssets(): Promise<TailFrameAsset[]>
@@ -66,6 +68,11 @@ interface AppBindings {
   SaveVideoTemplate(input: VideoTemplate): Promise<VideoTemplate>
   DeleteVideoTemplate(id: string): Promise<void>
   PreviewVideoTemplate(templateId: string, topic: string, vars: Record<string, string>): Promise<VideoTemplatePreview>
+
+  /* 角色库：跨任务复用角色档案（外观 / 人设 / 负向约束 / 音色 / 默认定妆图） */
+  ListVideoCharacters(): Promise<VideoCharacter[]>
+  SaveVideoCharacter(input: VideoCharacter): Promise<VideoCharacter>
+  DeleteVideoCharacter(id: string): Promise<void>
 
   OpenVideoTaskFolder(id: string): Promise<void>
   RevealVideoOutput(id: string): Promise<void>
@@ -127,6 +134,8 @@ export const backend = {
   getVideoEnvironment: (): Promise<VideoEnvironment> => bindings().GetVideoEnvironment(),
 
   approveVideoSegment: (id: string): Promise<void> => bindings().ApproveVideoSegment(id),
+  approveVideoSegmentPrompt: (id: string, edit: VideoSegmentRegen): Promise<void> =>
+    bindings().ApproveVideoSegmentPrompt(id, edit),
   regenerateVideoSegment: (id: string, edit: VideoSegmentRegen): Promise<void> =>
     bindings().RegenerateVideoSegment(id, edit),
   suggestSegmentPrompt: (id: string, segmentId: string, feedback: string): Promise<string> =>
@@ -148,6 +157,11 @@ export const backend = {
   deleteVideoTemplate: (id: string): Promise<void> => bindings().DeleteVideoTemplate(id),
   previewVideoTemplate: (templateId: string, topic: string, vars: Record<string, string>): Promise<VideoTemplatePreview> =>
     bindings().PreviewVideoTemplate(templateId, topic, vars),
+
+  listVideoCharacters: (): Promise<VideoCharacter[]> => bindings().ListVideoCharacters(),
+  saveVideoCharacter: (input: VideoCharacter): Promise<VideoCharacter> =>
+    bindings().SaveVideoCharacter(input),
+  deleteVideoCharacter: (id: string): Promise<void> => bindings().DeleteVideoCharacter(id),
 
   openVideoTaskFolder: (id: string): Promise<void> => bindings().OpenVideoTaskFolder(id),
   revealVideoOutput: (id: string): Promise<void> => bindings().RevealVideoOutput(id),

@@ -27,9 +27,22 @@ func waitForVideoTask(t *testing.T, app *App, id string, predicate func(VideoTas
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("等待任务状态超时（%s）: stage=%s status=%s error=%s pending=%s logs=%v",
-		reason, last.Stage, last.Status, last.Error, last.Run.ReviewPendingSegment, last.Run.Logs)
+	t.Fatalf("等待任务状态超时（%s）: stage=%s status=%s error=%s pending=%s pendingPrompt=%s logs=%v",
+		reason, last.Stage, last.Status, last.Error, last.Run.ReviewPendingSegment, last.Run.ReviewPendingPromptSegment, last.Run.Logs)
 	return last
+}
+
+// waitForVideoTaskIdle 等待后台流水线真正退出：避免紧接着的关卡操作撞上任务锁。
+func waitForVideoTaskIdle(t *testing.T, app *App, id string, reason string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if !app.isVideoTaskRunning(id) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("等待任务退出执行状态超时（%s）", reason)
 }
 
 func TestSegmentReviewGuards(t *testing.T) {
@@ -62,13 +75,32 @@ func TestSegmentReviewGuards(t *testing.T) {
 		t.Fatalf("待确认片段时 RunVideoTask 应报错: %v", err)
 	}
 
+	// 生成前的提示词确认同样挡在关卡外
+	task.Run.ReviewPendingSegment = ""
+	task.Run.ReviewPendingPromptSegment = "s1-1"
+	if err := app.updateVideoTaskRecord(task); err != nil {
+		t.Fatalf("写入任务失败: %v", err)
+	}
+	if err := app.RunVideoTask(created.ID); err == nil || !strings.Contains(err.Error(), "分段提示词确认关卡") {
+		t.Fatalf("待确认提示词时 RunVideoTask 应报错: %v", err)
+	}
+	if err := app.ApproveVideoSegmentPrompt(created.ID, VideoSegmentRegen{SegmentID: "s9-9"}); err == nil ||
+		!strings.Contains(err.Error(), "不是当前待确认") {
+		t.Fatalf("确认非当前片段应报错: %v", err)
+	}
+
 	// 没有待确认片段时不能凭空确认
 	task.Run.ReviewPendingSegment = ""
+	task.Run.ReviewPendingPromptSegment = ""
 	if err := app.updateVideoTaskRecord(task); err != nil {
 		t.Fatalf("写入任务失败: %v", err)
 	}
 	if err := app.ApproveVideoSegment(created.ID); err == nil || !strings.Contains(err.Error(), "没有待确认") {
 		t.Fatalf("无待确认片段时 ApproveVideoSegment 应报错: %v", err)
+	}
+	if err := app.ApproveVideoSegmentPrompt(created.ID, VideoSegmentRegen{SegmentID: "s1-1"}); err == nil ||
+		!strings.Contains(err.Error(), "没有待确认") {
+		t.Fatalf("无待确认提示词时 ApproveVideoSegmentPrompt 应报错: %v", err)
 	}
 
 	// 重生成必须命中渲染计划里的片段
@@ -85,6 +117,98 @@ func TestSegmentReviewGuards(t *testing.T) {
 	if err := app.RegenerateVideoSegment(created.ID, VideoSegmentRegen{SegmentID: "s1-1"}); err == nil ||
 		!strings.Contains(err.Error(), "仅可在视频生成阶段") {
 		t.Fatalf("非渲染阶段重渲应报错: %v", err)
+	}
+}
+
+// 逐段确认的「生成前」关卡：第 2 段提交模型前必须先让用户看到并确认提示词；
+// 已生成成功的第一段不能重复暂停，确认后改动要真的写进渲染计划。
+func TestSegmentPromptReviewPausesBeforeRender(t *testing.T) {
+	if _, ok := ffmpegPath(); !ok {
+		t.Skip("本地联调占位需要 ffmpeg，跳过逐段确认渲染集成测试")
+	}
+	withTempVideoRoot(t)
+	app := newTestApp(t)
+
+	reviewOn := true
+	created, err := app.CreateVideoTask(VideoTaskInput{Config: VideoRunConfig{
+		Topic: "逐段提示词确认", DurationS: 8, Adapter: "mock", SegmentReview: &reviewOn,
+	}})
+	if err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	task, err := app.videoTaskByID(created.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	task.Stage = VideoStageRender
+	task.Status = VideoStatusWaiting
+	// 预置发布元数据，避免渲染阶段顺带调用文本模型
+	task.Run.PublishMeta = &PublishMeta{}
+	task.Run.Script = &VideoScript{Shots: []VideoShot{
+		{ID: "s1", TimeRange: [2]float64{0, 4}, DurationS: 4},
+		{ID: "s2", TimeRange: [2]float64{4, 8}, DurationS: 4},
+	}}
+	task.Run.Prompts = []VideoPromptItem{
+		{ShotID: "s1", VisualPrompt: "第一段画面", Start: 0, End: 4},
+		{ShotID: "s2", VisualPrompt: "第二段画面", Start: 4, End: 8},
+	}
+	task.Run.Plan = &VideoPlan{Adapter: "mock", ClipCount: 2, TotalS: 2, Segments: []VideoSegment{
+		{ID: "s1-1", ShotID: "s1", Index: 0, Prompt: "第一段画面", DurationS: 1, Start: 0, End: 1},
+		{ID: "s2-1", ShotID: "s2", Index: 1, Prompt: "第二段画面", DurationS: 1, Start: 1, End: 2},
+	}}
+	if err := app.updateVideoTaskRecord(task); err != nil {
+		t.Fatalf("写入任务失败: %v", err)
+	}
+
+	// 第一段渲染完成后先停在后置确认关卡
+	app.runVideoPipeline(created.ID, VideoStageRender, "")
+	task = waitForVideoTask(t, app, created.ID, func(item VideoTask) bool {
+		return item.Run.ReviewPendingSegment == "s1-1"
+	}, "第一段生成后应停在片段确认")
+	if task.Run.ReviewPendingPromptSegment != "" {
+		t.Fatalf("第一段不该弹生成前确认: %q", task.Run.ReviewPendingPromptSegment)
+	}
+	if len(task.Run.Renders) != 1 || task.Run.Renders[0].Status != "succeeded" {
+		t.Fatalf("第一段应已生成成功: %+v", task.Run.Renders)
+	}
+	waitForVideoTaskIdle(t, app, created.ID, "第一段确认关卡")
+
+	// 确认第一段后，第二段应在渲染前停住等提示词确认
+	if err := app.ApproveVideoSegment(created.ID); err != nil {
+		t.Fatalf("确认第一段失败: %v", err)
+	}
+	task = waitForVideoTask(t, app, created.ID, func(item VideoTask) bool {
+		return item.Run.ReviewPendingPromptSegment == "s2-1"
+	}, "第二段生成前应停在提示词确认")
+	if task.Stage != VideoStageRender || task.Status != VideoStatusWaiting {
+		t.Fatalf("生成前确认应停在渲染阶段等待: stage=%s status=%s", task.Stage, task.Status)
+	}
+	for _, render := range task.Run.Renders {
+		if render.SegmentID == "s2-1" {
+			t.Fatalf("第二段尚未确认提示词就提交了模型: %+v", render)
+		}
+	}
+	waitForVideoTaskIdle(t, app, created.ID, "第二段提示词确认关卡")
+
+	// 确认时改写提示词/台词，改动必须落进渲染计划与提示词权威源
+	if err := app.ApproveVideoSegmentPrompt(created.ID, VideoSegmentRegen{
+		SegmentID:    "s2-1",
+		VisualPrompt: "第二段手改后的画面",
+		Dialogue:     "手改台词",
+	}); err != nil {
+		t.Fatalf("确认段落提示词失败: %v", err)
+	}
+	task = waitForVideoTask(t, app, created.ID, func(item VideoTask) bool {
+		return item.Run.ReviewPendingSegment == "s2-1"
+	}, "第二段生成后应停在片段确认")
+	if task.Run.Plan.Segments[1].Prompt != "第二段手改后的画面" {
+		t.Fatalf("确认时改写的提示词没进渲染计划: %q", task.Run.Plan.Segments[1].Prompt)
+	}
+	if task.Run.Prompts[1].VisualPrompt != "第二段手改后的画面" || task.Run.Prompts[1].Dialogue != "手改台词" {
+		t.Fatalf("确认时的改写没回写提示词关卡: %+v", task.Run.Prompts[1])
+	}
+	if !segmentPromptApproved(&task.Run, "s2-1") {
+		t.Fatal("确认后应记住该段提示词已确认，断点续跑不再重复暂停")
 	}
 }
 

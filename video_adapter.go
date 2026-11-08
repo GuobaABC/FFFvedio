@@ -357,25 +357,81 @@ func (a *App) GetVideoEnvironment() VideoEnvironment {
 }
 
 // composeRenderPrompt 按厂商提示词风格拼装最终提示词。
-// 只有原生音频模型才把台词写进提示词（无音频模型会出现"画面写字"的副作用）。
-// 台词必须带说话人：角色说话要让模型把口型给到该角色，旁白则明确不安排人对口型。
-func composeRenderPrompt(segment VideoSegment, caps VideoCapabilities) string {
+// 说话人块对所有视频模型一视同仁：谁开口、镜头给谁、谁必须闭口，是画面表演约束，
+// 与模型是否会出声无关。台词原文只在模型自带音频时写入（无音频模型容易把台词画成画面文字）。
+// 语速也写进提示词：模型读字速度最终由它自己决定，但至少把用户设置作为软约束传下去。
+func composeRenderPrompt(segment VideoSegment, caps VideoCapabilities, cfg VideoRunConfig) string {
 	prompt := strings.TrimSpace(segment.Prompt)
-	dialogue := strings.TrimSpace(segment.Dialogue)
-	if caps.NativeAudio && dialogue != "" {
-		speaker := strings.TrimSpace(segment.Speaker)
-		switch {
-		case speaker == "" || speaker == VideoSpeakerNarration:
-			prompt += fmt.Sprintf("\n旁白（画外音，说话人不在画面内，画面里不出现对口型的动作）：“%s”", dialogue)
-		default:
-			name := firstNonEmpty(strings.TrimSpace(segment.SpeakerName), speaker)
-			prompt += fmt.Sprintf("\n%s 说（只允许这一个主体说话，面部与口型在画面内）：“%s”", name, dialogue)
-		}
+	lines := normalizeDialogueLines(segment.DialogueLines, segment.Dialogue, segment.Speaker)
+	if len(lines) > 0 {
+		prompt += "\n" + dialoguePromptBlock(cfg, lines, caps)
 	}
 	if caps.PromptStyle == "veo" {
 		prompt += "\n限制：单镜头、不切镜，动作连续，保持主体与产品外观一致。"
 	}
 	return prompt
+}
+
+// dialoguePromptBlock 台词归属块：所有视频模型都带“谁在说 + 口型方向”，
+// 多说话人按台词顺序轮流开口；旁白显式写“画面内无人开口”。
+func dialoguePromptBlock(cfg VideoRunConfig, lines []VideoDialogueLine, caps VideoCapabilities) string {
+	speakers := dialogueSpeakerList(lines)
+	sequence := dialogueSpeakerSequence(cfg, lines)
+	characterSpeakers := make([]string, 0, len(sequence))
+	for _, speaker := range speakers {
+		if speaker != VideoSpeakerNarration {
+			characterSpeakers = append(characterSpeakers, speakerLabel(cfg, speaker))
+		}
+	}
+	hasNarration := false
+	for _, speaker := range speakers {
+		if speaker == VideoSpeakerNarration {
+			hasNarration = true
+			break
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("【本段台词归属】")
+	switch {
+	case len(characterSpeakers) == 0:
+		b.WriteString("本段为画外旁白：画面内无人开口，不安排任何对口型动作，用空镜或主体反应镜头承载。")
+	case len(characterSpeakers) == 1 && !hasNarration:
+		b.WriteString(fmt.Sprintf("本段说话人：%s。只有该角色开口，其他角色嘴唇闭合；镜头给到其面部（正面或侧脸），口型随说话动作。", characterSpeakers[0]))
+	default:
+		b.WriteString(fmt.Sprintf("本段台词依次由 %s 承担；角色之间按台词顺序轮流开口，轮到谁就把镜头给到其面部（正面或侧脸），其他角色嘴唇闭合。",
+			strings.Join(sequence, "、")))
+		if hasNarration {
+			b.WriteString("旁白句为画外音：画面内无人开口，不安排对口型。")
+		}
+	}
+
+	if caps.NativeAudio {
+		for _, line := range lines {
+			text := strings.TrimSpace(line.Text)
+			if text == "" {
+				continue
+			}
+			if line.Speaker == "" || line.Speaker == VideoSpeakerNarration {
+				b.WriteString(fmt.Sprintf("\n旁白（画外音，说话人不在画面内，画面里不出现对口型的动作）：“%s”", text))
+				continue
+			}
+			name := speakerLabel(cfg, line.Speaker)
+			b.WriteString(fmt.Sprintf("\n%s 说（只允许这一个主体说话，面部与口型在画面内）：“%s”", name, text))
+		}
+		rate := cfg.SpeechRate
+		if rate <= 0 {
+			rate = defaultSpeechRate(cfg.Language)
+		}
+		unit := "字"
+		if isEnglishLanguage(cfg.Language) {
+			unit = "词"
+		}
+		b.WriteString(fmt.Sprintf("\n语速约 %.1f %s/秒，按台词长度均匀读完，不要拖长停顿。", rate, unit))
+	} else {
+		b.WriteString("\n台词内容由后期字幕与配音承载，画面内不出现任何文字。")
+	}
+	return b.String()
 }
 
 /* ------------------------------ 本地联调适配器 ------------------------------ */

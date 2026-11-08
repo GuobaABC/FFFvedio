@@ -24,13 +24,49 @@ export type VideoAdapterId = 'auto' | 'dashscope' | 'runway' | 'veo' | 'generic'
 
 export type ContinuationMode = 'last_frame' | 'overlap' | 'none'
 
+export interface VideoVoiceProfile {
+  voiceId: string
+  /** 语速倍率（1 = 正常） */
+  rate: number
+  /** 音高偏移（半音） */
+  pitch: number
+  /** 音量（0-2，1 = 原始音量） */
+  volume: number
+  emotion: string
+}
+
+/** 角色库条目：跨任务复用的角色档案；任务创建时后端会快照进 characterRefs */
+export interface VideoCharacter {
+  id: string
+  name: string
+  roleId: string
+  appearanceBlock: string
+  persona: string
+  negativePrompt: string
+  voiceHint: string
+  voiceProfile: VideoVoiceProfile | null
+  perspective: string
+  images: string[]
+  tags: string[]
+  note: string
+  createdAt: string
+  updatedAt: string
+}
+
 export interface VideoCharacterRef {
   roleId: string
   name: string
+  /** 绑定的角色库条目；旧任务没有该字段 */
+  characterId?: string
   images: string[]
   /** 图片来源：user = 用户上传（优先），template = 模板定妆图；留空后端按 user 处理 */
   imageSource?: string
+  appearanceBlock?: string
+  persona?: string
+  negativePrompt?: string
+  perspective?: string
   voiceHint: string
+  voiceProfile?: VideoVoiceProfile | null
 }
 
 export interface VideoSubtitleStyle {
@@ -91,14 +127,22 @@ export interface VideoRunConfig {
   templateRef?: VideoTemplateRef | null
 }
 
+export interface VideoDialogueLine {
+  /** 说话人：roleId 或 narration（旁白）；空字符串表示自动推断 */
+  speaker: string
+  text: string
+}
+
 export interface VideoShot {
   id: string
   timeRange: [number, number]
   roles: string[]
   sceneIntent: string
+  /** 所有台词按行拼接后的兼容字段；多说话人时以 dialogueLines 为准 */
   dialogue: string
-  /** 台词归属：roleId，或 narration 表示旁白（画外音）；无台词时为空 */
+  /** 只有单一说话人时才保留；多说话人时为空 */
   speaker?: string
+  dialogueLines?: VideoDialogueLine[]
   camera: string
   mood: string
   audioCue: string
@@ -116,8 +160,9 @@ export interface VideoPromptItem {
   shotId: string
   visualPrompt: string
   dialogue: string
-  /** 台词归属：roleId 或 narration（旁白） */
+  /** 只有单一说话人时才保留；多说话人时为空 */
   speaker?: string
+  dialogueLines?: VideoDialogueLine[]
   start: number
   end: number
   charCount: number
@@ -133,9 +178,10 @@ export interface VideoSegment {
   index: number
   prompt: string
   dialogue: string
-  /** 台词归属（roleId / narration）与写进提示词的显示名 */
+  /** 台词归属（roleId / narration）与写进提示词的显示名；多说话人时 speaker 为空 */
   speaker?: string
   speakerName?: string
+  dialogueLines?: VideoDialogueLine[]
   start: number
   end: number
   durationS: number
@@ -239,6 +285,10 @@ export interface VideoRunContext {
   feedback: string
   /** 逐段确认关卡：等待用户确认的片段 ID（空 = 无待确认） */
   reviewPendingSegment: string
+  /** 逐段确认的「生成前」关卡：等待用户确认提示词的片段 ID（空 = 无待确认） */
+  reviewPendingPromptSegment: string
+  /** 已确认过提示词、可直接生成的片段 ID */
+  approvedSegmentPrompts?: string[] | null
 }
 
 export interface VideoTask {
@@ -269,6 +319,10 @@ export interface VideoPromptEdit {
   dialogue: string
   /** 台词归属：roleId 或 narration；留空表示不改 */
   speaker?: string
+  /** 多说话人台词；提交后以它为准 */
+  dialogueLines?: VideoDialogueLine[]
+  /** 本段目标时长（秒）；0 或省略表示沿用原时长 */
+  durationS?: number
 }
 
 /** 字幕关卡的修改：提交完整的 cue 列表，增删都体现在列表里 */
@@ -288,6 +342,10 @@ export interface VideoSegmentRegen {
   segmentId: string
   visualPrompt: string
   dialogue: string
+  /** 多说话人台词；提交后以它为准 */
+  dialogueLines?: VideoDialogueLine[]
+  /** 留空表示沿用原归属 */
+  speaker?: string
 }
 
 /** 尾帧资产：任务最后一段的尾帧，可在新任务里选作首帧 */
@@ -554,6 +612,7 @@ export function createManualShot(index: number): VideoShot {
     sceneIntent: '',
     dialogue: '',
     speaker: '',
+    dialogueLines: [],
     camera: '',
     mood: '',
     audioCue: '',

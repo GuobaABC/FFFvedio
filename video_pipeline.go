@@ -28,6 +28,9 @@ func (a *App) RunVideoTask(id string) error {
 		if task.Run.ReviewPendingSegment != "" {
 			return errors.New("当前处于片段确认关卡，请先确认或重新生成当前片段")
 		}
+		if task.Run.ReviewPendingPromptSegment != "" {
+			return errors.New("当前处于分段提示词确认关卡，请先确认提示词或修改后再生成本段")
+		}
 	}
 
 	if !a.beginVideoRun(id) {
@@ -192,6 +195,9 @@ func (a *App) ApproveVideoSegment(id string) error {
 	if task.Stage != VideoStageRender || task.Run.ReviewPendingSegment == "" {
 		return errors.New("当前没有待确认的视频片段")
 	}
+	if task.Run.ReviewPendingPromptSegment != "" {
+		return errors.New("请先确认待生成的段落提示词")
+	}
 
 	task.Run.ReviewPendingSegment = ""
 	task.Status = VideoStatusRunning
@@ -211,6 +217,178 @@ func (a *App) ApproveVideoSegment(id string) error {
 		a.runVideoPipeline(id, VideoStageRender, "")
 	}()
 	return nil
+}
+
+// ApproveVideoSegmentPrompt 逐段确认的「生成前」关卡：确认或修改下一段提示词后，才开始消耗额度。
+// 这是需求 11 的核心：用户应该在提交视频模型之前看到并改掉下一段的画面写法。
+func (a *App) ApproveVideoSegmentPrompt(id string, edit VideoSegmentRegen) error {
+	task, err := a.videoTaskByID(id)
+	if err != nil {
+		return err
+	}
+	if a.isVideoTaskRunning(id) {
+		return errors.New("任务正在执行，请稍候")
+	}
+	if task.Stage != VideoStageRender {
+		return errors.New("仅可在视频生成阶段确认段落提示词")
+	}
+	pending := strings.TrimSpace(task.Run.ReviewPendingPromptSegment)
+	if pending == "" {
+		return errors.New("当前没有待确认的段落提示词")
+	}
+	segmentID := strings.TrimSpace(edit.SegmentID)
+	if segmentID == "" {
+		segmentID = pending
+	}
+	if segmentID != pending {
+		return errors.New("提交的片段不是当前待确认的段落")
+	}
+	if task.Run.Plan == nil || len(task.Run.Plan.Segments) == 0 {
+		return errors.New("任务缺少渲染计划，请先确认提示词")
+	}
+	target := -1
+	for index, segment := range task.Run.Plan.Segments {
+		if segment.ID == segmentID {
+			target = index
+			break
+		}
+	}
+	if target < 0 {
+		return errors.New("待确认的片段不在渲染计划中")
+	}
+	if err := applySegmentEdit(&task.Run, target, edit, task.Config); err != nil {
+		return err
+	}
+
+	task.Run.ReviewPendingPromptSegment = ""
+	markSegmentPromptApproved(&task.Run, segmentID)
+	task.Run.ReviewPendingSegment = ""
+	task.Status = VideoStatusRunning
+	task.Error = ""
+	task.Run.Logs = append(task.Run.Logs, stageLog(fmt.Sprintf(
+		"第 %d/%d 段提示词已确认，开始生成", target+1, len(task.Run.Plan.Segments))))
+	task.UpdatedAt = time.Now().Format(time.RFC3339)
+
+	if !a.beginVideoRun(id) {
+		return errors.New("任务正在执行，请稍候")
+	}
+	if err := a.updateVideoTaskRecord(task); err != nil {
+		a.endVideoRun(id)
+		return err
+	}
+	go func() {
+		defer a.endVideoRun(id)
+		a.runVideoPipeline(id, VideoStageRender, "")
+	}()
+	return nil
+}
+
+// applySegmentEdit 把逐段修改写进渲染计划，并同步回提示词关卡的权威产物。
+func applySegmentEdit(run *VideoRunContext, target int, edit VideoSegmentRegen, cfg VideoRunConfig) error {
+	if run.Plan == nil || target < 0 || target >= len(run.Plan.Segments) {
+		return errors.New("要修改的片段不在渲染计划中")
+	}
+	segment := &run.Plan.Segments[target]
+	if prompt := strings.TrimSpace(edit.VisualPrompt); prompt != "" {
+		segment.Prompt = prompt
+	}
+
+	lines := normalizeDialogueLines(edit.DialogueLines, edit.Dialogue, edit.Speaker)
+	firstOfShot := true
+	for i := 0; i < target; i++ {
+		if run.Plan.Segments[i].ShotID == segment.ShotID {
+			firstOfShot = false
+			break
+		}
+	}
+	if !firstOfShot && len(lines) > 0 {
+		// 长镜头拆段后台词只落在首段：允许第 2 段填台词会造出“有声音、无字幕”的片段。
+		return fmt.Errorf("第 %d 段的台词属于镜头 %s 的首段，请在首段修改台词与说话人", target+1, segment.ShotID)
+	}
+	if firstOfShot {
+		roles := shotRolesOf(run.Script, segment.ShotID)
+		if len(lines) == 1 && strings.TrimSpace(lines[0].Speaker) == "" && strings.TrimSpace(edit.Speaker) == "" {
+			// 只改台词没提交归属：沿用这段原本的说话人，不要悄悄退回旁白。
+			lines[0].Speaker = segment.Speaker
+		}
+		roleSet := make(map[string]bool, len(roles))
+		for _, role := range roles {
+			roleSet[role] = true
+		}
+		for i := range lines {
+			speaker, _ := resolveSpeaker(cfg, lines[i].Speaker, roles, segment.ShotID, i, roleSet)
+			lines[i].Speaker = speaker
+			if speaker != "" && speaker != VideoSpeakerNarration {
+				roleSet[speaker] = true
+			}
+		}
+		segment.DialogueLines = lines
+		segment.Dialogue = dialogueText(lines)
+		segment.Speaker = dialogueSpeakerSummary(lines)
+		segment.SpeakerName = dialogueSpeakerName(cfg, lines)
+	} else {
+		segment.DialogueLines = nil
+		segment.Dialogue = ""
+		segment.Speaker = ""
+		segment.SpeakerName = ""
+	}
+	return syncSegmentEditToPrompt(run, target, cfg)
+}
+
+// shotRolesOf 按 shotId 取分镜的出场角色，供段落编辑时解析说话人兜底。
+func shotRolesOf(script *VideoScript, shotID string) []string {
+	if script == nil {
+		return nil
+	}
+	for _, shot := range script.Shots {
+		if shot.ID == shotID {
+			return append([]string{}, shot.Roles...)
+		}
+	}
+	return nil
+}
+
+// segmentPromptApproved 该段提示词是否已在生成前被用户确认过。
+func segmentPromptApproved(run *VideoRunContext, segmentID string) bool {
+	segmentID = strings.TrimSpace(segmentID)
+	for _, approved := range run.ApprovedSegmentPrompts {
+		if approved == segmentID {
+			return true
+		}
+	}
+	return false
+}
+
+func markSegmentPromptApproved(run *VideoRunContext, segmentID string) {
+	segmentID = strings.TrimSpace(segmentID)
+	if segmentID == "" || segmentPromptApproved(run, segmentID) {
+		return
+	}
+	run.ApprovedSegmentPrompts = append(run.ApprovedSegmentPrompts, segmentID)
+}
+
+func clearSegmentPromptApprovals(run *VideoRunContext) {
+	run.ApprovedSegmentPrompts = nil
+}
+
+// clearSegmentPromptApprovalsFrom 作废 target 及其后所有片段的提示词确认。
+// 前面的片段已经生成过，不受影响；后面的片段必须重新走生成前确认。
+func clearSegmentPromptApprovalsFrom(run *VideoRunContext, plan *VideoPlan, target int) {
+	if plan == nil {
+		clearSegmentPromptApprovals(run)
+		return
+	}
+	keep := make(map[string]bool, target)
+	for index := 0; index < target && index < len(plan.Segments); index++ {
+		keep[plan.Segments[index].ID] = true
+	}
+	filtered := make([]string, 0, len(run.ApprovedSegmentPrompts))
+	for _, approved := range run.ApprovedSegmentPrompts {
+		if keep[approved] {
+			filtered = append(filtered, approved)
+		}
+	}
+	run.ApprovedSegmentPrompts = filtered
 }
 
 // RegenerateVideoSegment 修改单段提示词/台词后只重渲该段：
@@ -242,10 +420,14 @@ func (a *App) RegenerateVideoSegment(id string, edit VideoSegmentRegen) error {
 		return errors.New("要重生成的片段不在渲染计划中")
 	}
 
-	if prompt := strings.TrimSpace(edit.VisualPrompt); prompt != "" {
-		task.Run.Plan.Segments[target].Prompt = prompt
+	segment := &task.Run.Plan.Segments[target]
+	if err := applySegmentEdit(&task.Run, target, edit, task.Config); err != nil {
+		return err
 	}
-	task.Run.Plan.Segments[target].Dialogue = strings.TrimSpace(edit.Dialogue)
+	// 用户刚在逐段确认里改过这一段，本次重渲不再二次弹提示词确认；
+	// 但后续片段依赖重渲后的画面，必须重新确认提示词。
+	clearSegmentPromptApprovalsFrom(&task.Run, task.Run.Plan, target)
+	markSegmentPromptApproved(&task.Run, segment.ID)
 
 	// 作废目标段及其后的渲染记录：尾帧延续下，下游片段依赖重渲后的画面
 	kept := make([]VideoRender, 0, target)
@@ -265,9 +447,10 @@ func (a *App) RegenerateVideoSegment(id string, edit VideoSegmentRegen) error {
 	task.Run.Output = nil
 	task.Run.Compose = nil
 	task.Run.ReviewPendingSegment = ""
+	task.Run.ReviewPendingPromptSegment = ""
 	task.Status = VideoStatusRunning
 	task.Error = ""
-	task.Run.Logs = append(task.Run.Logs, stageLog(fmt.Sprintf("第 %d 段提示词已修改，重新生成该段", target+1)))
+	task.Run.Logs = append(task.Run.Logs, stageLog(fmt.Sprintf("第 %d 段提示词已修改（已同步回提示词关卡），重新生成该段", target+1)))
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
 
 	if !a.beginVideoRun(id) {
@@ -281,6 +464,56 @@ func (a *App) RegenerateVideoSegment(id string, edit VideoSegmentRegen) error {
 		defer a.endVideoRun(id)
 		a.runVideoPipeline(id, VideoStageRender, "")
 	}()
+	return nil
+}
+
+// syncSegmentEditToPrompt 把逐段重生成的修改回写 Run.Prompts。
+// Run.Prompts 是提示词关卡的唯一权威源：只改 Plan 的话，重算计划或回到关卡②时，
+// 用户逐段改过的提示词会悄悄丢失，表现就是「改了没用」。
+func syncSegmentEditToPrompt(run *VideoRunContext, target int, cfg VideoRunConfig) error {
+	if run.Plan == nil || target < 0 || target >= len(run.Plan.Segments) {
+		return errors.New("要重生成的片段不在渲染计划中")
+	}
+	segment := run.Plan.Segments[target]
+	promptIndex := -1
+	for i := range run.Prompts {
+		if run.Prompts[i].ShotID == segment.ShotID {
+			promptIndex = i
+			break
+		}
+	}
+	if promptIndex < 0 {
+		return fmt.Errorf("片段 %s 对应的分镜提示词已丢失，请回到提示词关卡重新生成", segment.ID)
+	}
+
+	prompt := &run.Prompts[promptIndex]
+	if visual := strings.TrimSpace(segment.Prompt); visual != "" {
+		prompt.VisualPrompt = visual
+	}
+
+	// 台词是镜头级的：只有该镜头的第一段才回写。
+	// 长镜头拆成多段时台词只落在首段，重渲第 2 段不能把首段台词清空。
+	firstOfShot := true
+	for i := 0; i < target; i++ {
+		if run.Plan.Segments[i].ShotID == segment.ShotID {
+			firstOfShot = false
+			break
+		}
+	}
+	if firstOfShot {
+		prompt.DialogueLines = append([]VideoDialogueLine{}, segment.DialogueLines...)
+		prompt.Dialogue = segment.Dialogue
+		prompt.Speaker = segment.Speaker
+		duration := prompt.End - prompt.Start
+		prompt.CharCount = speechUnitCount(prompt.Dialogue, cfg.Language)
+		prompt.EstSpeechS = estimateSpeechSeconds(prompt.Dialogue, cfg.Language, cfg.SpeechRate)
+		prompt.Fits = prompt.EstSpeechS <= duration+0.1
+		if prompt.Fits {
+			prompt.Note = ""
+		} else {
+			prompt.Note = fmt.Sprintf("台词约 %.1fs，超出本段 %.1fs，建议精简或改排期", prompt.EstSpeechS, duration)
+		}
+	}
 	return nil
 }
 
@@ -334,6 +567,9 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		task.Run.Renders = nil
 		task.Run.Output = nil
 		task.Run.Compose = nil
+		task.Run.ReviewPendingSegment = ""
+		task.Run.ReviewPendingPromptSegment = ""
+		clearSegmentPromptApprovals(&task.Run)
 		// 分镜改动 → Agent4 的标签/标题来源也变了
 		task.Run.PublishMeta = nil
 		task.Run.Gates[VideoGateScript] = videoGatePending
@@ -350,10 +586,17 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		if len(task.Run.Prompts) == 0 {
 			return task, errors.New("任务缺少提示词产物，请先重新生成")
 		}
-		applyPromptEdits(task.Run.Prompts, edits.Prompts, task.Config)
-
 		_, adapter, provider, _, _ := a.resolveVideoAdapter(task.Config)
 		caps := adapterCapabilities(adapter, provider.Model)
+		if err := applyPromptEdits(task.Run.Prompts, edits.Prompts, task.Config, caps); err != nil {
+			return task, err
+		}
+		// 段时长再写回分镜：下次重新生成提示词时不能把用户改过的时长丢掉。
+		syncPromptTimelineToScript(&task.Config, task.Run.Script, task.Run.Prompts)
+		// 用户改过段时长后，任务目标时长跟着提示词时间轴走；渲染计划再按模型档位取整。
+		if total := promptTotalSeconds(task.Run.Prompts); total > 0 {
+			task.Config.DurationS = int(math.Round(total))
+		}
 		plan := buildVideoPlan(task.Config, task.Run.Prompts, caps, task.Run.Adapter)
 		task.Run.Plan = &plan
 
@@ -365,6 +608,9 @@ func (a *App) SaveVideoStageEdits(id string, edits VideoGateEdits) (VideoTask, e
 		task.Run.Renders = nil
 		task.Run.Output = nil
 		task.Run.PublishMeta = nil
+		task.Run.ReviewPendingSegment = ""
+		task.Run.ReviewPendingPromptSegment = ""
+		clearSegmentPromptApprovals(&task.Run)
 		task.Run.Gates[VideoGatePrompt] = videoGatePending
 		task.Run.Gates[VideoGateMeta] = videoGatePending
 		task.Status = VideoStatusWaiting
@@ -520,7 +766,9 @@ func normalizeScriptShots(shots []VideoShot, total float64) []VideoShot {
 	knownSum, knownCount := 0.0, 0
 	for index, shot := range shots {
 		shot.SceneIntent = strings.TrimSpace(shot.SceneIntent)
-		shot.Dialogue = strings.TrimSpace(shot.Dialogue)
+		shot.DialogueLines = normalizeDialogueLines(shot.DialogueLines, shot.Dialogue, shot.Speaker)
+		shot.Dialogue = dialogueText(shot.DialogueLines)
+		shot.Speaker = dialogueSpeakerSummary(shot.DialogueLines)
 		shot.Camera = strings.TrimSpace(shot.Camera)
 		shot.Mood = strings.TrimSpace(shot.Mood)
 		shot.AudioCue = strings.TrimSpace(shot.AudioCue)
@@ -560,37 +808,121 @@ func normalizeScriptShots(shots []VideoShot, total float64) []VideoShot {
 	return normalized
 }
 
-// applyPromptEdits 只改提示词与台词，并按语速预算重新校验。
+// applyPromptEdits 保存关卡②的提示词、台词、说话人与本段时长，并重排整条时间轴。
 // 提示词是 Agent2 定稿、用户在关卡②确认过的最终版本：这里不再补主体约束，
 // 否则用户手动删掉或改写的句式会被程序悄悄加回来。
-func applyPromptEdits(prompts []VideoPromptItem, edits []VideoPromptEdit, cfg VideoRunConfig) {
+// 改时长时后续镜头整体顺延：只改一段不能把后面的时间轴留在原地，否则字幕与渲染计划都会错位。
+func applyPromptEdits(prompts []VideoPromptItem, edits []VideoPromptEdit, cfg VideoRunConfig, caps VideoCapabilities) error {
 	index := make(map[string]int, len(prompts))
 	for i, prompt := range prompts {
-		index[prompt.ShotID] = i
+		index[strings.TrimSpace(prompt.ShotID)] = i
 	}
 	for _, edit := range edits {
-		i, ok := index[strings.TrimSpace(edit.ShotID)]
+		shotID := strings.TrimSpace(edit.ShotID)
+		i, ok := index[shotID]
 		if !ok {
-			continue
+			// 静默忽略会让用户以为改动保存成功，实际整条被丢掉
+			return fmt.Errorf("提示词修改里的分镜 %q 不存在，请刷新任务后重试", shotID)
 		}
-		prompts[i].VisualPrompt = strings.TrimSpace(edit.VisualPrompt)
-		prompts[i].Dialogue = strings.TrimSpace(edit.Dialogue)
-		// 台词归属：关卡里改了就按关卡，没改就保留原归属；台词被清空则归属也清空
-		if speaker := strings.TrimSpace(edit.Speaker); speaker != "" {
-			prompts[i].Speaker = firstNonEmpty(normalizeSpeaker(cfg, speaker), speaker)
+		visual := strings.TrimSpace(edit.VisualPrompt)
+		if visual == "" {
+			return fmt.Errorf("分镜 %s 的画面提示词不能为空", shotID)
 		}
-		if prompts[i].Dialogue == "" {
-			prompts[i].Speaker = ""
+		prompts[i].VisualPrompt = visual
+		// 台词与归属：多说话人按行提交；旧客户端只传 dialogue/speaker 时自动升级为一行。
+		lines := normalizeDialogueLines(edit.DialogueLines, edit.Dialogue, edit.Speaker)
+		if len(lines) == 1 && strings.TrimSpace(edit.Speaker) == "" && strings.TrimSpace(lines[0].Speaker) == "" {
+			// 关卡只改了台词、没动归属：沿用原归属，别把它退回旁白。
+			lines[0].Speaker = prompts[i].Speaker
 		}
+		for lineIndex := range lines {
+			raw := strings.TrimSpace(lines[lineIndex].Speaker)
+			speaker := normalizeSpeaker(cfg, raw)
+			if speaker == "" {
+				speaker = raw
+			}
+			if speaker == "" {
+				speaker = VideoSpeakerNarration
+			}
+			lines[lineIndex].Speaker = speaker
+		}
+		prompts[i].DialogueLines = lines
+		prompts[i].Dialogue = dialogueText(lines)
+		prompts[i].Speaker = dialogueSpeakerSummary(lines)
+		if edit.DurationS > 0 {
+			duration := clampFloat(edit.DurationS, 0.5, 600)
+			prompts[i].End = prompts[i].Start + duration
+		}
+	}
+
+	// 从 0 开始重排时间轴：每段时长以用户提交的值为准，后续镜头整体顺延。
+	cursor := 0.0
+	for i := range prompts {
+		duration := prompts[i].End - prompts[i].Start
+		if duration <= 0 {
+			duration = float64(cfg.DurationS) / float64(len(prompts))
+		}
+		if duration <= 0 {
+			duration = 1
+		}
+		prompts[i].Start = round2(cursor)
+		prompts[i].End = round2(cursor + duration)
+		cursor += duration
+
 		prompts[i].CharCount = speechUnitCount(prompts[i].Dialogue, cfg.Language)
 		prompts[i].EstSpeechS = estimateSpeechSeconds(prompts[i].Dialogue, cfg.Language, cfg.SpeechRate)
-		duration := prompts[i].End - prompts[i].Start
 		prompts[i].Fits = prompts[i].EstSpeechS <= duration+0.1
 		if prompts[i].Fits {
 			prompts[i].Note = ""
 		} else {
 			prompts[i].Note = fmt.Sprintf("台词约 %.1fs，超出本段 %.1fs，建议精简或改排期", prompts[i].EstSpeechS, duration)
 		}
+		prompts[i].RenderDurationS = nearestAllowedDuration(duration, caps.AllowedDurations)
+	}
+	return nil
+}
+
+// promptTotalSeconds 提示词时间轴总时长；用于把用户改过的段时长同步回任务目标时长。
+func promptTotalSeconds(prompts []VideoPromptItem) float64 {
+	if len(prompts) == 0 {
+		return 0
+	}
+	total := 0.0
+	for _, prompt := range prompts {
+		if duration := prompt.End - prompt.Start; duration > 0 {
+			total += duration
+		}
+	}
+	return round2(total)
+}
+
+// syncPromptTimelineToScript 把关卡②改过的段时长写回分镜。
+// 否则下一次重新生成提示词会从旧分镜重建时间轴，用户刚改的时长又被打回原样。
+func syncPromptTimelineToScript(cfg *VideoRunConfig, script *VideoScript, prompts []VideoPromptItem) {
+	byShot := make(map[string]VideoPromptItem, len(prompts))
+	for _, prompt := range prompts {
+		byShot[prompt.ShotID] = prompt
+	}
+	apply := func(shots []VideoShot) {
+		for i := range shots {
+			prompt, ok := byShot[shots[i].ID]
+			if !ok {
+				continue
+			}
+			start := round2(prompt.Start)
+			end := round2(prompt.End)
+			if end <= start {
+				continue
+			}
+			shots[i].DurationS = round2(end - start)
+			shots[i].TimeRange = [2]float64{start, end}
+		}
+	}
+	if script != nil {
+		apply(script.Shots)
+	}
+	if cfg != nil && cfg.manualScriptEnabled() {
+		apply(cfg.ManualShots)
 	}
 }
 
@@ -849,6 +1181,7 @@ func (r *videoRunner) runPromptStage() error {
 	}
 	caps := adapterCapabilities(adapter, provider.Model)
 	r.task.Run.Adapter = adapterID
+	hadPrompts := len(r.task.Run.Prompts) > 0
 
 	prompts, promptWarnings := r.app.generatePrompts(r.usageCtx(UsagePurposePrompt), r.task.Config, *r.task.Run.Script, caps,
 		r.consumeFeedback(VideoStageBuildPrompt), r.task.Run.Template)
@@ -861,6 +1194,10 @@ func (r *videoRunner) runPromptStage() error {
 		return errors.New("没有生成可用的提示词")
 	}
 	r.task.Run.Prompts = prompts
+	if hadPrompts {
+		r.logf("提示词已整批重算：你在关卡②里手工改过的内容以本次生成结果为准（重算前请先确认不再需要旧稿）")
+	}
+	clearSegmentPromptApprovals(&r.task.Run)
 
 	plan := buildVideoPlan(r.task.Config, prompts, caps, adapterID)
 	for _, warning := range plan.Warnings {
@@ -960,7 +1297,37 @@ func (r *videoRunner) runSubtitleStage() error {
 	r.task.Run.Subtitles = subtitles
 	r.logf("字幕已生成：%d 条，时间轴来源 %s（基于成片画布 %dx%d，可在字幕关卡里逐条改时间/位置/字号）",
 		len(subtitles.Cues), subtitles.TimingSource, width, height)
+	if subtitles.TimingSource == "aligned" || subtitles.TimingSource == "measured" {
+		if measured := measuredSpeechRate(subtitles.Cues, cfg.Language); measured > 0 {
+			unit := "字"
+			if isEnglishLanguage(cfg.Language) {
+				unit = "词"
+			}
+			configured := cfg.SpeechRate
+			if configured <= 0 {
+				configured = defaultSpeechRate(cfg.Language)
+			}
+			r.logf("实测语速约 %.1f %s/秒（设置 %.1f）：字幕轴按真实音频活动铺；模型读字快慢仍由模型自身决定",
+				measured, unit, configured)
+		}
+	}
 	return nil
+}
+
+// measuredSpeechRate 从字幕停留时长反算实际语速，用于校准「设置语速」与模型真实读字速度的差距。
+func measuredSpeechRate(cues []VideoSubtitleCue, lang string) float64 {
+	units := 0
+	seconds := 0.0
+	for _, cue := range cues {
+		units += speechUnitCount(cue.Text, lang)
+		if duration := cue.End - cue.Start; duration > 0 {
+			seconds += duration
+		}
+	}
+	if units == 0 || seconds <= 0 {
+		return 0
+	}
+	return round2(float64(units) / seconds)
 }
 
 // runRenderStage Agent3：按段串行生成，支持尾帧延续与断点续跑。
@@ -1018,6 +1385,7 @@ func (r *videoRunner) runRenderStage() (bool, error) {
 
 	// 进入渲染即清空上一轮的待确认标记：确认/重生成后重新评定，失败时不会残留
 	r.task.Run.ReviewPendingSegment = ""
+	r.task.Run.ReviewPendingPromptSegment = ""
 
 	// 断点续跑：已成功且文件仍在的片段直接复用
 	existing := make(map[string]VideoRender, len(r.task.Run.Renders))
@@ -1045,6 +1413,17 @@ func (r *videoRunner) runRenderStage() (bool, error) {
 			renders = append(renders, done)
 			previousClip = done.VideoURI
 			continue
+		}
+
+		// 逐段确认的「生成前」关卡（需求 11）：下一段的提示词在提交视频模型前先让用户过目。
+		// 第 1 段已在提示词关卡整体确认过，不再重复打断；用户刚在逐段确认里改过的段也视为已确认。
+		if taskReview && segment.Index > 0 && !segmentPromptApproved(&r.task.Run, segment.ID) {
+			r.task.Run.ReviewPendingPromptSegment = segment.ID
+			r.task.Run.Renders = append([]VideoRender{}, renders...)
+			r.logf("第 %d/%d 段待生成：提示词已展示，确认后再提交视频模型（可在确认面板里直接改写提示词/台词）",
+				segment.Index+1, len(segments))
+			_ = r.save()
+			return true, nil
 		}
 
 		firstFrame := cfg.FirstFrame
@@ -1099,7 +1478,7 @@ func (r *videoRunner) runRenderStage() (bool, error) {
 		outputPath := filepath.Join(workDir, "clips", fmt.Sprintf("%02d-%s.mp4", segment.Index+1, segment.ID))
 		// 提示词由 Agent2 定稿、用户在关卡②确认：渲染层只按定稿原样提交，
 		// 不再追加或改写主体约束，保证“看到的提示词就是发给视频模型的提示词”。
-		renderPrompt := composeRenderPrompt(segment, caps)
+		renderPrompt := composeRenderPrompt(segment, caps, cfg)
 		request := VideoGenRequest{
 			Prompt:           renderPrompt,
 			FirstFrame:       firstFrame,
@@ -1248,6 +1627,9 @@ func characterImagesForSegment(cfg VideoRunConfig, script *VideoScript, segment 
 				continue
 			}
 			for _, role := range shot.Roles {
+				if roleID, ok := matchSpeakerRole(cfg, role); ok {
+					role = roleID
+				}
 				if key := normalizeRoleKey(role); key != "" {
 					roles[key] = true
 				}
@@ -1255,8 +1637,24 @@ func characterImagesForSegment(cfg VideoRunConfig, script *VideoScript, segment 
 		}
 	}
 	// 说话人即使没写进 roles，也得算出场：台词归他、画面却没参考过他，脸一定翻。
-	if segment.Speaker != "" && segment.Speaker != VideoSpeakerNarration {
-		if key := normalizeRoleKey(segment.Speaker); key != "" {
+	// 多说话人时逐个带上，不能只看单值 Speaker。
+	if speaker := strings.TrimSpace(segment.Speaker); speaker != "" && speaker != VideoSpeakerNarration {
+		if roleID, ok := matchSpeakerRole(cfg, speaker); ok {
+			speaker = roleID
+		}
+		if key := normalizeRoleKey(speaker); key != "" {
+			roles[key] = true
+		}
+	}
+	for _, line := range normalizeDialogueLines(segment.DialogueLines, segment.Dialogue, segment.Speaker) {
+		if line.Speaker == "" || line.Speaker == VideoSpeakerNarration {
+			continue
+		}
+		speaker := line.Speaker
+		if roleID, ok := matchSpeakerRole(cfg, speaker); ok {
+			speaker = roleID
+		}
+		if key := normalizeRoleKey(speaker); key != "" {
 			roles[key] = true
 		}
 	}
@@ -1289,13 +1687,12 @@ func characterImagesForSegment(cfg VideoRunConfig, script *VideoScript, segment 
 func speakerDigest(cfg VideoRunConfig, prompts []VideoPromptItem) string {
 	parts := make([]string, 0, len(prompts))
 	for _, item := range prompts {
+		lines := normalizeDialogueLines(item.DialogueLines, item.Dialogue, item.Speaker)
 		switch {
-		case item.Dialogue == "":
+		case len(lines) == 0:
 			parts = append(parts, item.ShotID+"=无台词")
-		case item.Speaker == "":
-			parts = append(parts, item.ShotID+"=未定")
 		default:
-			parts = append(parts, item.ShotID+"="+speakerLabel(cfg, item.Speaker))
+			parts = append(parts, item.ShotID+"="+dialogueSpeakerName(cfg, lines))
 		}
 	}
 	return strings.Join(parts, "／")
@@ -1306,25 +1703,13 @@ func normalizeRoleKey(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
-// roleMatches 先按 role_id / 角色名精确比，再放宽到包含关系（模型常把「主理人（橘猫）」写成「主理人」）。
+// roleMatches 只做精确匹配（role_id / 角色名）。分镜角色在入库前已归一成 role_id，
+// 这里再放宽到包含关系会让 char_1 抢走 char_12 的参考图与台词。
 func roleMatches(roles map[string]bool, ref VideoCharacterRef) bool {
 	if len(roles) == 0 {
 		return false
 	}
-	for _, candidate := range []string{normalizeRoleKey(ref.RoleID), normalizeRoleKey(ref.Name)} {
-		if candidate == "" {
-			continue
-		}
-		if roles[candidate] {
-			return true
-		}
-		for got := range roles {
-			if strings.Contains(got, candidate) || strings.Contains(candidate, got) {
-				return true
-			}
-		}
-	}
-	return false
+	return roles[normalizeRoleKey(ref.RoleID)] || roles[normalizeRoleKey(ref.Name)]
 }
 
 // characterImagesOf 把一个角色的定妆图展开成带身份的图片条目。
@@ -1361,6 +1746,9 @@ func orderCharacterImages(in []VideoCharacterImage) []VideoCharacterImage {
 // roleUsesUserImages 判断某个出镜角色吃的是用户上传的定妆图（而不是模板里的生成图）。
 // 两者的权威程度不同：上传图是用户亲自认定的形象，提示词里的文字描述只能兜底。
 func roleUsesUserImages(cfg VideoRunConfig, role string) bool {
+	if roleID, ok := matchSpeakerRole(cfg, role); ok {
+		role = roleID
+	}
 	key := normalizeRoleKey(role)
 	if key == "" {
 		return false

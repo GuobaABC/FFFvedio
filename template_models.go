@@ -562,16 +562,19 @@ func applyVideoTemplate(tpl *VideoTemplate, cfg VideoRunConfig, overrides map[st
 	return cfg, sources, warnings
 }
 
-// templateCharacterRefs 把模板角色转成 RunConfig 的角色参考（外观块留在模板快照里）。
+// templateCharacterRefs 把模板角色转成 RunConfig 的角色参考；档案字段一并快照，
+// 这样 characterTable / 本地兜底都能用同一套角色档案生成外观锚点。
 func templateCharacterRefs(tpl *VideoTemplate) []VideoCharacterRef {
 	refs := make([]VideoCharacterRef, 0, len(tpl.Characters))
 	for _, character := range tpl.Characters {
 		refs = append(refs, VideoCharacterRef{
-			RoleID:      character.RoleID,
-			Name:        character.Name,
-			Images:      append([]string{}, character.Images...),
-			ImageSource: CharacterImageSourceTemplate,
-			VoiceHint:   character.VoiceHint,
+			RoleID:          character.RoleID,
+			Name:            character.Name,
+			Images:          append([]string{}, character.Images...),
+			ImageSource:     CharacterImageSourceTemplate,
+			AppearanceBlock: character.AppearanceBlock,
+			VoiceHint:       character.VoiceHint,
+			Perspective:     character.Perspective,
 		})
 	}
 	return refs
@@ -593,14 +596,27 @@ func mergeCharacterRefs(tpl *VideoTemplate, cfg *VideoRunConfig, sources map[str
 	userBacked := make([]string, 0, len(userRefs))
 	pushed := make([]string, 0, len(templateRefs))
 	for _, ref := range userRefs {
-		if len(ref.Images) > 0 {
+		// 绑定角色库的条目即使暂时没有图，也代表用户已经选定了这个角色，不能再被模板行顶掉。
+		if len(ref.Images) > 0 || strings.TrimSpace(ref.CharacterID) != "" {
 			// 前端会把模板那一行原样送回来（已标 template）：只认身份，不给它上传图的优先权
-			if ref.ImageSource != CharacterImageSourceTemplate {
+			if ref.ImageSource != CharacterImageSourceTemplate && len(ref.Images) > 0 {
 				ref.ImageSource = CharacterImageSourceUser
 				userBacked = append(userBacked, firstNonEmpty(ref.Name, ref.RoleID))
 			}
 			for _, key := range characterRefKeys(ref) {
 				claimed[key] = true
+			}
+		}
+		// 用户认领了模板角色但没填档案时，继承模板的外观/声音，任务内即可自洽
+		if character := templateCharacterByRole(tpl, ref.RoleID); character != nil {
+			if ref.AppearanceBlock == "" {
+				ref.AppearanceBlock = character.AppearanceBlock
+			}
+			if ref.VoiceHint == "" {
+				ref.VoiceHint = character.VoiceHint
+			}
+			if ref.Perspective == "" {
+				ref.Perspective = character.Perspective
 			}
 		}
 		merged = append(merged, ref)

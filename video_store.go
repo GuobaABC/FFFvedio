@@ -107,8 +107,14 @@ func (a *App) CreateVideoTask(input VideoTaskInput) (VideoTask, error) {
 	}
 
 	cfg := input.Config
+	// 先解析角色库绑定：后续模板合并要靠角色图/角色标识判断「这个角色已由用户认领」。
+	hydrateWarnings, hydrateErr := a.hydrateCharacterRefs(&cfg)
+	if hydrateErr != nil {
+		return VideoTask{}, hydrateErr
+	}
 	var templateRun *VideoTemplateRun
 	templateWarnings := make([]string, 0, 2)
+	templateWarnings = append(templateWarnings, hydrateWarnings...)
 	if ref := cfg.TemplateRef; ref != nil && strings.TrimSpace(ref.ID) != "" {
 		merged, run, refWarnings, refErr := a.applyTemplateRef(cfg, *ref)
 		if refErr != nil {

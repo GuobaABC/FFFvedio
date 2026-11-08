@@ -74,14 +74,52 @@ const (
 	CharacterImageSourceTemplate = "template" // 模板自带的定妆图（多为生成图）
 )
 
+// VideoVoiceProfile 角色音色档案：需求 5 先把结构存下来，需求 10 接入 TTS 后可直接复用。
+// 未配置时为零值指针，JSON 里不出现，旧任务不受影响。
+type VideoVoiceProfile struct {
+	VoiceID string  `json:"voiceId"`
+	Rate    float64 `json:"rate"`   // 语速倍率（1 = 正常）
+	Pitch   float64 `json:"pitch"`  // 音高偏移（半音）
+	Volume  float64 `json:"volume"` // 音量（0-2，1 = 原始音量）
+	Emotion string  `json:"emotion"`
+}
+
+// VideoCharacter 角色库条目：跨任务复用的角色档案。
+// 任务创建时会把档案「快照」进 VideoCharacterRef，因此角色库后续修改不会改写旧任务。
+type VideoCharacter struct {
+	ID              string             `json:"id"`
+	Name            string             `json:"name"`
+	RoleID          string             `json:"roleId"`
+	AppearanceBlock string             `json:"appearanceBlock"`
+	Persona         string             `json:"persona"`
+	NegativePrompt  string             `json:"negativePrompt"`
+	VoiceHint       string             `json:"voiceHint"`
+	VoiceProfile    *VideoVoiceProfile `json:"voiceProfile"`
+	Perspective     string             `json:"perspective"`
+	Images          []string           `json:"images"`
+	Tags            []string           `json:"tags"`
+	Note            string             `json:"note"`
+	CreatedAt       string             `json:"createdAt"`
+	UpdatedAt       string             `json:"updatedAt"`
+}
+
 // VideoCharacterRef 多角色参考图：每个角色一张或多张定妆图，用于跨段保持外观一致。
+// 角色档案字段（AppearanceBlock / Persona / NegativePrompt / Perspective / VoiceProfile）
+// 允许任务级覆盖；为空时由 CreateVideoTask 从绑定的角色库条目补全并快照。
 type VideoCharacterRef struct {
-	RoleID string   `json:"roleId"`
-	Name   string   `json:"name"`
-	Images []string `json:"images"`
+	RoleID string `json:"roleId"`
+	Name   string `json:"name"`
+	// CharacterID 绑定的角色库条目；旧任务没有该字段，仍按纯角色参考图方式工作。
+	CharacterID string   `json:"characterId,omitempty"`
+	Images      []string `json:"images"`
 	// ImageSource 标记 Images 的来源，决定提交顺序与提示词里的措辞权重
-	ImageSource string `json:"imageSource"`
-	VoiceHint   string `json:"voiceHint"`
+	ImageSource     string             `json:"imageSource"`
+	AppearanceBlock string             `json:"appearanceBlock,omitempty"`
+	Persona         string             `json:"persona,omitempty"`
+	NegativePrompt  string             `json:"negativePrompt,omitempty"`
+	Perspective     string             `json:"perspective,omitempty"`
+	VoiceHint       string             `json:"voiceHint"`
+	VoiceProfile    *VideoVoiceProfile `json:"voiceProfile,omitempty"`
 }
 
 // VideoSubtitleStyle 字幕样式，全部来自用户输入（§6）。
@@ -182,19 +220,28 @@ func (cfg VideoRunConfig) strictFirstFrameEnabled() bool {
 // 否则渲染层不知道给谁拍口型、字幕与配音也会含糊。
 const VideoSpeakerNarration = "narration"
 
+// VideoDialogueLine 一句台词及其说话人。一段可以有多个说话人，
+// 因此台词不能只用一个 speaker 字段承载；Dialogue / Speaker 保留为单说话人兼容字段。
+type VideoDialogueLine struct {
+	Speaker string `json:"speaker"`
+	Text    string `json:"text"`
+}
+
 // VideoShot Agent1 的分镜数组元素。
 type VideoShot struct {
 	ID          string     `json:"id"`
 	TimeRange   [2]float64 `json:"timeRange"`
 	Roles       []string   `json:"roles"`
 	SceneIntent string     `json:"sceneIntent"`
-	Dialogue    string     `json:"dialogue"`
-	// Speaker 这句台词谁说：role_id，或 VideoSpeakerNarration 表示旁白；无台词时为空
-	Speaker   string  `json:"speaker"`
-	Camera    string  `json:"camera"`
-	Mood      string  `json:"mood"`
-	AudioCue  string  `json:"audioCue"`
-	DurationS float64 `json:"durationS"`
+	// Dialogue 所有台词按行拼接后的兼容字段；多说话人时以 DialogueLines 为准。
+	Dialogue string `json:"dialogue"`
+	// Speaker 只有单一说话人时才保留（role_id 或 VideoSpeakerNarration）；无台词或多人时为空。
+	Speaker       string              `json:"speaker"`
+	DialogueLines []VideoDialogueLine `json:"dialogueLines,omitempty"`
+	Camera        string              `json:"camera"`
+	Mood          string              `json:"mood"`
+	AudioCue      string              `json:"audioCue"`
+	DurationS     float64             `json:"durationS"`
 }
 
 // VideoScript Agent1 输出契约。
@@ -207,32 +254,38 @@ type VideoScript struct {
 
 // VideoPromptItem Agent2 输出：画面提示词 + 台词 + 时长预算校验。
 type VideoPromptItem struct {
-	ShotID          string  `json:"shotId"`
-	VisualPrompt    string  `json:"visualPrompt"`
-	Dialogue        string  `json:"dialogue"`
-	Speaker         string  `json:"speaker"` // 台词归属：role_id 或 VideoSpeakerNarration
-	Start           float64 `json:"start"`
-	End             float64 `json:"end"`
-	CharCount       int     `json:"charCount"`
-	EstSpeechS      float64 `json:"estSpeechS"`
-	Fits            bool    `json:"fits"`
-	RenderDurationS int     `json:"renderDurationS"`
-	Note            string  `json:"note"`
+	ShotID       string `json:"shotId"`
+	VisualPrompt string `json:"visualPrompt"`
+	// Dialogue 所有台词按行拼接后的兼容字段；多说话人时以 DialogueLines 为准。
+	Dialogue string `json:"dialogue"`
+	// Speaker 只有单一说话人时才保留；多说话人时为空。
+	Speaker         string              `json:"speaker"`
+	DialogueLines   []VideoDialogueLine `json:"dialogueLines,omitempty"`
+	Start           float64             `json:"start"`
+	End             float64             `json:"end"`
+	CharCount       int                 `json:"charCount"`
+	EstSpeechS      float64             `json:"estSpeechS"`
+	Fits            bool                `json:"fits"`
+	RenderDurationS int                 `json:"renderDurationS"`
+	Note            string              `json:"note"`
 }
 
 // VideoSegment 渲染段：分镜按模型时长档位切分后的最小生成单元。
 type VideoSegment struct {
-	ID       string `json:"id"`
-	ShotID   string `json:"shotId"`
-	Index    int    `json:"index"`
-	Prompt   string `json:"prompt"`
+	ID     string `json:"id"`
+	ShotID string `json:"shotId"`
+	Index  int    `json:"index"`
+	Prompt string `json:"prompt"`
+	// Dialogue 所有台词按行拼接后的兼容字段；多说话人时以 DialogueLines 为准。
 	Dialogue string `json:"dialogue"`
-	// Speaker 台词归属（role_id / narration）；SpeakerName 是写进提示词的显示名（旁白 / 角色名）
-	Speaker     string  `json:"speaker"`
-	SpeakerName string  `json:"speakerName"`
-	Start       float64 `json:"start"`
-	End         float64 `json:"end"`
-	DurationS   int     `json:"durationS"`
+	// Speaker 只有单一说话人时才保留；多说话人时为空。
+	Speaker string `json:"speaker"`
+	// SpeakerName 写进提示词的显示名；多说话人时为“甲、乙”这类可读标签。
+	SpeakerName   string              `json:"speakerName"`
+	DialogueLines []VideoDialogueLine `json:"dialogueLines,omitempty"`
+	Start         float64             `json:"start"`
+	End           float64             `json:"end"`
+	DurationS     int                 `json:"durationS"`
 }
 
 // VideoPlan 成本/拼接计划（确认门②前展示段数×单价 + 串行/并行）。
@@ -336,13 +389,21 @@ type VideoRunContext struct {
 	Logs                 []string          `json:"logs"`
 	Feedback             string            `json:"feedback"`
 	ReviewPendingSegment string            `json:"reviewPendingSegment"` // 逐段确认关卡：等待用户确认的片段 ID
+	// ReviewPendingPromptSegment 逐段确认的「生成前」关卡：下一段尚未消耗额度，等待用户确认提示词。
+	ReviewPendingPromptSegment string `json:"reviewPendingPromptSegment"`
+	// ApprovedSegmentPrompts 已确认过提示词、可以直接生成的片段 ID：
+	// 只放行用户明确确认过的段，避免每次续跑都重复弹确认。
+	ApprovedSegmentPrompts []string `json:"approvedSegmentPrompts,omitempty"`
 }
 
 // VideoSegmentRegen 单段重生成的入参：修改该段提示词/台词后只重渲这一段的下游。
 type VideoSegmentRegen struct {
 	SegmentID    string `json:"segmentId"`
 	VisualPrompt string `json:"visualPrompt"`
-	Dialogue     string `json:"dialogue"`
+	// Dialogue / Speaker 单说话人兼容字段；多说话人用 DialogueLines。
+	Dialogue      string              `json:"dialogue"`
+	Speaker       string              `json:"speaker"`
+	DialogueLines []VideoDialogueLine `json:"dialogueLines,omitempty"`
 }
 
 // TailFrameAsset 尾帧资产：任务最后一段的尾帧，供其他任务作为首帧续写。
@@ -390,12 +451,17 @@ type VideoTaskInput struct {
 	Config    VideoRunConfig `json:"config"`
 }
 
-// VideoPromptEdit 确认门②的局部修改（只改提示词与台词，不动分镜结构）。
+// VideoPromptEdit 确认门②的局部修改（只改提示词、台词与本段时长，不动分镜结构）。
 type VideoPromptEdit struct {
 	ShotID       string `json:"shotId"`
 	VisualPrompt string `json:"visualPrompt"`
-	Dialogue     string `json:"dialogue"`
-	Speaker      string `json:"speaker"` // 留空表示不改台词归属
+	// Dialogue / Speaker 单说话人兼容字段；多说话人用 DialogueLines。
+	Dialogue      string              `json:"dialogue"`
+	Speaker       string              `json:"speaker"` // 留空表示不改台词归属
+	DialogueLines []VideoDialogueLine `json:"dialogueLines,omitempty"`
+	// DurationS 本段目标时长（秒）；≤0 表示沿用原时长。
+	// 改时长会重排后续镜头的时间轴，渲染时仍会按模型档位切分并对差额给出警告。
+	DurationS float64 `json:"durationS"`
 }
 
 // VideoSubtitleEdit 字幕关卡的整表提交：时间轴、文本、位置、字号由用户在这一步定稿。
@@ -677,7 +743,13 @@ func normalizeVideoConfig(cfg VideoRunConfig) (VideoRunConfig, []string, error) 
 	for index, ref := range cfg.CharacterRefs {
 		ref.RoleID = strings.TrimSpace(ref.RoleID)
 		ref.Name = strings.TrimSpace(ref.Name)
+		ref.CharacterID = strings.TrimSpace(ref.CharacterID)
+		ref.AppearanceBlock = strings.TrimSpace(ref.AppearanceBlock)
+		ref.Persona = strings.TrimSpace(ref.Persona)
+		ref.NegativePrompt = strings.TrimSpace(ref.NegativePrompt)
+		ref.Perspective = strings.TrimSpace(ref.Perspective)
 		ref.VoiceHint = strings.TrimSpace(ref.VoiceHint)
+		ref.VoiceProfile = normalizeVideoVoiceProfile(ref.VoiceProfile)
 		ref.ImageSource = strings.ToLower(strings.TrimSpace(ref.ImageSource))
 		if ref.Name == "" && ref.RoleID == "" && len(ref.Images) == 0 {
 			continue
@@ -714,6 +786,19 @@ func normalizeVideoConfig(cfg VideoRunConfig) (VideoRunConfig, []string, error) 
 		refs = append(refs, ref)
 	}
 	cfg.CharacterRefs = refs
+	// role_id 是台词归属的唯一锚点：重复标识会让“谁在说”永远绑不到确定的人。
+	// 新建任务时直接拦截；旧任务的数据在加载时不会走这里，不受影响。
+	seenRoleIDs := make(map[string]string, len(refs))
+	for _, ref := range refs {
+		key := normalizeRoleKey(ref.RoleID)
+		if key == "" {
+			continue
+		}
+		if previous, ok := seenRoleIDs[key]; ok {
+			return cfg, warnings, fmt.Errorf("角色标识 %q 重复（%s 与 %s）：每个角色的 role_id 必须唯一", ref.RoleID, previous, ref.Name)
+		}
+		seenRoleIDs[key] = ref.Name
+	}
 
 	// 分镜来源：手动分段就地归一（段时长保真），目标时长以各段之和为准
 	cfg.ScriptMode = normalizeVideoScriptMode(cfg.ScriptMode)
@@ -731,6 +816,31 @@ func normalizeVideoConfig(cfg VideoRunConfig) (VideoRunConfig, []string, error) 
 	}
 
 	return cfg, warnings, nil
+}
+
+// normalizeVideoVoiceProfile 音色档案做宽松归一：空值保持为空，数值夹到可用区间。
+// 需求 5 只负责保存与展示，真正的 TTS 参数在需求 10 接入后才会被渲染层消费。
+func normalizeVideoVoiceProfile(profile *VideoVoiceProfile) *VideoVoiceProfile {
+	if profile == nil {
+		return nil
+	}
+	normalized := *profile
+	normalized.VoiceID = strings.TrimSpace(normalized.VoiceID)
+	normalized.Emotion = strings.TrimSpace(normalized.Emotion)
+	if normalized.Rate != 0 {
+		normalized.Rate = round2(clampFloat(normalized.Rate, 0.5, 2))
+	}
+	if normalized.Pitch != 0 {
+		normalized.Pitch = round2(clampFloat(normalized.Pitch, -12, 12))
+	}
+	if normalized.Volume != 0 {
+		normalized.Volume = round2(clampFloat(normalized.Volume, 0, 2))
+	}
+	if normalized.VoiceID == "" && normalized.Rate == 0 && normalized.Pitch == 0 &&
+		normalized.Volume == 0 && normalized.Emotion == "" {
+		return nil
+	}
+	return &normalized
 }
 
 // speechUnitCount 中文按字符、英文按词统计（去空格）。
@@ -755,6 +865,23 @@ func speechUnitCount(text, lang string) int {
 	return count
 }
 
+// speechPauseBufferS 每句台词的起音/收尾缓冲：估算与裁剪必须用同一个口径，
+// 否则会出现「按语速刚好写满，却被判定超时」的自相矛盾。
+const speechPauseBufferS = 0.3
+
+// speechUnitBudget 本段台词可用字数/词数：先扣掉停顿缓冲，再按语速换算。
+// 中文按字、英文按词，与 speechUnitCount 的统计口径一致。
+func speechUnitBudget(duration, rate float64, lang string) int {
+	if rate <= 0 {
+		rate = defaultSpeechRate(lang)
+	}
+	available := duration - speechPauseBufferS
+	if available <= 0 {
+		return 0
+	}
+	return int(math.Floor(available * rate))
+}
+
 // estimateSpeechSeconds 台词时长模型（§4.2）：字数 / 语速 + 每句停顿缓冲。
 func estimateSpeechSeconds(text, lang string, rate float64) float64 {
 	units := speechUnitCount(text, lang)
@@ -764,7 +891,7 @@ func estimateSpeechSeconds(text, lang string, rate float64) float64 {
 	if rate <= 0 {
 		rate = defaultSpeechRate(lang)
 	}
-	return round2(float64(units)/rate + 0.3)
+	return round2(float64(units)/rate + speechPauseBufferS)
 }
 
 // nearestAllowedDuration 把任意时长夹取到模型支持的离散档位，避免厂商侧直接拒绝。
@@ -795,29 +922,157 @@ func maxAllowedDuration(allowed []int) int {
 }
 
 // splitShotDurations 超过单段上限时按档位切分（§5.3）。
+// 旧实现先平均再逐段就近取档，余数会被整段丢掉（21s → 3×7 → 3×5 = 15s）；
+// 这里改成在“段数 × 允许档位”的组合里找总和最接近目标的一组，同样差额优先段数更少。
 func splitShotDurations(duration float64, allowed []int, maxClip float64) []int {
-	if len(allowed) == 0 {
-		allowed = defaultVideoCapabilities().AllowedDurations
-	}
+	allowed = normalizeAllowedDurations(allowed)
 	if duration <= 0 {
 		duration = float64(allowed[0])
 	}
 	if maxClip <= 0 {
-		maxClip = float64(maxAllowedDuration(allowed))
+		maxClip = float64(allowed[len(allowed)-1])
 	}
-	parts := int(math.Ceil(duration / maxClip))
-	if parts < 1 {
-		parts = 1
+	// 单段上限必须压过档位：宁可拆更多段，也不提交模型不接受的时长。
+	fitted := make([]int, 0, len(allowed))
+	for _, value := range allowed {
+		if float64(value) <= maxClip {
+			fitted = append(fitted, value)
+		}
 	}
-	if parts > 12 {
-		parts = 12
+	if len(fitted) > 0 {
+		allowed = fitted
+	} else {
+		// 档位全都超过单段上限：退回上限本身，至少保证不提交模型不接受的时长。
+		capacity := int(math.Floor(maxClip))
+		if capacity < 1 {
+			capacity = 1
+		}
+		allowed = []int{capacity}
 	}
-	per := duration / float64(parts)
-	out := make([]int, 0, parts)
-	for i := 0; i < parts; i++ {
-		out = append(out, nearestAllowedDuration(per, allowed))
+	partsMin := int(math.Ceil(duration / maxClip))
+	if partsMin < 1 {
+		partsMin = 1
 	}
-	return out
+	if partsMin > 12 {
+		partsMin = 12
+	}
+	partsMax := int(math.Ceil(duration / float64(allowed[0])))
+	if partsMax < partsMin {
+		partsMax = partsMin
+	}
+	if partsMax > 12 {
+		partsMax = 12
+	}
+
+	best := []int(nil)
+	bestDiff := math.Inf(1)
+	for parts := partsMin; parts <= partsMax; parts++ {
+		combo := closestDurationCombo(duration, parts, allowed)
+		if len(combo) == 0 {
+			continue
+		}
+		sum := 0
+		for _, part := range combo {
+			sum += part
+		}
+		diff := math.Abs(float64(sum) - duration)
+		// 差额相同时保留段数更少的方案：少一段就少一次生成成本。
+		if diff < bestDiff-1e-9 {
+			best = combo
+			bestDiff = diff
+		}
+	}
+	if len(best) == 0 {
+		return []int{nearestAllowedDuration(duration, allowed)}
+	}
+	return best
+}
+
+// normalizeAllowedDurations 去重、升序，并过滤掉非正数档位。
+func normalizeAllowedDurations(allowed []int) []int {
+	if len(allowed) == 0 {
+		allowed = defaultVideoCapabilities().AllowedDurations
+	}
+	cleaned := make([]int, 0, len(allowed))
+	seen := make(map[int]bool, len(allowed))
+	for _, value := range allowed {
+		if value <= 0 || seen[value] {
+			continue
+		}
+		seen[value] = true
+		cleaned = append(cleaned, value)
+	}
+	if len(cleaned) == 0 {
+		return []int{10}
+	}
+	sort.Ints(cleaned)
+	return cleaned
+}
+
+// closestDurationCombo 在恰好 parts 段、每段取 allowed 档位的约束下，
+// 找一个总和最接近 target 的组合（差额相同取总时长更短的，控制成本）。
+func closestDurationCombo(target float64, parts int, allowed []int) []int {
+	if parts <= 0 || len(allowed) == 0 {
+		return nil
+	}
+	maxAllowed := allowed[len(allowed)-1]
+	limit := int(math.Ceil(target)) + maxAllowed
+	if maxSum := parts * maxAllowed; limit > maxSum {
+		limit = maxSum
+	}
+	if limit < allowed[0] {
+		return nil
+	}
+
+	reachable := make([][]bool, parts+1)
+	previous := make([][]int, parts+1)
+	for i := range reachable {
+		reachable[i] = make([]bool, limit+1)
+		previous[i] = make([]int, limit+1)
+	}
+	reachable[0][0] = true
+	for count := 1; count <= parts; count++ {
+		for sum := 0; sum <= limit; sum++ {
+			if !reachable[count-1][sum] {
+				continue
+			}
+			for _, value := range allowed {
+				next := sum + value
+				if next > limit || reachable[count][next] {
+					continue
+				}
+				reachable[count][next] = true
+				previous[count][next] = sum
+			}
+		}
+	}
+
+	bestSum := -1
+	bestDiff := math.Inf(1)
+	for sum := 0; sum <= limit; sum++ {
+		if !reachable[parts][sum] {
+			continue
+		}
+		diff := math.Abs(float64(sum) - target)
+		if diff < bestDiff-1e-9 || (math.Abs(diff-bestDiff) <= 1e-9 && sum < bestSum) {
+			bestSum = sum
+			bestDiff = diff
+		}
+	}
+	if bestSum < 0 {
+		return nil
+	}
+
+	combo := make([]int, parts)
+	sum := bestSum
+	for count := parts; count > 0; count-- {
+		prev := previous[count][sum]
+		combo[count-1] = sum - prev
+		sum = prev
+	}
+	// 统一按长段在前输出，计划与日志更稳定，也避免同一输入每次排列不同。
+	sort.Sort(sort.Reverse(sort.IntSlice(combo)))
+	return combo
 }
 
 // speakerLabel 把台词归属翻译成提示词里能读的名字：旁白就叫旁白，角色用角色名。
@@ -830,6 +1085,98 @@ func speakerLabel(cfg VideoRunConfig, speaker string) string {
 		return "旁白"
 	}
 	return firstNonEmpty(characterDisplayName(cfg, speaker), speaker)
+}
+
+// normalizeDialogueLines 统一台词行：优先结构化 dialogueLines；
+// 旧任务只有 dialogue / speaker 时自动升级成一行，保证多说话人改造对旧数据无感。
+func normalizeDialogueLines(lines []VideoDialogueLine, dialogue, speaker string) []VideoDialogueLine {
+	out := make([]VideoDialogueLine, 0, len(lines)+1)
+	for _, line := range lines {
+		text := strings.TrimSpace(strings.ReplaceAll(line.Text, "\r\n", "\n"))
+		if text == "" {
+			continue
+		}
+		out = append(out, VideoDialogueLine{Speaker: strings.TrimSpace(line.Speaker), Text: text})
+	}
+	if len(out) == 0 {
+		if text := strings.TrimSpace(dialogue); text != "" {
+			out = append(out, VideoDialogueLine{Speaker: strings.TrimSpace(speaker), Text: text})
+		}
+	}
+	return out
+}
+
+// dialogueText 把多行台词拼回一个字符串，供字幕、字数与时长估算使用。
+func dialogueText(lines []VideoDialogueLine) string {
+	texts := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if text := strings.TrimSpace(line.Text); text != "" {
+			texts = append(texts, text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+// dialogueSpeakerList 按出现顺序列出不重复的说话人（含 narration）。
+func dialogueSpeakerList(lines []VideoDialogueLine) []string {
+	out := make([]string, 0, len(lines))
+	seen := make(map[string]bool, len(lines))
+	for _, line := range lines {
+		speaker := strings.TrimSpace(line.Speaker)
+		if speaker == "" || seen[speaker] {
+			continue
+		}
+		seen[speaker] = true
+		out = append(out, speaker)
+	}
+	return out
+}
+
+// dialogueSpeakerSummary 单一说话人时返回 role_id；多人或未定时返回空，兼容旧字段。
+func dialogueSpeakerSummary(lines []VideoDialogueLine) string {
+	speakers := dialogueSpeakerList(lines)
+	if len(speakers) == 1 {
+		return speakers[0]
+	}
+	return ""
+}
+
+// dialogueSpeakerName 把本段所有说话人翻成可读标签：旁白 / 角色名，多个用“、”连接。
+func dialogueSpeakerName(cfg VideoRunConfig, lines []VideoDialogueLine) string {
+	speakers := dialogueSpeakerList(lines)
+	labels := make([]string, 0, len(speakers))
+	for _, speaker := range speakers {
+		if label := speakerLabel(cfg, speaker); label != "" {
+			labels = append(labels, label)
+		}
+	}
+	return strings.Join(labels, "、")
+}
+
+// dialogueHasCharacterSpeaker 本段是否有角色开口（旁白不算，旁白不需要画面里有人对口型）。
+func dialogueHasCharacterSpeaker(lines []VideoDialogueLine) bool {
+	for _, speaker := range dialogueSpeakerList(lines) {
+		if speaker != VideoSpeakerNarration {
+			return true
+		}
+	}
+	return false
+}
+
+// dialogueSpeakerSequence 按台词顺序输出说话人标签（连续重复的合并），
+// 用于提示词里描述“谁先说、谁后说”。旁白也参与排序。
+func dialogueSpeakerSequence(cfg VideoRunConfig, lines []VideoDialogueLine) []string {
+	out := make([]string, 0, len(lines))
+	last := ""
+	for _, line := range lines {
+		label := speakerLabel(cfg, line.Speaker)
+		if label == "" || label == last {
+			continue
+		}
+		out = append(out, label)
+		last = label
+	}
+	return out
 }
 
 // buildVideoPlan 依据分镜提示词与适配器能力生成拼接/成本计划。
@@ -866,10 +1213,11 @@ func buildVideoPlan(cfg VideoRunConfig, prompts []VideoPromptItem, caps VideoCap
 				DurationS: part,
 			}
 			if index == 0 {
-				segment.Dialogue = item.Dialogue
-				// 台词只在首段下发，归属跟着一起下：下游才能决定是给谁拍口型，还是按旁白处理
-				segment.Speaker = item.Speaker
-				segment.SpeakerName = speakerLabel(cfg, item.Speaker)
+				// 台词只在首段下发；多说话人按行携带，归属不再被压成单值。
+				segment.DialogueLines = normalizeDialogueLines(item.DialogueLines, item.Dialogue, item.Speaker)
+				segment.Dialogue = dialogueText(segment.DialogueLines)
+				segment.Speaker = dialogueSpeakerSummary(segment.DialogueLines)
+				segment.SpeakerName = dialogueSpeakerName(cfg, segment.DialogueLines)
 			}
 			plan.Segments = append(plan.Segments, segment)
 			cursor += float64(part)

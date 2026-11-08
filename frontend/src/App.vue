@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 import ProviderSettings from './components/ProviderSettings.vue'
+import CharacterLibrary from './components/CharacterLibrary.vue'
 import CrawlResults from './components/CrawlResults.vue'
 import CrawlTaskCreate from './components/CrawlTaskCreate.vue'
 import Dashboard from './components/Dashboard.vue'
@@ -53,6 +54,7 @@ const mainTabs: MainTab[] = [
       { id: 'video-results', label: '视频生成结果', description: '' },
       { id: 'video-projects', label: '项目视图', description: '' },
       { id: 'video-templates', label: '模板库', description: '' },
+      { id: 'video-characters', label: '角色库', description: '' },
     ],
   },
   {
@@ -232,6 +234,7 @@ onUnmounted(() => {
         <VideoResults v-else-if="activeSubTab.id === 'video-results'" />
         <VideoProjects v-else-if="activeSubTab.id === 'video-projects'" @to-create="handleProjectsToCreate" />
         <TemplateLibrary v-else-if="activeSubTab.id === 'video-templates'" @use-template="handleUseTemplate" />
+        <CharacterLibrary v-else-if="activeSubTab.id === 'video-characters'" />
         <ProviderSettings v-else-if="activeSubTab.id === 'providers'" />
         <div v-else class="panel__empty">
           <p class="panel__title">{{ activeSubTab.label }}</p>
