@@ -115,6 +115,10 @@ type VideoCharacter struct {
 type VideoCharacterRef struct {
 	RoleID string `json:"roleId"`
 	Name   string `json:"name"`
+	// Species 自动创建角色的动物种类（无图任务只能用动物）；用户角色可为空。
+	Species string `json:"species,omitempty"`
+	// AutoCreated 标记这是 Agent1 企划阶段自动创建的临时角色，不等于用户角色库条目。
+	AutoCreated bool `json:"autoCreated,omitempty"`
 	// CharacterID 绑定的角色库条目；旧任务没有该字段，仍按纯角色参考图方式工作。
 	CharacterID string   `json:"characterId,omitempty"`
 	Images      []string `json:"images"`
@@ -155,6 +159,8 @@ type VideoRunConfig struct {
 	Topic string `json:"topic"`
 	// ScriptMode 分镜来源：auto（Agent1 自动生成）/ manual（用户逐段填写）
 	ScriptMode string `json:"scriptMode"`
+	// ScriptLocked 用户明确提供了完整剧本：台词原文锁定，只做分镜化。
+	ScriptLocked bool `json:"scriptLocked"`
 	// ManualShots 手动分段：scriptMode=manual 时直接当分镜用，段数与段时长以用户输入为准
 	ManualShots      []VideoShot         `json:"manualShots"`
 	FirstFrame       string              `json:"firstFrame"` // 本地路径或 URL
@@ -200,6 +206,10 @@ func (cfg VideoRunConfig) localFallbackEnabled() bool {
 const (
 	VideoScriptModeAuto   = "auto"
 	VideoScriptModeManual = "manual"
+	// VideoScriptModeLocked 用户提供了完整剧本：台词锁定，只做分镜化。
+	VideoScriptModeLocked = "script_locked"
+	// VideoModeOriginal 企划分为原创故事（非锁定剧本）。
+	VideoModeOriginal = "original"
 )
 
 // manualScriptEnabled 是否走到手动分段分支。
@@ -248,14 +258,69 @@ type VideoShot struct {
 	Mood          string              `json:"mood"`
 	AudioCue      string              `json:"audioCue"`
 	DurationS     float64             `json:"durationS"`
+	// 以下字段由「企划→分镜」两阶段的新分镜输出，旧数据为空。
+	BeatID     string `json:"beatId,omitempty"`
+	Function   string `json:"function,omitempty"`
+	NewInfo    string `json:"newInfo,omitempty"`
+	Reaction   string `json:"reaction,omitempty"`
+	Transition string `json:"transition,omitempty"`
 }
 
-// VideoScript Agent1 输出契约。
+// VideoCastMember 企划阶段的角色卡。用户角色与自动创建的临时角色共用同一结构，
+// 但 AutoCreated / Ephemeral 明确标记来源，避免把临时角色写进角色库。
+type VideoCastMember struct {
+	RoleID      string `json:"roleId"`
+	Name        string `json:"name"`
+	Species     string `json:"species,omitempty"`
+	Appearance  string `json:"appearance,omitempty"`
+	Persona     string `json:"persona,omitempty"`
+	VoiceHint   string `json:"voiceHint"`
+	AutoCreated bool   `json:"autoCreated,omitempty"`
+	Ephemeral   bool   `json:"ephemeral,omitempty"`
+}
+
+// VideoBeat 企划阶段的一个故事节拍：先有节拍，再由分镜阶段拆成镜头。
+type VideoBeat struct {
+	ID         string   `json:"id"`
+	Function   string   `json:"function"` // hook|setup|turn|payoff|cta
+	Summary    string   `json:"summary"`
+	NewInfo    string   `json:"newInfo"`
+	Emotion    string   `json:"emotion,omitempty"`
+	Location   string   `json:"location,omitempty"`
+	Characters []string `json:"characters,omitempty"`
+	Props      []string `json:"props,omitempty"`
+	Link       string   `json:"link,omitempty"` // 与上一拍的因果/转折关系
+}
+
+// VideoLockedLine 锁定剧本里的一句台词：分镜阶段只能引用，不能改写。
+type VideoLockedLine struct {
+	ID      string `json:"id"`
+	Speaker string `json:"speaker"`
+	Text    string `json:"text"`
+	Scene   int    `json:"scene,omitempty"`
+}
+
+// VideoTreatment 「企划→分镜」第一阶段产物：角色、故事骨架与连续性约定。
+// 它先于分镜存在，分镜阶段只能可视化，不能新增角色/情节/反转。
+type VideoTreatment struct {
+	Mode        string            `json:"mode"` // original|script_locked
+	Premise     string            `json:"premise"`
+	Cast        []VideoCastMember `json:"cast"`
+	Beats       []VideoBeat       `json:"beats"`
+	Continuity  []string          `json:"continuity,omitempty"`
+	LockedLines []VideoLockedLine `json:"lockedLines,omitempty"`
+	Model       string            `json:"model,omitempty"`
+	Revision    int               `json:"revision,omitempty"`
+}
+
+// VideoScript Agent1 输出契约。Treatment 为空表示旧任务/旧单阶段结果。
 type VideoScript struct {
-	Logline  string      `json:"logline"`
-	Language string      `json:"language"`
-	Source   string      `json:"source"` // llm|local
-	Shots    []VideoShot `json:"shots"`
+	Logline   string          `json:"logline"`
+	Language  string          `json:"language"`
+	Source    string          `json:"source"` // llm|llm_locked|local|llm_locked
+	Mode      string          `json:"mode,omitempty"`
+	Treatment *VideoTreatment `json:"treatment,omitempty"`
+	Shots     []VideoShot     `json:"shots"`
 }
 
 // VideoPromptItem Agent2 输出：画面提示词 + 台词 + 时长预算校验。
@@ -795,12 +860,17 @@ func normalizeVideoConfig(cfg VideoRunConfig) (VideoRunConfig, []string, error) 
 	for index, ref := range cfg.CharacterRefs {
 		ref.RoleID = strings.TrimSpace(ref.RoleID)
 		ref.Name = strings.TrimSpace(ref.Name)
+		ref.Species = strings.TrimSpace(ref.Species)
 		ref.CharacterID = strings.TrimSpace(ref.CharacterID)
 		ref.AppearanceBlock = strings.TrimSpace(ref.AppearanceBlock)
 		ref.Persona = strings.TrimSpace(ref.Persona)
 		ref.NegativePrompt = strings.TrimSpace(ref.NegativePrompt)
 		ref.Perspective = strings.TrimSpace(ref.Perspective)
 		ref.VoiceHint = strings.TrimSpace(ref.VoiceHint)
+		if ref.VoiceHint == "" {
+			ref.VoiceHint = defaultVoiceHint(VideoCastMember{Name: ref.Name, Species: ref.Species, Persona: ref.Persona})
+			warnings = append(warnings, fmt.Sprintf("角色「%s」未填写声音风格，已补默认值：%s", ref.Name, ref.VoiceHint))
+		}
 		ref.VoiceProfile = normalizeVideoVoiceProfile(ref.VoiceProfile)
 		ref.ImageSource = strings.ToLower(strings.TrimSpace(ref.ImageSource))
 		if ref.Name == "" && ref.RoleID == "" && len(ref.Images) == 0 {
@@ -854,6 +924,9 @@ func normalizeVideoConfig(cfg VideoRunConfig) (VideoRunConfig, []string, error) 
 
 	// 分镜来源：手动分段就地归一（段时长保真），目标时长以各段之和为准
 	cfg.ScriptMode = normalizeVideoScriptMode(cfg.ScriptMode)
+	if cfg.manualScriptEnabled() {
+		cfg.ScriptLocked = false
+	}
 	if cfg.manualScriptEnabled() {
 		shots, shotWarnings, shotErr := normalizeManualShots(cfg)
 		if shotErr != nil {

@@ -1502,6 +1502,7 @@ func (r *videoRunner) runScriptStage() error {
 
 	var script VideoScript
 	var warnings []string
+	var err error
 	manual := r.task.Config.manualScriptEnabled()
 	if manual {
 		built, notes, err := buildManualScript(r.task.Config)
@@ -1511,7 +1512,10 @@ func (r *videoRunner) runScriptStage() error {
 		script, warnings = built, notes
 		r.logf("手动分段模式：沿用你填写的 %d 段（合计 %.1fs），跳过 Agent1", len(script.Shots), manualTotalSeconds(script.Shots))
 	} else {
-		script, warnings = r.app.generateScript(r.usageCtx(UsagePurposeScript), r.task.Config, r.consumeFeedback(VideoStageDraftScript), r.task.Run.Template)
+		script, warnings, err = r.app.generateScriptChecked(r.usageCtx(UsagePurposeScript), r.task.Config, r.consumeFeedback(VideoStageDraftScript), r.task.Run.Template)
+		if err != nil {
+			return err
+		}
 		// 把真正带进模型输入的用户参数写进日志：参数有没有生效，用户要能一眼验证
 		r.logf("Agent1 输入参数：%s", userParamDigest(r.task.Config))
 	}
@@ -1521,8 +1525,13 @@ func (r *videoRunner) runScriptStage() error {
 	if len(script.Shots) == 0 {
 		return errors.New("没有生成任何分镜")
 	}
+	syncTreatmentCastToConfig(&r.task.Config, &script)
 
 	r.task.Run.Script = &script
+	if script.Treatment != nil {
+		r.logf("企划完成：%d 个角色 / %d 个节拍；分镜 %d 段（%s）",
+			len(script.Treatment.Cast), len(script.Treatment.Beats), len(script.Shots), script.Treatment.Mode)
+	}
 	// 重跑剧本 → 下游全部失效
 	r.task.Run.Prompts = nil
 	r.task.Run.Plan = nil

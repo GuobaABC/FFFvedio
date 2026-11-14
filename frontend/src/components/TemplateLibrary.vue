@@ -277,7 +277,7 @@ async function removeSelected() {
           @click="selectedId = template.id"
         >
           <span class="item__top">
-            <span class="item__name">{{ template.name }}</span>
+            <span class="item__name" :title="template.name">{{ template.name }}</span>
             <span class="ui-chip" :class="templateScopeClass(template.scope)">
               {{ TEMPLATE_SCOPE_LABELS[template.scope] ?? template.scope }}
             </span>

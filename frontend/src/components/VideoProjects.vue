@@ -339,7 +339,7 @@ function statusClass(status: string): string {
           </template>
           <template v-else>
             <button type="button" class="plist__main" @click="selectProject(project.id)">
-              <span class="plist__name">{{ project.name }}</span>
+              <span class="plist__name" :title="project.name">{{ project.name }}</span>
             </button>
             <span class="plist__count">{{ project.taskCount }} / {{ project.tailCount }}</span>
             <span class="plist__ops">
@@ -406,7 +406,7 @@ function statusClass(status: string): string {
             >
               <button type="button" class="tcard__main" @click="selectedTaskId = task.id">
                 <span class="tcard__top">
-                  <span class="tcard__title">{{ task.title }}</span>
+                  <span class="tcard__title" :title="task.title">{{ task.title }}</span>
                   <span class="ui-chip" :class="statusClass(task.status)">{{ STATUS_LABELS[task.status] }}</span>
                 </span>
                 <span class="tcard__meta">
@@ -801,7 +801,9 @@ function statusClass(status: string): string {
 .tcard__meta {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
+  min-width: 0;
   font-size: 11px;
   color: var(--color-text-muted);
 }

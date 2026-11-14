@@ -56,6 +56,10 @@ export interface VideoCharacter {
 export interface VideoCharacterRef {
   roleId: string
   name: string
+  /** 自动创建角色的动物种类；用户角色可为空 */
+  species?: string
+  /** Agent1 企划自动创建的任务内临时角色 */
+  autoCreated?: boolean
   /** 绑定的角色库条目；旧任务没有该字段 */
   characterId?: string
   images: string[]
@@ -65,6 +69,7 @@ export interface VideoCharacterRef {
   persona?: string
   negativePrompt?: string
   perspective?: string
+  /** 声音风格提示词；新流程要求每个角色必须绑定 */
   voiceHint: string
   voiceProfile?: VideoVoiceProfile | null
 }
@@ -93,6 +98,8 @@ export interface VideoRunConfig {
   topic: string
   /** 分镜来源：auto = Agent1 自动生成；manual = 用户逐段填写（跳过 Agent1） */
   scriptMode?: ScriptMode
+  /** 用户提供了完整剧本：锁定台词，只做分镜化 */
+  scriptLocked?: boolean
   /** 手动分段：scriptMode=manual 时直接当分镜用，段数与段时长以填写为准 */
   manualShots?: VideoShot[]
   firstFrame: string
@@ -147,12 +154,64 @@ export interface VideoShot {
   mood: string
   audioCue: string
   durationS: number
+  /** 企划→分镜两阶段的新字段；旧任务为空 */
+  beatId?: string
+  function?: string
+  newInfo?: string
+  reaction?: string
+  transition?: string
+}
+
+export interface VideoCastMember {
+  roleId: string
+  name: string
+  species?: string
+  appearance?: string
+  persona?: string
+  /** 声音风格提示词；新流程要求非空 */
+  voiceHint: string
+  autoCreated?: boolean
+  ephemeral?: boolean
+}
+
+export interface VideoBeat {
+  id: string
+  function: string
+  summary: string
+  newInfo: string
+  emotion?: string
+  location?: string
+  characters?: string[]
+  props?: string[]
+  link?: string
+}
+
+export interface VideoLockedLine {
+  id: string
+  speaker: string
+  text: string
+  scene?: number
+}
+
+export interface VideoTreatment {
+  mode: 'original' | 'script_locked' | string
+  premise: string
+  cast: VideoCastMember[]
+  beats: VideoBeat[]
+  continuity?: string[]
+  lockedLines?: VideoLockedLine[]
+  model?: string
+  revision?: number
 }
 
 export interface VideoScript {
   logline: string
   language: string
   source: string
+  /** original / script_locked；旧任务为空 */
+  mode?: string
+  /** 企划→分镜两阶段产物；旧任务为空 */
+  treatment?: VideoTreatment | null
   shots: VideoShot[]
 }
 
@@ -601,6 +660,7 @@ export function createEmptyVideoConfig(): VideoRunConfig {
   return {
     topic: '',
     scriptMode: 'auto',
+    scriptLocked: false,
     manualShots: [],
     firstFrame: '',
     characterRefs: [],

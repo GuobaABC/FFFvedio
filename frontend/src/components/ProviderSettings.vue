@@ -268,7 +268,7 @@ function maskKey(apiKey: string): string {
       <li v-for="provider in visibleProviders" :key="provider.id" class="card">
         <div class="card__main">
           <p class="card__name">{{ provider.name }}</p>
-          <p class="card__url">{{ provider.baseUrl }}</p>
+          <p class="card__url" :title="provider.baseUrl">{{ provider.baseUrl }}</p>
           <div class="card__meta">
             <span class="tag">{{ provider.model }}</span>
             <span class="card__key">{{ maskKey(provider.apiKey) }}</span>
@@ -617,6 +617,7 @@ function maskKey(apiKey: string): string {
 .card__meta {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 8px;
 }

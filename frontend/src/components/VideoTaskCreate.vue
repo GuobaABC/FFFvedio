@@ -899,12 +899,18 @@ const manualTotalS = computed(
 
 /** 说话人候选：旁白 + 已登记的角色（没登记角色时只能选旁白） */
 const speakerOptions = computed(() => [
-  { value: '', label: '自动（本段唯一角色→他，否则旁白）' },
+  { value: '', label: '自动（本段唯一角色，否则旁白）' },
   { value: 'narration', label: '旁白（画外音）' },
   ...form.characterRefs
     .filter((ref) => ref.roleId)
     .map((ref) => ({ value: ref.roleId, label: ref.name || ref.roleId })),
 ])
+
+/** 说话人下拉的完整标签：选择框宽度有限，被截断时靠 title 兜底 */
+function speakerOptionLabel(value?: string): string {
+  const option = speakerOptions.value.find((item) => item.value === (value ?? ''))
+  return option?.label ?? '自动（本段唯一角色，否则旁白）'
+}
 
 function addManualShot() {
   if (!form.manualShots) {
@@ -1158,15 +1164,24 @@ async function submit() {
       <section class="ui-card block">
         <h3 class="ui-h3">1. 主题与首帧</h3>
         <label class="ui-field">
-          <span class="ui-label">视频主题 / 诉求 *</span>
+          <span class="ui-label">{{ form.scriptLocked ? '完整剧本（锁定台词）*' : '视频主题 / 诉求 *' }}</span>
           <textarea
             v-model="form.topic"
             class="ui-textarea"
             rows="3"
-            placeholder="例：清晨咖啡馆里，一杯手冲咖啡唤醒整座城市（温暖、写实电影感）"
+            :placeholder="form.scriptLocked
+              ? '把已有剧本原样贴进来：支持【镜头1】、甲：、老婆：等格式；台词不会被改写，只做分镜'
+              : '例：清晨咖啡馆里，一杯手冲咖啡唤醒整座城市（温暖、写实电影感）'"
             required
           ></textarea>
         </label>
+        <label class="check check--inline">
+          <input v-model="form.scriptLocked" type="checkbox" :disabled="scriptMode === 'manual'" />
+          已有完整剧本（锁定台词，只做分镜；角色按剧本对白自动创建）
+        </label>
+        <p v-if="form.scriptLocked" class="hint hint--warn">
+          锁定模式会逐字保留台词与说话人，超出语速预算时只报告不改写；无角色图时自动创建拟人动物角色。
+        </p>
         <div class="grid grid--2">
           <label class="ui-field">
             <span class="ui-label">任务标题（可选）</span>
@@ -1300,8 +1315,8 @@ async function submit() {
                 />
               </label>
               <label class="ui-field">
-                <span class="ui-label">声音提示</span>
-                <input v-model="ref.voiceHint" class="ui-input" type="text" placeholder="温暖中音，4.2 字/秒" />
+                <span class="ui-label">声音风格提示词（必填，留空自动补默认）</span>
+                <input v-model="ref.voiceHint" class="ui-input" type="text" placeholder="温暖中音，语速偏慢，情绪先犹豫后坚定" />
               </label>
               <label class="ui-field">
                 <span class="ui-label">视角约定</span>
@@ -1412,7 +1427,11 @@ async function submit() {
         <div class="block__head">
           <h3 class="ui-h3">4. 分镜来源</h3>
           <span class="ui-chip">
-            {{ scriptMode === 'manual' ? `${manualShots.length} 段 · 合计 ${manualTotalS}s` : 'AI 自动生成' }}
+            {{ scriptMode === 'manual'
+              ? `${manualShots.length} 段 · 合计 ${manualTotalS}s`
+              : form.scriptLocked
+                ? '锁定剧本 · 只做分镜'
+                : 'AI 自动生成' }}
           </span>
         </div>
         <div class="chips chips--options">
@@ -1426,7 +1445,8 @@ async function submit() {
           </label>
         </div>
         <p v-if="scriptMode === 'auto'" class="hint">
-          自动模式：Agent1 按目标时长（{{ form.durationS }} 秒）规划段数与节奏，关卡①里可再改。
+          自动模式：Agent1 先做企划（角色 + 故事节拍），再出分镜；按目标时长（{{ form.durationS }} 秒）推荐镜头数，关卡①里可再改。
+          <template v-if="form.scriptLocked">当前勾选了「已有完整剧本」：台词会逐字锁定，只补分镜信息。</template>
         </p>
         <p v-else class="hint">
           手动模式：你填的 {{ manualShots.length }} 段直接当最终分镜，Agent1 不再改结构；目标时长改为按各段之和（{{ manualTotalS }}s）回写，
@@ -1489,6 +1509,7 @@ async function submit() {
                 <select
                   v-model="line.speaker"
                   class="ui-select"
+                  :title="speakerOptionLabel(line.speaker)"
                   @change="onDialogueSpeakerChange(index)"
                 >
                   <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
@@ -1499,12 +1520,15 @@ async function submit() {
                   v-model="line.text"
                   class="ui-input"
                   type="text"
+                  :title="line.text"
                   placeholder="这一句台词"
                   @input="syncShotDialogue(shot)"
                 />
                 <button
                   class="ui-btn ui-btn--ghost"
                   type="button"
+                  title="删除这句台词"
+                  aria-label="删除这句台词"
                   @click="removeDialogueLine(index, lineIndex)"
                 >删除</button>
               </div>
@@ -1571,7 +1595,7 @@ async function submit() {
             </select>
           </label>
           <label class="ui-field">
-            <span class="ui-label">文本提供商（Agent1 / Agent2）</span>
+            <span class="ui-label">文本提供商（企划 / 分镜 / 提示词共用）</span>
             <select v-model="form.textProviderId" class="ui-select">
               <option value="">自动选择文本模型</option>
               <option v-for="provider in textProviders" :key="provider.id" :value="provider.id">
@@ -1799,6 +1823,7 @@ async function submit() {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
 }
 
 .grid {
@@ -1821,13 +1846,23 @@ async function submit() {
   min-width: 0;
 }
 
-/* 台词行：说话人选择固定宽度，台词输入吃掉剩余空间 */
+/* 台词行：说话人自适应宽度；容器变窄时自动折成「说话人」+「台词 / 删除」两行 */
+.dialogue-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .dialogue-line .ui-select {
-  flex: 0 0 190px;
+  flex: 1 1 170px;
+  min-width: 150px;
+  max-width: 260px;
 }
 
 .dialogue-line .ui-input {
-  flex: 1 1 auto;
+  flex: 1 1 220px;
 }
 
 .dialogue-line .ui-btn {

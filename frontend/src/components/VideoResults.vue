@@ -152,7 +152,7 @@ function handleDeleted(taskId: string) {
           @click="selectedId = task.id"
         >
           <span class="task__top">
-            <span class="task__title">{{ task.title }}</span>
+            <span class="task__title" :title="task.title">{{ task.title }}</span>
             <span class="ui-chip" :class="statusClass(task.status)">{{ STATUS_LABELS[task.status] }}</span>
           </span>
           <span class="task__meta">
@@ -297,7 +297,9 @@ function handleDeleted(taskId: string) {
 .task__meta {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
+  min-width: 0;
   font-size: 11px;
   color: var(--color-text-muted);
 }
@@ -305,6 +307,7 @@ function handleDeleted(taskId: string) {
 .task__id {
   font-family: var(--font-mono);
   letter-spacing: 0.02em;
+  overflow-wrap: anywhere;
 }
 
 .detail {

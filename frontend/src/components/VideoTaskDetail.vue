@@ -97,7 +97,7 @@ watch(() => `${props.task.id}:${props.task.updatedAt}`, syncDrafts, { immediate:
 /** 台词归属可选值：旁白 + 任务里的角色表；空值表示交给后端按出场角色推断 */
 const speakerOptions = computed(() => {
   const options = [
-    { value: '', label: '自动（本段唯一角色→他，否则旁白）' },
+    { value: '', label: '自动（本段唯一角色，否则旁白）' },
     { value: 'narration', label: '旁白（画外音）' },
   ]
   for (const ref of props.task.config?.characterRefs ?? []) {
@@ -106,6 +106,12 @@ const speakerOptions = computed(() => {
   }
   return options
 })
+
+/** 说话人下拉的完整标签：选择框宽度有限，被截断时靠 title 兜底 */
+function speakerOptionLabel(value?: string): string {
+  const option = speakerOptions.value.find((item) => item.value === (value ?? ''))
+  return option?.label ?? '自动（本段唯一角色，否则旁白）'
+}
 
 /** 把归属值翻译成人看得懂的名字：说话人写错时，用户要能一眼发现 */
 function speakerLabelOf(speaker?: string): string {
@@ -241,8 +247,17 @@ const scriptSourceLabel = computed(() => {
     const count = run.value?.script?.shots?.length ?? config.value.manualShots?.length ?? 0
     return `手动分段（你填的 ${count} 段，未调 Agent1）`
   }
+  if (run.value?.script?.source === 'llm_locked' || run.value?.script?.treatment?.mode === 'script_locked') {
+    return '锁定剧本（台词原文，只做分镜）'
+  }
+  if (run.value?.script?.treatment) {
+    return '文本模型（企划→分镜）'
+  }
   return run.value?.script?.source === 'llm' ? '文本模型（Agent1）' : '本地规则'
 })
+
+/** 企划→分镜第一阶段的产物；旧任务为空 */
+const treatment = computed(() => run.value?.script?.treatment ?? null)
 
 const summaryRows = computed(() => [
   { label: '主题', value: config.value.topic },
@@ -270,7 +285,9 @@ const summaryRows = computed(() => [
               const images = item.images ?? []
               const source =
                 item.imageSource === 'template' ? '模板定妆图' : item.imageSource === 'user' ? '用户上传' : '未标注来源'
-              return `${item.name || item.roleId}（${source}，${images.length} 张${item.appearanceBlock ? '，有外观锚点' : ''}）`
+              const auto = item.autoCreated ? '，企划自动创建' : ''
+              const species = item.species ? `，${item.species}` : ''
+              return `${item.name || item.roleId}（${source}，${images.length} 张${item.appearanceBlock ? '，有外观锚点' : ''}${species}${auto}）`
             })
             .join('、')
         : '无',
@@ -773,6 +790,8 @@ function revealOutput() {
         <div v-for="ref in config.characterRefs" :key="ref.roleId" class="role">
           <span class="role__name">{{ ref.name || ref.roleId }}</span>
           <span class="role__meta">{{ ref.roleId }}</span>
+          <span v-if="ref.species" class="ui-chip">{{ ref.species }}</span>
+          <span v-if="ref.autoCreated" class="ui-chip ui-chip--warn">企划自动创建</span>
           <span class="role__meta">{{ (ref.images ?? []).length }} 张定妆图</span>
           <span v-if="ref.characterId" class="ui-chip ui-chip--ok">角色库快照</span>
           <span v-if="ref.appearanceBlock" class="role__block">外观：{{ ref.appearanceBlock }}</span>
@@ -781,6 +800,46 @@ function revealOutput() {
           <span v-if="ref.voiceHint" class="role__meta">声音：{{ ref.voiceHint }}</span>
         </div>
       </div>
+    </section>
+
+    <!-- 故事企划：两阶段流程的角色、节拍与连续性约定；旧任务没有该产物 -->
+    <section v-if="treatment" class="block">
+      <header class="block__head">
+        <h4 class="block__title">故事企划</h4>
+        <span class="ui-chip" :class="treatment.mode === 'script_locked' ? 'ui-chip--ok' : 'ui-chip--warn'">
+          {{ treatment.mode === 'script_locked' ? '锁定台词' : '原创企划' }}
+        </span>
+        <span v-if="treatment.model" class="ui-chip">模型 {{ treatment.model }}</span>
+        <span class="ui-chip">{{ (treatment.beats ?? []).length }} 个节拍 · {{ (treatment.cast ?? []).length }} 个角色</span>
+        <span v-if="(treatment.lockedLines ?? []).length > 0" class="ui-chip ui-chip--ok">
+          锁定 {{ treatment.lockedLines?.length }} 句台词
+        </span>
+      </header>
+      <p class="opening">立意：{{ treatment.premise }}</p>
+      <div v-if="(treatment.cast ?? []).length > 0" class="treatment__cast">
+        <div v-for="member in treatment.cast ?? []" :key="member.roleId" class="treatment__cast-item">
+          <span class="role__name">{{ member.name }}</span>
+          <span class="role__meta">{{ member.roleId }}</span>
+          <span v-if="member.species" class="ui-chip">{{ member.species }}</span>
+          <span v-if="member.autoCreated" class="ui-chip ui-chip--warn">自动创建</span>
+          <span class="treatment__voice">声音：{{ member.voiceHint || '未绑定' }}</span>
+          <span v-if="member.appearance" class="role__block">{{ member.appearance }}</span>
+        </div>
+      </div>
+      <div class="treatment__beats">
+        <div v-for="beat in treatment.beats ?? []" :key="beat.id" class="treatment__beat">
+          <div class="treatment__beat-head">
+            <span class="ui-chip">{{ beat.id }}</span>
+            <span class="ui-chip ui-chip--ok">{{ beat.function }}</span>
+            <span class="treatment__beat-title">{{ beat.summary }}</span>
+          </div>
+          <p v-if="beat.newInfo" class="hint">新信息：{{ beat.newInfo }}</p>
+          <p v-if="beat.link" class="hint">衔接：{{ beat.link }}</p>
+        </div>
+      </div>
+      <p v-if="treatment.continuity?.length" class="hint">
+        连续性：{{ treatment.continuity.join('；') }}
+      </p>
     </section>
 
     <!-- 关卡 ①：分镜确认 -->
@@ -812,52 +871,56 @@ function revealOutput() {
           </span>
           <span class="ui-chip">{{ dialogueSpeakerLabelOf(shot) }}</span>
         </header>
-        <div class="grid grid--2">
-          <label class="ui-field">
-            <span class="ui-label">场景意图</span>
-            <textarea v-model="shot.sceneIntent" class="ui-textarea" rows="2" :disabled="!canEditShots"></textarea>
-          </label>
-          <div class="ui-field">
-            <div class="block__head">
-              <span class="ui-label">台词与说话人（语速预算内，可多行）</span>
-              <button
-                class="ui-btn ui-btn--ghost"
-                type="button"
-                :disabled="!canEditShots"
-                @click="addDialogueLine(shot, shot.roles ?? [])"
-              >+ 加一句</button>
-            </div>
-            <p v-if="dialogueLinesOf(shot).length === 0" class="hint">
-              本段无台词：画面内不会安排任何对口型动作。
-            </p>
-            <div v-for="(line, lineIndex) in dialogueLinesOf(shot)" :key="lineIndex" class="row dialogue-line">
-              <select
-                v-model="line.speaker"
-                class="ui-select"
-                :disabled="!canEditShots"
-                @change="onDialogueEdited(shot)"
-              >
-                <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
-                  {{ option.label }}
-                </option>
-              </select>
-              <input
-                v-model="line.text"
-                class="ui-input"
-                type="text"
-                :disabled="!canEditShots"
-                placeholder="这一句台词"
-                @input="onDialogueEdited(shot)"
-              />
-              <button
-                class="ui-btn ui-btn--ghost"
-                type="button"
-                :disabled="!canEditShots"
-                @click="removeDialogueLine(shot, lineIndex)"
-              >删除</button>
-            </div>
-            <span class="hint">按开口顺序排列；轮到谁开口，镜头就给到谁，其他角色嘴唇闭合。</span>
+        <label class="ui-field">
+          <span class="ui-label">场景意图</span>
+          <textarea v-model="shot.sceneIntent" class="ui-textarea" rows="2" :disabled="!canEditShots"></textarea>
+        </label>
+        <div class="ui-field">
+          <div class="block__head">
+            <span class="ui-label">台词与说话人（语速预算内，可多行）</span>
+            <button
+              class="ui-btn ui-btn--ghost"
+              type="button"
+              :disabled="!canEditShots"
+              @click="addDialogueLine(shot, shot.roles ?? [])"
+            >+ 加一句</button>
           </div>
+          <p v-if="dialogueLinesOf(shot).length === 0" class="hint">
+            本段无台词：画面内不会安排任何对口型动作。
+          </p>
+          <div v-for="(line, lineIndex) in dialogueLinesOf(shot)" :key="lineIndex" class="row dialogue-line">
+            <select
+              v-model="line.speaker"
+              class="ui-select"
+              :title="speakerOptionLabel(line.speaker)"
+              :disabled="!canEditShots"
+              @change="onDialogueEdited(shot)"
+            >
+              <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
+                {{ option.label }}
+              </option>
+            </select>
+            <input
+              v-model="line.text"
+              class="ui-input"
+              type="text"
+              :title="line.text"
+              :disabled="!canEditShots"
+              placeholder="这一句台词"
+              @input="onDialogueEdited(shot)"
+            />
+            <button
+              class="ui-btn ui-btn--ghost"
+              type="button"
+              title="删除这句台词"
+              aria-label="删除这句台词"
+              :disabled="!canEditShots"
+              @click="removeDialogueLine(shot, lineIndex)"
+            >删除</button>
+          </div>
+          <span class="hint">按开口顺序排列；轮到谁开口，镜头就给到谁，其他角色嘴唇闭合。</span>
+        </div>
+        <div class="grid grid--2">
           <label class="ui-field">
             <span class="ui-label">角色（顿号 / 逗号分隔）</span>
             <input
@@ -979,6 +1042,7 @@ function revealOutput() {
             <select
               v-model="line.speaker"
               class="ui-select"
+              :title="speakerOptionLabel(line.speaker)"
               :disabled="!canEditPrompts"
               @change="onDialogueEdited(prompt)"
             >
@@ -990,6 +1054,7 @@ function revealOutput() {
               v-model="line.text"
               class="ui-input"
               type="text"
+              :title="line.text"
               :disabled="!canEditPrompts"
               placeholder="这一句台词"
               @input="onDialogueEdited(prompt)"
@@ -997,6 +1062,8 @@ function revealOutput() {
             <button
               class="ui-btn ui-btn--ghost"
               type="button"
+              title="删除这句台词"
+              aria-label="删除这句台词"
               :disabled="!canEditPrompts"
               @click="removeDialogueLine(prompt, lineIndex)"
             >删除</button>
@@ -1098,7 +1165,7 @@ function revealOutput() {
             本段无台词：画面内不会安排任何对口型动作。
           </p>
           <div v-for="(line, lineIndex) in segDialogueDrafts" :key="lineIndex" class="row dialogue-line">
-            <select v-model="line.speaker" class="ui-select" :disabled="!segIsFirstOfShot">
+            <select v-model="line.speaker" class="ui-select" :title="speakerOptionLabel(line.speaker)" :disabled="!segIsFirstOfShot">
               <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
                 {{ option.label }}
               </option>
@@ -1107,12 +1174,15 @@ function revealOutput() {
               v-model="line.text"
               class="ui-input"
               type="text"
+              :title="line.text"
               :disabled="!segIsFirstOfShot"
               placeholder="这一句台词"
             />
             <button
               class="ui-btn ui-btn--ghost"
               type="button"
+              title="删除这句台词"
+              aria-label="删除这句台词"
               :disabled="!segIsFirstOfShot"
               @click="removeSegmentDialogueLine(lineIndex)"
             >删除</button>
@@ -1184,7 +1254,7 @@ function revealOutput() {
               本段无台词：画面内不会安排任何对口型动作。
             </p>
             <div v-for="(line, lineIndex) in segDialogueDrafts" :key="lineIndex" class="row dialogue-line">
-              <select v-model="line.speaker" class="ui-select" :disabled="!segIsFirstOfShot">
+              <select v-model="line.speaker" class="ui-select" :title="speakerOptionLabel(line.speaker)" :disabled="!segIsFirstOfShot">
                 <option v-for="option in speakerOptions" :key="option.value" :value="option.value">
                   {{ option.label }}
                 </option>
@@ -1193,12 +1263,15 @@ function revealOutput() {
                 v-model="line.text"
                 class="ui-input"
                 type="text"
+                :title="line.text"
                 :disabled="!segIsFirstOfShot"
                 placeholder="这一句台词"
               />
               <button
                 class="ui-btn ui-btn--ghost"
                 type="button"
+                title="删除这句台词"
+                aria-label="删除这句台词"
                 :disabled="!segIsFirstOfShot"
                 @click="removeSegmentDialogueLine(lineIndex)"
               >删除</button>
@@ -1471,20 +1544,24 @@ function revealOutput() {
   padding-bottom: 12px;
 }
 
-/* 台词行：说话人选择固定宽度，台词输入吃掉剩余空间 */
+/* 台词行：说话人自适应宽度；容器变窄时自动折成「说话人」+「台词 / 删除」两行，
+   避免固定 190px 的下拉把台词输入挤到只剩几个字 */
 .dialogue-line {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   min-width: 0;
 }
 
 .dialogue-line .ui-select {
-  flex: 0 0 190px;
+  flex: 1 1 170px;
+  min-width: 150px;
+  max-width: 260px;
 }
 
 .dialogue-line .ui-input {
-  flex: 1 1 auto;
+  flex: 1 1 220px;
 }
 
 .dialogue-line .ui-btn {
@@ -1520,6 +1597,7 @@ function revealOutput() {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--color-text-muted);
+  overflow-wrap: anywhere;
 }
 
 .head__actions {
@@ -1532,6 +1610,7 @@ function revealOutput() {
 .timeline {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   margin: 0;
   padding: 10px 12px;
@@ -1539,7 +1618,6 @@ function revealOutput() {
   border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.02);
   list-style: none;
-  overflow-x: auto;
 }
 
 .timeline__item {
@@ -1856,15 +1934,18 @@ function revealOutput() {
 
 .cue {
   display: grid;
-  grid-template-columns: 130px minmax(0, 1fr);
+  grid-template-columns: minmax(120px, 150px) minmax(0, 1fr);
   gap: 8px;
+  align-items: start;
   font-size: 12px;
 }
 
 .cue__time {
   font-family: var(--font-mono);
   font-size: 11px;
+  line-height: 1.7;
   color: var(--color-text-muted);
+  overflow-wrap: anywhere;
 }
 
 .cue__text {
@@ -1908,6 +1989,55 @@ function revealOutput() {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* 故事企划：角色卡 + 节拍卡 */
+.treatment__cast,
+.treatment__beats {
+  display: grid;
+  gap: 8px;
+}
+
+.treatment__cast {
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.treatment__cast-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.18);
+  font-size: 12px;
+}
+
+.treatment__voice {
+  flex-basis: 100%;
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--color-text-muted);
+}
+
+.treatment__beat {
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.treatment__beat-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.treatment__beat-title {
+  font-size: 12.5px;
+  font-weight: 600;
 }
 
 .roles__label {

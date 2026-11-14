@@ -154,58 +154,10 @@ func promptSubjectDirective(cfg VideoRunConfig, caps VideoCapabilities) string {
 	return subjectDirective(cfg)
 }
 
+// scriptSystemPrompt 兼容入口：新流程把 Agent1 拆成「企划」与「分镜」两段，
+// 这里把两段规则拼起来，旧测试与旧调用仍能拿到完整约束。
 func scriptSystemPrompt(cfg VideoRunConfig) string {
-	// 无图时台词与自检按动物主体写；有图时按图写，免得“贴合动物主体”反过来架空用户传的图
-	dialogueFit := "台词里的称呼、自称与比喻要贴合动物主体，不要出现“上班打卡”“对着镜子化妆”这类只有人类才成立的身份动作。"
-	castCheck := "⑦ 没有真人或人类专属动作？"
-	if hasImageInput(cfg) {
-		dialogueFit = "台词里的称呼、自称与比喻要贴合用户提供的参考图或首帧里的角色形象。"
-		castCheck = "⑦ 每段主体形象都与用户提供的参考图或首帧一致？"
-	}
-	firstFrameRule := "第一段自由构图（本任务没有首帧图）"
-	firstShotCheck := "⑥ 第一段是钩子？"
-	if hasUserFirstFrame(cfg) {
-		firstFrameRule = "第一段从首帧的主体身份（脸型、毛色、服装）出发，在开头 0.5–1 秒内自然过渡到分镜描述的新场景，首帧只是起点，不锁死它的背景与机位"
-		firstShotCheck = "⑥ 第一段是钩子且主体与首帧一致？"
-	}
-	return `【角色】你是中文短视频分镜编剧兼导演，擅长 15-60 秒口播与剧情短片。你的输出会被程序直接解析，不要 Markdown 代码块、不要任何解释。
-
-【输出结构】
-{"logline":"一句话主题","shots":[{"id":"s1","durationS":6,"roles":["char_a","char_b"],"sceneIntent":"画面意图","dialogueLines":[{"speaker":"char_a","text":"台词"},{"speaker":"char_b","text":"回应"}],"camera":"运镜","mood":"情绪","audioCue":"环境音"}]}
-- id 从 s1 起顺序编号；durationS 为数字（秒）；roles 只能取用户给出的 role_id
-- dialogueLines 按开口顺序排列，每行一句；speaker 填 roles 里的 role_id，画外解说填 "narration"（旁白）
-- 一段可以出现多个说话人：谁先说、谁后说，就按顺序写成多行
-- 无台词时 dialogueLines 给空数组；不要输出 timeRange / language / source：时间轴与语言由系统计算
-
-【规划规则】
-1. 先定镜头数：总时长 ÷ 8 四舍五入，再限制在 2-8 个；镜头越短，一段里能发生的动作越少，别在 4 秒里塞完整故事；
-2. 单段时长 4-12 秒（渲染单段上限 15 秒，超过 12 秒的叙事请拆成两个镜头）；
-3. 各段 durationS 之和必须等于目标总时长；
-4. 第一段承担 3 秒钩子：开场直接抛冲突、悬念或反常识结论，不要寒暄、自我介绍、空镜铺垫；
-5. 相邻两段至少在景别、机位或动作方向上有一项不同，避免全片一个机位。
-
-【台词规则】
-6. 台词字数上限 =（段时长 - 0.3 秒）× 语速；宁可少写，不要靠压缩停顿蒙混；
-7. 每行台词不超 20 字，一段最多两行；口语短句，不用成语堆叠、括号说明、表情符号与书面语；
-8. 台词必须写清是谁在说：dialogueLines 每行的 speaker 填该段 role_id，画外解说填 "narration"（旁白），不允许空着或写“他/她/大家”；一段内多人轮流说话时按实际顺序分行；` + dialogueFit + `
-
-【画面意图规则】
-9. sceneIntent 只写看得见的东西：具体主体 + 可度量的动作 + 环境与光线；不写“字幕”“文字”“标题”“logo”等画面文字要求；
-10. camera / mood / audioCue 各用 2-8 字的具体描述（如“缓慢推近”“克制/期待”“雨声垫底”），不要“电影感”“高级”这类空词；
-11. ` + firstFrameRule + `；
-12. 角色只要入镜（含手部、背影等局部）就必须写进 roles，确实无角色出场时才给空数组。
-
-【硬性约束】
-13. ` + subjectDirective(cfg) + `；
-14. 用户给出的参数（时长、画幅、语言、语速、平台、垂类、风格/运镜/情绪、额外要求、负向约束）都是权威输入，不得改写；与上述规则冲突时，优先保证“不超时长与台词预算”；
-15. 额外要求必须落到具体画面或台词里，负向约束必须全片都不出现。
-
-【输出前自检】
-① 段数在 2-8 且 durationS 之和 = 总时长？② 每段 4-12 秒？
-③ 每行台词 ≤ 20 字、合计字数 ≤（时长-0.3）× 语速？④ roles 全部是给定 role_id？
-⑤ 没有画面文字要求？` + firstShotCheck + castCheck + `
-⑧ 有台词的段落 dialogueLines 每行 speaker 都填了，并且是 role_id 或 "narration"？
-自检不合格就改到合格再输出。`
+	return treatmentSystemPrompt(cfg) + "\n\n" + storyboardSystemPrompt(cfg, nil)
 }
 
 func (a *App) llmScript(ctx context.Context, provider Provider, cfg VideoRunConfig, tpl *VideoTemplateRun, feedback string) (VideoScript, []string, error) {
@@ -457,6 +409,9 @@ func characterTable(cfg VideoRunConfig, tpl *VideoTemplateRun) string {
 func characterProfileLine(cfg VideoRunConfig, tpl *VideoTemplateRun, ref VideoCharacterRef) string {
 	profile, _ := characterProfileForRole(cfg, tpl, firstNonEmpty(ref.RoleID, ref.Name))
 	line := fmt.Sprintf("- %s（%s）", firstNonEmpty(ref.RoleID, profile.RoleID), firstNonEmpty(ref.Name, profile.Name, ref.RoleID, profile.RoleID))
+	if strings.TrimSpace(profile.Species) != "" {
+		line += "｜物种：" + profile.Species
+	}
 	switch {
 	case profile.ImageSource == CharacterImageSourceUser && len(profile.Images) > 0:
 		line += "｜形象：用户上传的定妆图（以此为准，不要另编外貌）"
@@ -609,30 +564,50 @@ func feedbackDroppedWarning(feedback string) string {
 	return "本轮返工意见未生效：本地规则不能理解自然语言，请在「系统设置 - 提供商」登记文本模型后重生成"
 }
 
-// generateScript 先尝试文本模型，失败或未配置时降级为本地规则（设计文档 §9 的最小闭环思路）。
+// generateScript 兼容入口：返回脚本与降级提示；需要区分“硬失败”时用 generateScriptChecked。
 func (a *App) generateScript(ctx context.Context, cfg VideoRunConfig, feedback string, templates ...*VideoTemplateRun) (VideoScript, []string) {
+	script, warnings, err := a.generateScriptChecked(ctx, cfg, feedback, templates...)
+	if err != nil {
+		warnings = append(warnings, "剧本生成未通过："+err.Error())
+	}
+	return script, warnings
+}
+
+// generateScriptChecked 新版 Agent1：企划 → 分镜两阶段。
+// - 用户提供了完整剧本时进入锁定模式：台词原文锁定，只做分镜；
+// - 无角色时由企划阶段自动创建动物临时角色；
+// - 台词归属不合法时先修复一次，仍失败则硬失败（不允许静默降级旁白）。
+func (a *App) generateScriptChecked(ctx context.Context, cfg VideoRunConfig, feedback string, templates ...*VideoTemplateRun) (VideoScript, []string, error) {
 	tpl := firstTemplateRun(templates)
-	warnings := make([]string, 0, 2)
+	warnings := make([]string, 0, 3)
+	lockedMode := cfg.ScriptLocked || looksLikeLockedScript(cfg.Topic)
 	provider := a.pickTextProvider(cfg)
 	if provider.ID != "" {
-		script, llmWarnings, err := a.llmScript(ctx, provider, cfg, tpl, feedback)
+		script, llmWarnings, err := a.generateScriptTwoStage(ctx, provider, cfg, tpl, feedback)
 		warnings = append(warnings, llmWarnings...)
-		if err == nil {
-			normalized := normalizeScript(script, cfg, tpl)
-			if len(normalized.Shots) > 0 {
-				bound, speakerWarnings := bindSpeakers(normalized, cfg)
-				return bound, append(warnings, speakerWarnings...)
-			}
-			err = errors.New("模型返回的分镜归一化后为空")
+		if err == nil && len(script.Shots) > 0 {
+			return script, warnings, nil
 		}
-		// 用户关掉本地兜底后不许偷偷降级：返回空分镜交给上层报错，别让他以为这是模型写的
+		// 锁定剧本不能回退本地规则：本地规则会改写/丢失用户台词，等于破坏锁定承诺。
+		if lockedMode {
+			return VideoScript{}, warnings, err
+		}
+		// 绑定失败是硬失败：不许用本地规则“补一个能跑的剧本”掩盖问题
+		if errors.Is(err, errScriptBinding) {
+			return VideoScript{}, warnings, err
+		}
 		if !cfg.localFallbackEnabled() {
-			return VideoScript{}, append(warnings, fmt.Sprintf("已关闭本地兜底：文本模型未产出可用分镜（%v）", err))
+			return VideoScript{}, append(warnings, fmt.Sprintf("已关闭本地兜底：文本模型未产出可用剧本（%v）", err)), err
 		}
-		warnings = append(warnings, fmt.Sprintf("文本模型生成分镜失败，已回退本地规则：%v", err))
+		warnings = append(warnings, fmt.Sprintf("文本模型生成剧本失败，已回退本地规则：%v", err))
 	} else {
+		if lockedMode {
+			err := errors.New("锁定剧本模式需要文本模型：请先登记文本模型，台词只能在分镜阶段原样保留")
+			return VideoScript{}, append(warnings, err.Error()), err
+		}
 		if !cfg.localFallbackEnabled() {
-			return VideoScript{}, append(warnings, "已关闭本地兜底：本任务需要文本模型产出分镜，请在「系统设置 - 提供商」登记后再试")
+			err := errors.New("本任务需要文本模型产出剧本，请在「系统设置 - 提供商」登记后再试")
+			return VideoScript{}, append(warnings, "已关闭本地兜底："+err.Error()), err
 		}
 		warnings = append(warnings, "未配置文本模型，已使用本地规则生成分镜（可在「系统设置 - 提供商」登记文本模型）")
 	}
@@ -640,7 +615,7 @@ func (a *App) generateScript(ctx context.Context, cfg VideoRunConfig, feedback s
 		warnings = append(warnings, warning)
 	}
 	bound, speakerWarnings := bindSpeakers(normalizeScript(localVideoScript(cfg, tpl), cfg, tpl), cfg)
-	return bound, append(warnings, speakerWarnings...)
+	return bound, append(warnings, speakerWarnings...), nil
 }
 
 // firstTemplateRun 取首个非空模板快照，便于保持旧调用点兼容。
@@ -1082,10 +1057,12 @@ func normalizeScript(script VideoScript, cfg VideoRunConfig, templates ...*Video
 	language := normalizeLanguage(firstNonEmpty(script.Language, cfg.Language))
 	source := firstNonEmpty(script.Source, "llm")
 	return VideoScript{
-		Logline:  firstNonEmpty(script.Logline, cfg.Topic),
-		Language: language,
-		Source:   source,
-		Shots:    shots,
+		Logline:   firstNonEmpty(script.Logline, cfg.Topic),
+		Language:  language,
+		Source:    source,
+		Mode:      script.Mode,
+		Treatment: script.Treatment,
+		Shots:     shots,
 	}
 }
 
@@ -1120,7 +1097,8 @@ func splitTopicClauses(topic string) []string {
 func localVideoScript(cfg VideoRunConfig, templates ...*VideoTemplateRun) VideoScript {
 	tpl := firstTemplateRun(templates)
 	clauses := splitTopicClauses(cfg.Topic)
-	shotCount := clampInt(int(math.Round(float64(cfg.DurationS)/6)), 1, 5)
+	lowShots, highShots := shotCountRange(cfg)
+	shotCount := clampInt(int(math.Round(float64(cfg.DurationS)/6)), lowShots, highShots)
 	if shotCount < 2 && len(clauses) >= 3 {
 		shotCount = 2
 	}

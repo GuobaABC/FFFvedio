@@ -176,7 +176,7 @@ async function refreshAll() {
           @click="selectedId = task.id"
         >
           <span class="task__top">
-            <span class="task__title">{{ task.title }}</span>
+            <span class="task__title" :title="task.title">{{ task.title }}</span>
             <span class="ui-chip" :class="crawlStatusClass(task.status)">
               {{ CRAWL_STATUS_LABELS[task.status] ?? task.status }}
             </span>

@@ -248,7 +248,7 @@ function characterSummary(character: VideoCharacter): string {
           @click="selectedId = character.id"
         >
           <span class="item__top">
-            <span class="item__name">{{ character.name }}</span>
+            <span class="item__name" :title="character.name">{{ character.name }}</span>
             <span class="ui-chip">{{ character.roleId }}</span>
           </span>
           <span class="item__desc">{{ characterSummary(character) }}</span>
