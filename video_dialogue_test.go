@@ -180,7 +180,7 @@ func TestSegmentEditRebindsMultiSpeaker(t *testing.T) {
 // 长镜头第 2 段不允许单独填台词：否则会出现“有声音、无字幕”。
 func TestSegmentEditRejectsDialogueOnLaterPart(t *testing.T) {
 	run := &VideoRunContext{
-		Script: &VideoScript{Shots: []VideoShot{{ID: "s1", Roles: []string{"host"}}}},
+		Script:  &VideoScript{Shots: []VideoShot{{ID: "s1", Roles: []string{"host"}}}},
 		Prompts: []VideoPromptItem{{ShotID: "s1", VisualPrompt: "推镜"}},
 		Plan: &VideoPlan{Segments: []VideoSegment{
 			{ID: "s1-1", ShotID: "s1", Index: 0},

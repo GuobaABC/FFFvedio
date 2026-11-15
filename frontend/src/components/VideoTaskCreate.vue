@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 
-import { consumeCrawlDraft, type CrawlVideoDraft } from '../composables/crawlNav'
 import { consumePendingTemplate } from '../composables/templateNav'
 import { videoNav } from '../composables/videoNav'
 import { backend, errorText } from '../services/backend'
@@ -50,11 +49,21 @@ const environment = ref<VideoEnvironment | null>(null)
 /* ---------------- 所属项目：任务归组，项目视图按它聚合 ---------------- */
 const projects = ref<VideoProject[]>([])
 const projectId = ref('')
+const episode = ref(0)
 /** 项目视图「用为新建首帧」交接来的尾帧路径提示 */
 const tailHandoffHint = ref('')
 
-/** 从「热点爬取 → 爬取结果」带入的素材草稿（只消费一次） */
-const sourceDraft = ref<CrawlVideoDraft | null>(null)
+watch(projectId, async (id) => {
+  if (!id) {
+    episode.value = 0
+    return
+  }
+  try {
+    episode.value = await backend.nextVideoEpisode(id)
+  } catch {
+    episode.value = 0
+  }
+})
 
 /** 角色参考图以「; 分隔的路径文本」编辑，提交时再转成 images 数组 */
 const characterImagesText = ref<string[]>([])
@@ -592,12 +601,6 @@ const aspectHint = '画幅以任务选择为准：火山方舟 Seedance 的首�
   + '素材比例不符时合成阶段会用模糊填充统一画幅。开启字幕时，时间轴按各片段实测时长重排，一句一条，跟对白对齐。'
 
 onMounted(async () => {
-  // 热点爬取带入的素材：先落到表单，再拉提供商能力
-  const draft = consumeCrawlDraft()
-  if (draft) {
-    sourceDraft.value = draft
-    form.topic = draft.topic
-  }
   // 项目视图尾帧「用为新建首帧」交接：填入首帧并提示来源（只消费一次）
   if (videoNav.pendingFirstFramePath) {
     form.firstFrame = videoNav.pendingFirstFramePath
@@ -849,28 +852,6 @@ function splitImages(value: string): string[] {
     .filter(Boolean)
 }
 
-/** 把爬取条目的封面填进首帧（远程 URL 需模型侧能公网访问） */
-function useCrawlThumbnail() {
-  if (sourceDraft.value?.thumbnail) {
-    form.firstFrame = sourceDraft.value.thumbnail
-  }
-}
-
-/** 把爬取时存的选题标签并入创作要求：extraPrompt 会作为“必须落实的额外要求”进 Agent1/Agent2 */
-function applyDraftTags() {
-  const tags = sourceDraft.value?.tags ?? []
-  if (tags.length === 0) {
-    return
-  }
-  const line = `选题标签：${tags.join('、')}`
-  const current = form.videoParams.extraPrompt.trim()
-  form.videoParams.extraPrompt = current ? `${current}；${line}` : line
-}
-
-function dismissCrawlDraft() {
-  sourceDraft.value = null
-}
-
 function togglePlatform(id: string) {
   const index = form.platforms.indexOf(id)
   if (index >= 0) {
@@ -1014,6 +995,7 @@ async function submit() {
     const task = await backend.createVideoTask({
       title: title.value.trim(),
       projectId: projectId.value,
+      episode: episode.value,
       config,
     })
     emit('created', task.id)
@@ -1043,29 +1025,6 @@ async function submit() {
     <p v-if="environment && !environment.ffmpegAvailable" class="ui-notice ui-notice--warn">
       未检测到 ffmpeg：合成时会保留分段视频，跳过拼接与字幕烧录。安装 ffmpeg 并加入 PATH 后可重试。
     </p>
-
-    <div v-if="sourceDraft" class="source">
-      <div class="source__body">
-        <span class="ui-chip ui-chip--ok">已带入爬取素材</span>
-        <span class="source__topic">{{ sourceDraft.note }}</span>
-        <span v-for="tag in sourceDraft.tags ?? []" :key="tag" class="ui-chip">#{{ tag }}</span>
-      </div>
-      <div class="source__actions">
-        <button v-if="sourceDraft.thumbnail" class="ui-btn" type="button" @click="useCrawlThumbnail">
-          用封面作首帧
-        </button>
-        <button
-          v-if="sourceDraft.tags?.length"
-          class="ui-btn"
-          type="button"
-          title="写进「额外创作要求」，分镜与提示词会落实这几个标签"
-          @click="applyDraftTags"
-        >
-          标签并入创作要求
-        </button>
-        <button class="ui-btn ui-btn--ghost" type="button" @click="dismissCrawlDraft">仅保留主题</button>
-      </div>
-    </div>
 
     <form class="create__form" @submit.prevent="submit">
       <section class="ui-card block">
@@ -1195,6 +1154,10 @@ async function submit() {
                 {{ project.name }}
               </option>
             </select>
+          </label>
+          <label v-if="projectId" class="ui-field">
+            <span class="ui-label">集数（留空自动取下一集）</span>
+            <input v-model.number="episode" class="ui-input" type="number" min="0" step="1" />
           </label>
           <div class="ui-field">
             <span class="ui-label">首帧图片（本地路径或 URL）</span>
@@ -1647,8 +1610,8 @@ async function submit() {
           <h3 class="ui-h3">7. 字幕（默认生成）</h3>
         </div>
         <p class="hint">
-          新任务默认生成字幕：视频生成后自动铺时间轴，可在剪辑页预览、逐条调整时间与位置，确认后再烧录。
-          画面提示词始终要求模型不把文字画进画面。旧任务若曾关闭字幕，可在剪辑页为本次开启。
+          新任务默认生成字幕：视频生成后自动铺时间轴，可在字幕页预览、逐条调整时间与位置，确认后再烧录。
+          画面提示词始终要求模型不把文字画进画面。旧任务若曾关闭字幕，可在字幕页为本次开启。
         </p>
         <div class="grid grid--3">
           <label class="ui-field">
@@ -2015,38 +1978,6 @@ async function submit() {
   gap: 12px;
   flex-wrap: wrap;
   padding: 4px 2px 12px;
-}
-
-.source {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  flex-wrap: wrap;
-  padding: 8px 12px;
-  border: 1px solid rgba(88, 214, 141, 0.28);
-  border-radius: var(--radius-sm);
-  background: rgba(88, 214, 141, 0.06);
-}
-
-.source__body {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  flex-wrap: wrap;
-}
-
-.source__topic {
-  font-size: 11.5px;
-  color: var(--color-text-muted);
-  word-break: break-all;
-}
-
-.source__actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 
 .preview {

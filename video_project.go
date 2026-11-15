@@ -31,6 +31,35 @@ func (a *App) videoProjectNameTaken(name, excludeID string) (bool, error) {
 	return count > 0, nil
 }
 
+// nextProjectEpisode 返回项目下一集编号：已有最大 episode + 1（旧任务 episode=0 不参与）。
+func (a *App) nextProjectEpisode(projectID string) int {
+	if a.db == nil || strings.TrimSpace(projectID) == "" {
+		return 1
+	}
+	var maxEpisode int
+	if err := a.db.QueryRow(
+		`SELECT COALESCE(MAX(episode), 0) FROM video_tasks WHERE project_id = ?`, projectID,
+	).Scan(&maxEpisode); err != nil {
+		return 1
+	}
+	if maxEpisode < 0 {
+		maxEpisode = 0
+	}
+	return maxEpisode + 1
+}
+
+// NextVideoEpisode 给新建任务页建议下一集编号。
+func (a *App) NextVideoEpisode(projectID string) (int, error) {
+	if a.db == nil {
+		return 0, errors.New("数据库未初始化")
+	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID != "" && !a.videoProjectExists(projectID) {
+		return 0, errors.New("项目不存在")
+	}
+	return a.nextProjectEpisode(projectID), nil
+}
+
 // ListVideoProjects 返回全部项目（创建时间升序），带任务数与尾帧数统计。
 func (a *App) ListVideoProjects() ([]VideoProject, error) {
 	if a.db == nil {

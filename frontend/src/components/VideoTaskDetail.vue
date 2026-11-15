@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue'
 
 import { backend, errorText } from '../services/backend'
-import VideoEditTimeline from './VideoEditTimeline.vue'
+import SubtitleConfirm from './SubtitleConfirm.vue'
 import {
   TEMPLATE_FIELD_LABELS,
   TEMPLATE_SCOPE_LABELS,
@@ -840,6 +840,16 @@ function revealOutput() {
       <p v-if="treatment.continuity?.length" class="hint">
         连续性：{{ treatment.continuity.join('；') }}
       </p>
+      <p v-if="treatment.bible" class="hint">
+        连续性圣经：
+        <template v-if="treatment.bible.locations?.length">地点 {{ treatment.bible.locations.join('、') }}；</template>
+        <template v-if="treatment.bible.props?.length">道具 {{ treatment.bible.props.join('、') }}；</template>
+        <template v-if="treatment.bible.timeline?.length">时间线 {{ treatment.bible.timeline.join(' → ') }}；</template>
+        <template v-if="treatment.bible.style">风格 {{ treatment.bible.style }}</template>
+      </p>
+      <p v-if="treatment.memoryHits?.length" class="hint">
+        已参考项目记忆：{{ treatment.memoryHits.join('；') }}
+      </p>
     </section>
 
     <!-- 关卡 ①：分镜确认 -->
@@ -1112,8 +1122,8 @@ function revealOutput() {
       </div>
     </section>
 
-    <!-- 剪辑与字幕确认关卡：排在视频生成之后，调完才进合成 -->
-    <VideoEditTimeline v-if="task.stage === 'CONFIRM_EDIT'" :task="task" @changed="emit('changed')" />
+    <!-- 字幕确认关卡：排在视频生成之后，调完字幕才进合成 -->
+    <SubtitleConfirm v-if="task.stage === 'CONFIRM_EDIT'" :task="task" @changed="emit('changed')" />
 
     <!-- 分段渲染 -->
     <section v-if="renders.length > 0 || task.stage === 'RENDER_VIDEO' || task.stage === 'COMPOSE' || task.stage === 'DONE'" class="block">

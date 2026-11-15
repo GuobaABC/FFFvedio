@@ -13,6 +13,7 @@ import {
   type VideoTask,
 } from '../types/video'
 import VideoTaskDetail from './VideoTaskDetail.vue'
+import ProjectMemoryPanel from './ProjectMemoryPanel.vue'
 
 /** App.vue 用来切到「视频生成 → 新建任务」（尾帧「用为新建首帧」交接后） */
 const emit = defineEmits<{ (event: 'to-create'): void }>()
@@ -26,7 +27,7 @@ const tasks = ref<VideoTask[]>([])
 const assets = ref<TailFrameAsset[]>([])
 
 const selectedProjectId = ref<string>(ALL_PROJECTS)
-const activeTab = ref<'tasks' | 'tails'>('tasks')
+const activeTab = ref<'tasks' | 'tails' | 'memory'>('tasks')
 const selectedTaskId = ref('')
 
 const loading = ref(false)
@@ -55,7 +56,11 @@ function projectMatch(projectId: string): boolean {
   return projectId === selectedProjectId.value
 }
 
-const projectTasks = computed(() => tasks.value.filter((item) => projectMatch(item.projectId ?? '')))
+const projectTasks = computed(() =>
+  tasks.value
+    .filter((item) => projectMatch(item.projectId ?? ''))
+    .sort((a, b) => (a.episode || 0) - (b.episode || 0) || a.createdAt.localeCompare(b.createdAt)),
+)
 const projectAssets = computed(() => assets.value.filter((item) => projectMatch(item.projectId ?? '')))
 const selectedTask = computed(
   () => projectTasks.value.find((item) => item.id === selectedTaskId.value) ?? null,
@@ -77,6 +82,12 @@ const projectName = computed(() => {
   }
   return selectedProject.value?.name ?? '项目已删除'
 })
+
+const memoryProjectId = computed(() =>
+  selectedProjectId.value === ALL_PROJECTS || selectedProjectId.value === UNASSIGNED
+    ? ''
+    : selectedProjectId.value,
+)
 
 /** 有任务在执行时按 2s 轮询刷新，让阶段与日志自动前进（与结果页一致） */
 let pollTimer: number | undefined
@@ -144,6 +155,7 @@ onUnmounted(() => {
 function selectProject(id: string) {
   selectedProjectId.value = id
   selectedTaskId.value = ''
+  activeTab.value = 'tasks'
 }
 
 /* ---------------- 项目增删改 ---------------- */
@@ -389,6 +401,15 @@ function statusClass(status: string): string {
             >
               尾帧（{{ projectAssets.length }}）
             </button>
+            <button
+              v-if="memoryProjectId"
+              type="button"
+              class="ptabs__tab"
+              :class="{ 'ptabs__tab--active': activeTab === 'memory' }"
+              @click="activeTab = 'memory'"
+            >
+              项目记忆
+            </button>
           </div>
         </div>
 
@@ -410,6 +431,7 @@ function statusClass(status: string): string {
                   <span class="ui-chip" :class="statusClass(task.status)">{{ STATUS_LABELS[task.status] }}</span>
                 </span>
                 <span class="tcard__meta">
+                  <span v-if="task.episode > 0">第 {{ task.episode }} 集 ·</span>
                   <span>{{ STAGE_LABELS[task.stage] ?? task.stage }}</span>
                   <span>·</span>
                   <span>{{ formatSeconds(task.config.durationS) }} · {{ task.config.aspectRatio }}</span>
@@ -453,7 +475,7 @@ function statusClass(status: string): string {
         </div>
 
         <!-- 尾帧页签 -->
-        <div v-else class="pmain__tails">
+        <div v-else-if="activeTab === 'tails'" class="pmain__tails">
           <p v-if="projectAssets.length === 0 && !loading" class="tails__empty">
             这里还没有尾帧。任务开启「保留最后一段尾帧到资产库」并生成完成后，
             尾帧会自动收录；点卡片上的「查看任务」可以回到产生它的任务。
@@ -493,6 +515,13 @@ function statusClass(status: string): string {
             </div>
           </div>
         </div>
+
+        <!-- 项目记忆页签：短剧角色/剧情/世界设定的检索与人工维护 -->
+        <ProjectMemoryPanel
+          v-else
+          :project-id="memoryProjectId"
+          @changed="load(true)"
+        />
       </div>
     </div>
   </section>

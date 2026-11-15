@@ -213,7 +213,7 @@ const generatedAtText = computed(() => formatCreatedAt(snapshot.value.generatedA
     </section>
 
     <p v-if="!snapshot.hasData" class="dash__empty">
-      还没有计费调用记录：跑一次视频任务或热点爬取后，这里会出现 token 与片段消耗。
+      还没有计费调用记录：跑一次视频任务后，这里会出现 token 与片段消耗。
     </p>
 
     <!-- KPI 磁贴 -->
@@ -298,15 +298,6 @@ const generatedAtText = computed(() => formatCreatedAt(snapshot.value.generatedA
             <span>视频任务</span>
             <b>{{ business.videoTasks }}</b>
             <em>近 7 日 +{{ business.videoTasksThisWeek }}</em>
-          </p>
-          <p class="dash__biz-item">
-            <span>爬取任务</span>
-            <b>{{ business.crawlTasks }}</b>
-            <em>近 7 日 +{{ business.crawlTasksThisWeek }}</em>
-          </p>
-          <p class="dash__biz-item">
-            <span>热点条目</span>
-            <b>{{ business.crawlItems }}</b>
           </p>
           <p class="dash__biz-item">
             <span>尾帧资产</span>

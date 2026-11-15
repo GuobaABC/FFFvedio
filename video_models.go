@@ -157,6 +157,8 @@ type VideoParams struct {
 // VideoRunConfig 输入契约（§1）：一次给全、入口归一化。
 type VideoRunConfig struct {
 	Topic string `json:"topic"`
+	// ProjectID 任务归属项目（由后端从 VideoTaskInput 写入，供项目记忆检索）。
+	ProjectID string `json:"projectId,omitempty"`
 	// ScriptMode 分镜来源：auto（Agent1 自动生成）/ manual（用户逐段填写）
 	ScriptMode string `json:"scriptMode"`
 	// ScriptLocked 用户明确提供了完整剧本：台词原文锁定，只做分镜化。
@@ -300,6 +302,14 @@ type VideoLockedLine struct {
 	Scene   int    `json:"scene,omitempty"`
 }
 
+// VideoBible 连续性圣经：地点/道具/时间线/风格；分镜阶段只能引用，不得新增。
+type VideoBible struct {
+	Locations []string `json:"locations,omitempty"`
+	Props     []string `json:"props,omitempty"`
+	Timeline  []string `json:"timeline,omitempty"`
+	Style     string   `json:"style,omitempty"`
+}
+
 // VideoTreatment 「企划→分镜」第一阶段产物：角色、故事骨架与连续性约定。
 // 它先于分镜存在，分镜阶段只能可视化，不能新增角色/情节/反转。
 type VideoTreatment struct {
@@ -308,7 +318,9 @@ type VideoTreatment struct {
 	Cast        []VideoCastMember `json:"cast"`
 	Beats       []VideoBeat       `json:"beats"`
 	Continuity  []string          `json:"continuity,omitempty"`
+	Bible       *VideoBible       `json:"bible,omitempty"`
 	LockedLines []VideoLockedLine `json:"lockedLines,omitempty"`
+	MemoryHits  []string          `json:"memoryHits,omitempty"`
 	Model       string            `json:"model,omitempty"`
 	Revision    int               `json:"revision,omitempty"`
 }
@@ -550,6 +562,7 @@ type VideoTask struct {
 	Error      string          `json:"error"`
 	TemplateID string          `json:"templateId"`
 	ProjectID  string          `json:"projectId"`
+	Episode    int             `json:"episode"`
 	Config     VideoRunConfig  `json:"config"`
 	Run        VideoRunContext `json:"run"`
 	CreatedAt  string          `json:"createdAt"`
@@ -560,6 +573,7 @@ type VideoTask struct {
 type VideoTaskInput struct {
 	Title     string         `json:"title"`
 	ProjectID string         `json:"projectId"`
+	Episode   int            `json:"episode"`
 	Config    VideoRunConfig `json:"config"`
 }
 

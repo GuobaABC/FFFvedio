@@ -110,11 +110,13 @@ func treatmentSystemPrompt(cfg VideoRunConfig) string {
 - 无任何图片输入时，所有角色必须是动物/拟人动物，不得出现真人、人脸、人体；这是硬约束。
 - 每个角色必须有 voiceHint（声音风格提示词）：音色、语速、语气、情绪变化至少写到两项，例如“温和偏低的女声，语速偏慢，先犹豫后坚定”。
 - 角色关系、目标、口吻要能驱动台词；不要只写外观。
+- 名字、物种、外观必须互相一致：名字叫「猪老板」就写猪，不要写成橘猫；外观锚点里的动物必须与 species 一致。
 - 有用户角色时，沿用其 name / appearance / persona / voiceHint，不得改写。
 
 【输出结构】
-{"cast":[{"roleId":"char_1","name":"角色名","species":"拟人化橘猫","appearance":"外观锚点","persona":"性格与口吻","voiceHint":"声音风格提示词"}],"premise":"一句话立意","beats":[{"id":"b1","function":"hook","summary":"发生了什么","newInfo":"新信息","emotion":"情绪变化","location":"地点","characters":["char_1"],"props":["关键道具"],"link":"与上一拍的关系"}],"continuity":["时间/地点/道具/服装连续性约定"]}
+{"cast":[{"roleId":"char_1","name":"角色名","species":"拟人化橘猫","appearance":"外观锚点","persona":"性格与口吻","voiceHint":"声音风格提示词"}],"premise":"一句话立意","beats":[{"id":"b1","function":"hook","summary":"发生了什么","newInfo":"新信息","emotion":"情绪变化","location":"地点","characters":["char_1"],"props":["关键道具"],"link":"与上一拍的关系"}],"continuity":["时间/地点/道具/服装连续性约定"],"bible":{"locations":["老面馆","后厨"],"props":["白板价目牌","面桶"],"timeline":["白天→夜晚"],"style":"写实电影感"}}
 - roleId 用 char_1、char_2… 顺序编号；如果用户角色表已有 roleId，必须沿用用户的 roleId；characters 只能引用 cast 里的 roleId；旁白写 "narration"。
+- bible 是分镜阶段的地点/道具/时间线/风格白名单：分镜只能引用，不得新增。
 - 只输出企划 JSON；不要输出 shots、durationS、camera、mood。
 
 【硬性约束】
@@ -144,6 +146,8 @@ func storyboardSystemPrompt(cfg VideoRunConfig, treatment *VideoTreatment) strin
 - id 从 s1 起顺序编号；每镜 durationS 为数字秒；所有 durationS 之和必须等于目标总时长。
 - beatId 必须逐字引用企划 beats 的 id；一镜只服务一个 beat，一个 beat 可以拆成 1-2 镜。
 - roles 只能引用企划 cast 的 roleId；角色只要入镜就必须写进 roles。
+- 画面里用 cast 的 name 指代角色（如「猪老板」），species 只用于外观描述；不要用物种替换角色名，也不要让同一角色在不同镜头里变成另一种动物。
+- 只能使用企划 bible 里的地点/道具/时间线；不要新增地点、道具或让时间无理由跳变。
 - 示例里的 char_1 / auto_1 只是占位：实际必须逐字使用输入 cast 里的 roleId，不要自创 ID。
 - dialogueLines 按开口顺序排列；每行 speaker 必须是 cast 的 roleId 或 "narration"；无台词给空数组。
 - 不允许输出企划 cast/beats 以外的角色、地点、道具或剧情。
@@ -188,10 +192,17 @@ func (a *App) generateScriptTwoStage(ctx context.Context, provider Provider, cfg
 		return script, append(warnings, lockWarnings...), err
 	}
 
-	treatment, legacy, treatWarnings, err := a.llmTreatment(ctx, provider, cfg, tpl, feedback)
+	memoryContext, memoryTitles := a.projectMemoryContext(cfg)
+	treatment, legacy, treatWarnings, err := a.llmTreatment(ctx, provider, cfg, tpl, feedback, memoryContext)
 	warnings = append(warnings, treatWarnings...)
 	if err != nil {
 		return VideoScript{}, warnings, err
+	}
+	if treatment != nil {
+		treatment.MemoryHits = memoryTitles
+		if memoryContext != "" {
+			warnings = append(warnings, fmt.Sprintf("已检索项目历史记忆 %d 条", len(memoryTitles)))
+		}
 	}
 	if legacy != nil {
 		// 兼容只返回 shots 的旧模型/旧提示词：不强行要求两段，但不能假装它是新企划。
@@ -224,8 +235,8 @@ func (a *App) generateScriptTwoStage(ctx context.Context, provider Provider, cfg
 }
 
 // llmTreatment 第一阶段：返回企划；若模型直接返回 shots，则作为旧协议兼容结果返回。
-func (a *App) llmTreatment(ctx context.Context, provider Provider, cfg VideoRunConfig, tpl *VideoTemplateRun, feedback string) (*VideoTreatment, *VideoScript, []string, error) {
-	userPrompt := buildTreatmentUserPrompt(cfg, tpl)
+func (a *App) llmTreatment(ctx context.Context, provider Provider, cfg VideoRunConfig, tpl *VideoTemplateRun, feedback, memoryContext string) (*VideoTreatment, *VideoScript, []string, error) {
+	userPrompt := buildTreatmentUserPrompt(cfg, tpl, memoryContext)
 	userPrompt += feedbackDirective(feedback)
 	raw, warnings, _, err := a.chatCompletionTraced(ctx, provider, treatmentSystemPrompt(cfg), userPrompt, firstFrameImages(cfg))
 	if err != nil {
@@ -236,6 +247,7 @@ func (a *App) llmTreatment(ctx context.Context, provider Provider, cfg VideoRunC
 		Premise    string            `json:"premise"`
 		Beats      []VideoBeat       `json:"beats"`
 		Continuity []string          `json:"continuity"`
+		Bible      *VideoBible       `json:"bible"`
 		Logline    string            `json:"logline"`
 		Language   string            `json:"language"`
 		Shots      []VideoShot       `json:"shots"`
@@ -258,6 +270,7 @@ func (a *App) llmTreatment(ctx context.Context, provider Provider, cfg VideoRunC
 		Cast:       mergedCast,
 		Beats:      beats,
 		Continuity: normalizeStringList(payload.Continuity),
+		Bible:      normalizeVideoBible(payload.Bible),
 		Model:      provider.Model,
 		Revision:   1,
 	}
@@ -303,8 +316,11 @@ func (a *App) llmStoryboard(ctx context.Context, provider Provider, cfg VideoRun
 	}, nil
 }
 
-func buildTreatmentUserPrompt(cfg VideoRunConfig, tpl *VideoTemplateRun) string {
+func buildTreatmentUserPrompt(cfg VideoRunConfig, tpl *VideoTemplateRun, memoryContext string) string {
 	lines := userParams(cfg)
+	if strings.TrimSpace(memoryContext) != "" {
+		lines = append(lines, memoryContext)
+	}
 	lines = append(lines, "用户角色表：\n"+characterTable(cfg, tpl))
 	lines = append(lines, "本任务建议："+shotCountHint(cfg))
 	if hints := templateScriptHints(tpl, cfg); hints != "" {
@@ -403,13 +419,7 @@ func mergeTreatmentCast(cfg VideoRunConfig, incoming []VideoCastMember) ([]Video
 		auto := member
 		auto.AutoCreated = true
 		auto.Ephemeral = true
-		if auto.Species == "" {
-			auto.Species = pickAnimalSpecies(auto.Name + cfg.Vertical)
-		}
-		if !hasImageInput(cfg) && looksHumanSpecies(auto.Species) {
-			warnings = append(warnings, fmt.Sprintf("角色「%s」被企划写成人类，已按约束改为拟人动物", auto.Name))
-			auto.Species = pickAnimalSpecies(auto.Name + cfg.Vertical)
-		}
+		warnings = append(warnings, normalizeAutoCastIdentity(cfg, &auto)...)
 		if auto.Appearance == "" {
 			auto.Appearance = "拟人化" + auto.Species + "，" + auto.Name + "，面部与毛色特征稳定，穿着符合场景"
 		}
@@ -418,6 +428,105 @@ func mergeTreatmentCast(cfg VideoRunConfig, incoming []VideoCastMember) ([]Video
 		}
 	}
 	return merged, warnings
+}
+
+// animalFamily 动物家族：用于判断角色名、物种、外观是不是同一种动物。
+// canonical 是写进 species 的规范写法；terms 用于中文包含匹配。
+type animalFamily struct {
+	canonical string
+	terms     []string
+}
+
+var animalFamilies = []animalFamily{
+	{canonical: "小猪", terms: []string{"猪"}},
+	{canonical: "柴犬", terms: []string{"狗", "犬", "柴犬", "柯基", "金毛", "田园犬"}},
+	{canonical: "橘猫", terms: []string{"猫", "橘猫", "布偶猫", "狸花猫"}},
+	{canonical: "公鸡", terms: []string{"鸡", "公鸡", "母鸡"}},
+	{canonical: "垂耳兔", terms: []string{"兔", "兔子", "垂耳兔"}},
+	{canonical: "小羊", terms: []string{"羊", "绵羊", "山羊"}},
+	{canonical: "小牛", terms: []string{"牛", "奶牛", "小牛"}},
+	{canonical: "小马", terms: []string{"马"}},
+	{canonical: "鸭子", terms: []string{"鸭", "鸭子"}},
+	{canonical: "小鸟", terms: []string{"鸟", "麻雀", "小鸟"}},
+}
+
+func familyOfAnimalText(text string) (animalFamily, bool) {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "" {
+		return animalFamily{}, false
+	}
+	for _, family := range animalFamilies {
+		for _, term := range family.terms {
+			if strings.Contains(text, term) {
+				return family, true
+			}
+		}
+	}
+	return animalFamily{}, false
+}
+
+func speciesFamily(species string) (animalFamily, bool) {
+	return familyOfAnimalText(species)
+}
+
+func inferAnimalSpecies(text string) (string, bool) {
+	if family, ok := familyOfAnimalText(text); ok {
+		return family.canonical, true
+	}
+	return "", false
+}
+
+// normalizeAutoCastIdentity 修正企划自动角色的身份：
+// 名字里的动物优先（猪老板→小猪），其次外观/人设；人类物种或名字/物种/外观冲突时，
+// 以名字为准并重写冲突外观，避免同一条提示词里“橘猫”和“中年家猪”同时出现。
+func normalizeAutoCastIdentity(cfg VideoRunConfig, member *VideoCastMember) []string {
+	warnings := make([]string, 0, 2)
+	if member == nil {
+		return warnings
+	}
+	nameFamily, nameOK := familyOfAnimalText(member.Name)
+	appearanceFamily, appearanceOK := familyOfAnimalText(member.Appearance)
+	personaFamily, personaOK := familyOfAnimalText(member.Persona)
+	currentFamily, currentOK := speciesFamily(member.Species)
+
+	target := animalFamily{}
+	targetOK := false
+	switch {
+	case nameOK:
+		target, targetOK = nameFamily, true
+	case appearanceOK:
+		target, targetOK = appearanceFamily, true
+	case personaOK:
+		target, targetOK = personaFamily, true
+	case currentOK:
+		target, targetOK = currentFamily, true
+	}
+
+	if !targetOK {
+		// 没有可推断的动物线索：无图任务仍必须落到动物；用户上传过图片的
+		// 用户角色不会走到这里（本函数只处理自动创建的临时角色）。
+		if looksHumanSpecies(member.Species) || strings.TrimSpace(member.Species) == "" {
+			member.Species = pickAnimalSpecies(member.Name + cfg.Vertical)
+			warnings = append(warnings, fmt.Sprintf("角色「%s」没有可识别的动物形象，已按题材改为拟人动物「%s」", member.Name, member.Species))
+		}
+		if strings.TrimSpace(member.Appearance) == "" || looksHumanSpecies(member.Appearance) {
+			member.Appearance = "拟人化" + member.Species + "，" + member.Name + "，面部与毛色特征稳定，穿着符合场景"
+		}
+		return warnings
+	}
+
+	if !currentOK || currentFamily.canonical != target.canonical || looksHumanSpecies(member.Species) {
+		if strings.TrimSpace(member.Species) != target.canonical {
+			warnings = append(warnings, fmt.Sprintf("角色「%s」的物种「%s」与身份不一致，已按名字/外观改为「%s」", member.Name, firstNonEmpty(member.Species, "未填"), target.canonical))
+		}
+		member.Species = target.canonical
+	}
+	// 外观描述的是另一种动物，或仍是人类描述时，重写为“拟人化 + 名字”的稳定身份。
+	if (appearanceOK && appearanceFamily.canonical != target.canonical) || looksHumanSpecies(member.Appearance) {
+		member.Appearance = "拟人化" + member.Species + "，" + member.Name + "，面部与毛色特征稳定，穿着符合场景"
+		warnings = append(warnings, fmt.Sprintf("角色「%s」的外观与物种冲突，已按「%s」重写外观锚点", member.Name, member.Species))
+	}
+	return warnings
 }
 
 func applyTreatmentCast(cfg VideoRunConfig, treatment *VideoTreatment) (VideoRunConfig, []string) {
@@ -495,6 +604,22 @@ func normalizeStringList(values []string) []string {
 	return out
 }
 
+func normalizeVideoBible(bible *VideoBible) *VideoBible {
+	if bible == nil {
+		return nil
+	}
+	normalized := &VideoBible{
+		Locations: normalizeStringList(bible.Locations),
+		Props:     normalizeStringList(bible.Props),
+		Timeline:  normalizeStringList(bible.Timeline),
+		Style:     strings.TrimSpace(bible.Style),
+	}
+	if len(normalized.Locations) == 0 && len(normalized.Props) == 0 && len(normalized.Timeline) == 0 && normalized.Style == "" {
+		return nil
+	}
+	return normalized
+}
+
 func normalizeTreatmentBeats(beats []VideoBeat) []VideoBeat {
 	out := make([]VideoBeat, 0, len(beats))
 	for index, beat := range beats {
@@ -536,6 +661,29 @@ func syncTreatmentCastToConfig(cfg *VideoRunConfig, script *VideoScript) {
 /* ------------------------------------------------------------------
    严格台词绑定：空归属/未知角色直接报错，不再静默降级旁白
    ------------------------------------------------------------------ */
+
+// validateBeatCoverage 分镜只能引用企划里的 beat；未知 beatId 说明分镜阶段自己编了剧情。
+func validateBeatCoverage(script VideoScript, treatment VideoTreatment) []string {
+	if len(treatment.Beats) == 0 {
+		return nil
+	}
+	known := make(map[string]bool, len(treatment.Beats))
+	for _, beat := range treatment.Beats {
+		known[beat.ID] = true
+	}
+	issues := make([]string, 0, 2)
+	for _, shot := range script.Shots {
+		beatID := strings.TrimSpace(shot.BeatID)
+		if beatID == "" {
+			issues = append(issues, fmt.Sprintf("%s 没有 beatId，分镜阶段必须绑定企划节拍", shot.ID))
+			continue
+		}
+		if !known[beatID] {
+			issues = append(issues, fmt.Sprintf("%s 的 beatId「%s」不在企划节拍里", shot.ID, beatID))
+		}
+	}
+	return issues
+}
 
 func validateScriptBindings(script *VideoScript, cfg VideoRunConfig) []string {
 	issues := make([]string, 0, 4)
@@ -585,6 +733,9 @@ func validateScriptBindings(script *VideoScript, cfg VideoRunConfig) []string {
 
 func (a *App) validateAndBindScript(ctx context.Context, provider Provider, cfg VideoRunConfig, script VideoScript, treatment VideoTreatment, locked bool) (VideoScript, []string, error) {
 	issues := validateScriptBindings(&script, cfg)
+	if !locked {
+		issues = append(issues, validateBeatCoverage(script, treatment)...)
+	}
 	if locked {
 		issues = append(issues, validateLockedLines(script, treatment.LockedLines)...)
 		issues = append(issues, validateLockedBudget(script, cfg)...)

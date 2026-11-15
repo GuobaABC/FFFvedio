@@ -62,7 +62,14 @@ func (a *App) ApproveVideoGate(id string) error {
 		task.Run.Gates[VideoGateMeta] = videoGateApproved
 		task.Run.Logs = append(task.Run.Logs, stageLog("发布元数据已确认，任务完成"))
 		task.UpdatedAt = time.Now().Format(time.RFC3339)
-		return a.updateVideoTaskRecord(task)
+		if err := a.updateVideoTaskRecord(task); err != nil {
+			return err
+		}
+		// 任务完成后把企划/角色/剧情沉淀进项目记忆；embedding 留给手动重建，避免完成时额外外呼。
+		if task.ProjectID != "" {
+			_, _ = a.rebuildProjectMemory(task.ProjectID, false)
+		}
+		return nil
 	}
 
 	next := ""
@@ -82,7 +89,7 @@ func (a *App) ApproveVideoGate(id string) error {
 			}
 		}
 		task.Run.Gates[VideoGateEdit] = videoGateApproved
-		task.Run.Logs = append(task.Run.Logs, stageLog("剪辑与字幕已确认，合成阶段按这份时间轴烧录"))
+		task.Run.Logs = append(task.Run.Logs, stageLog("字幕已确认，合成阶段按这份时间轴烧录"))
 		task.UpdatedAt = time.Now().Format(time.RFC3339)
 		if err := a.updateVideoTaskRecord(task); err != nil {
 			return err
@@ -1096,7 +1103,7 @@ func (a *App) SetVideoSubtitlesEnabled(id string, enabled bool) (VideoTask, erro
 		return task, err
 	}
 	task.Run.Subtitles = subtitles
-	task.Run.Logs = append(task.Run.Logs, stageLog(fmt.Sprintf("已为本次开启字幕：%d 条，可在剪辑页继续调整", len(normalized))))
+	task.Run.Logs = append(task.Run.Logs, stageLog(fmt.Sprintf("已为本次开启字幕：%d 条，可在字幕页继续调整", len(normalized))))
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
 	return task, a.updateVideoTaskRecord(task)
 }
@@ -1658,14 +1665,14 @@ func (r *videoRunner) runEditStage() error {
 			return fmt.Errorf("重建预览画布失败: %w", prepErr)
 		}
 		r.task.Run.Compose = built
-		r.logf("预览画布已就绪：%.1fs（%dx%d），可在剪辑页直接播放",
+		r.logf("预览画布已就绪：%.1fs（%dx%d），可在字幕页直接播放",
 			built.DurationS, built.CanvasWidth, built.CanvasHeight)
 	}
 
 	if !cfg.Subtitles {
 		r.task.Run.Subtitles = nil
 		r.task.Run.SubtitleIssues = nil
-		r.logf("该任务未开启字幕：仍可剪辑片段；需要字幕时可在此页一键开启")
+		r.logf("该任务未开启字幕：仍可播放预览画布；需要字幕时可在此页一键开启")
 		return nil
 	}
 
@@ -1693,8 +1700,7 @@ func (r *videoRunner) runEditStage() error {
 	}
 	r.task.Run.Subtitles = subtitles
 	r.task.Run.SubtitleIssues = issues
-	r.logf("剪辑与字幕已生成：%d 个片段、%d 条字幕，时间轴来源 %s（可在剪辑页预览、裁剪、调时间轴）",
-		len(r.task.Run.Edit.Clips), len(normalized), subtitles.TimingSource)
+	r.logf("字幕已生成：%d 条，时间轴来源 %s（可在字幕页预览、调时间与位置）", len(normalized), subtitles.TimingSource)
 	if subtitles.TimingSource == "aligned" || subtitles.TimingSource == "measured" {
 		if measured := measuredSpeechRate(subtitles.Cues, cfg.Language); measured > 0 {
 			unit := "字"

@@ -233,7 +233,6 @@ func (a *App) fillBusinessCounts(business *dashboardBusinessCount) error {
 		dst   *int
 		query string
 	}{
-		{&business.CrawlItems, `SELECT COUNT(1) FROM crawl_items`},
 		{&business.TailFrameAssets, `SELECT COUNT(1) FROM tail_frame_assets`},
 		{&business.Templates, `SELECT COUNT(1) FROM video_templates`},
 		{&business.Providers, `SELECT COUNT(1) FROM providers`},
@@ -250,7 +249,6 @@ func (a *App) fillBusinessCounts(business *dashboardBusinessCount) error {
 		query  string
 	}{
 		{&business.VideoTasks, &business.VideoTasksThisWeek, `video_tasks`},
-		{&business.CrawlTasks, &business.CrawlTasksThisWeek, `crawl_tasks`},
 	}
 	for _, counter := range windowed {
 		if err := a.db.QueryRow(`SELECT COUNT(1) FROM ` + counter.query).Scan(counter.total); err != nil {

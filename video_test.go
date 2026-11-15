@@ -1516,8 +1516,8 @@ func TestSubtitleGeneratedOnlyAfterPromptConfirm(t *testing.T) {
 	if !fileExists(task.Run.Subtitles.SRTPath) {
 		t.Fatalf("SRT 没落盘: %s", task.Run.Subtitles.SRTPath)
 	}
-	if logs := strings.Join(task.Run.Logs, "\n"); !strings.Contains(logs, "剪辑与字幕已生成") {
-		t.Fatalf("日志要留下剪辑与字幕生成记录：%v", task.Run.Logs)
+	if logs := strings.Join(task.Run.Logs, "\n"); !strings.Contains(logs, "字幕已生成") {
+		t.Fatalf("日志要留下字幕生成记录：%v", task.Run.Logs)
 	}
 }
 
@@ -2043,7 +2043,7 @@ func TestEditStageStopsAtConfirmGate(t *testing.T) {
 	if advanced.Run.Gates[VideoGateEdit] != videoGateApproved {
 		t.Fatalf("剪辑关卡应为 approved：%v", advanced.Run.Gates)
 	}
-	if logs := strings.Join(advanced.Run.Logs, "\n"); !strings.Contains(logs, "剪辑与字幕已确认") {
+	if logs := strings.Join(advanced.Run.Logs, "\n"); !strings.Contains(logs, "字幕已确认") {
 		t.Fatalf("日志要留下确认记录：%v", advanced.Run.Logs)
 	}
 }

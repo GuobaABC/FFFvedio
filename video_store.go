@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const videoTaskColumns = `id, title, stage, status, error, config_json, context_json, created_at, updated_at, template_id, project_id`
+const videoTaskColumns = `id, title, stage, status, error, config_json, context_json, created_at, updated_at, template_id, project_id, episode`
 
 func randomHex(size int) string {
 	buf := make([]byte, size)
@@ -34,7 +34,7 @@ func scanVideoTask(scanner interface{ Scan(dest ...any) error }) (VideoTask, err
 	var configJSON, contextJSON string
 	if err := scanner.Scan(
 		&task.ID, &task.Title, &task.Stage, &task.Status, &task.Error,
-		&configJSON, &contextJSON, &task.CreatedAt, &task.UpdatedAt, &task.TemplateID, &task.ProjectID,
+		&configJSON, &contextJSON, &task.CreatedAt, &task.UpdatedAt, &task.TemplateID, &task.ProjectID, &task.Episode,
 	); err != nil {
 		return task, err
 	}
@@ -149,6 +149,7 @@ func (a *App) CreateVideoTask(input VideoTaskInput) (VideoTask, error) {
 		warnings = append(warnings, "归属项目不存在或已被删除，任务已按未归类创建")
 		projectID = ""
 	}
+	cfg.ProjectID = projectID
 	task := VideoTask{
 		ID:         newVideoTaskID(),
 		Title:      strings.TrimSpace(input.Title),
@@ -156,6 +157,7 @@ func (a *App) CreateVideoTask(input VideoTaskInput) (VideoTask, error) {
 		Status:     VideoStatusDraft,
 		TemplateID: templateID,
 		ProjectID:  projectID,
+		Episode:    input.Episode,
 		Config:     cfg,
 		Run: VideoRunContext{
 			Adapter:       cfg.Adapter,
@@ -170,6 +172,9 @@ func (a *App) CreateVideoTask(input VideoTaskInput) (VideoTask, error) {
 	if task.Title == "" {
 		task.Title = defaultVideoTitle(cfg.Topic)
 	}
+	if task.ProjectID != "" && task.Episode <= 0 {
+		task.Episode = a.nextProjectEpisode(task.ProjectID)
+	}
 
 	configJSON, err := encodeVideoJSON(task.Config)
 	if err != nil {
@@ -181,8 +186,8 @@ func (a *App) CreateVideoTask(input VideoTaskInput) (VideoTask, error) {
 	}
 
 	if _, err := a.db.Exec(
-		`INSERT INTO video_tasks (`+videoTaskColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		task.ID, task.Title, task.Stage, task.Status, task.Error, configJSON, contextJSON, task.CreatedAt, task.UpdatedAt, task.TemplateID, task.ProjectID,
+		`INSERT INTO video_tasks (`+videoTaskColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		task.ID, task.Title, task.Stage, task.Status, task.Error, configJSON, contextJSON, task.CreatedAt, task.UpdatedAt, task.TemplateID, task.ProjectID, task.Episode,
 	); err != nil {
 		return VideoTask{}, fmt.Errorf("创建视频任务失败: %w", err)
 	}

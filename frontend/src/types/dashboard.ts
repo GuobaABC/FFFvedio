@@ -68,9 +68,6 @@ export interface AdapterMaturityRow {
 export interface DashboardBusinessCount {
   videoTasks: number
   videoTasksThisWeek: number
-  crawlTasks: number
-  crawlTasksThisWeek: number
-  crawlItems: number
   tailFrameAssets: number
   templates: number
   providers: number
@@ -118,9 +115,6 @@ export function emptyDashboard(): DashboardSnapshot {
     business: {
       videoTasks: 0,
       videoTasksThisWeek: 0,
-      crawlTasks: 0,
-      crawlTasksThisWeek: 0,
-      crawlItems: 0,
       tailFrameAssets: 0,
       templates: 0,
       providers: 0,

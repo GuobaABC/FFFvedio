@@ -193,13 +193,22 @@ export interface VideoLockedLine {
   scene?: number
 }
 
+export interface VideoBible {
+  locations?: string[]
+  props?: string[]
+  timeline?: string[]
+  style?: string
+}
+
 export interface VideoTreatment {
   mode: 'original' | 'script_locked' | string
   premise: string
   cast: VideoCastMember[]
   beats: VideoBeat[]
   continuity?: string[]
+  bible?: VideoBible | null
   lockedLines?: VideoLockedLine[]
+  memoryHits?: string[]
   model?: string
   revision?: number
 }
@@ -402,6 +411,8 @@ export interface VideoTask {
   templateId: string
   /** 归属项目 ID（空 = 未归类） */
   projectId: string
+  /** 集数（0 = 未分集） */
+  episode: number
   config: VideoRunConfig
   run: VideoRunContext
   createdAt: string
@@ -411,7 +422,22 @@ export interface VideoTask {
 export interface VideoTaskInput {
   title: string
   projectId: string
+  episode?: number
   config: VideoRunConfig
+}
+
+export interface ProjectMemory {
+  id: string
+  projectId: string
+  episode: number
+  kind: string
+  title: string
+  content: string
+  payload: string
+  sourceTask: string
+  createdAt: string
+  updatedAt: string
+  score?: number
 }
 
 export interface VideoPromptEdit {
@@ -587,8 +613,8 @@ export const VIDEO_STAGES: { id: VideoStage; label: string; hint: string }[] = [
   { id: 'BUILD_PROMPT', label: '提示词', hint: 'Agent2 展开画面提示词' },
   { id: 'CONFIRM_PROMPT', label: '确认提示词', hint: '人工确认关卡 ②（成本拍板）' },
   { id: 'RENDER_VIDEO', label: '生成视频', hint: 'Agent3 适配器逐段生成' },
-  { id: 'BUILD_EDIT', label: '剪辑生成', hint: '生成默认剪辑计划、预览画布与字幕时间轴' },
-  { id: 'CONFIRM_EDIT', label: '剪辑与字幕', hint: '人工确认关卡：预览、裁剪、排序与调时间轴' },
+  { id: 'BUILD_EDIT', label: '生成字幕', hint: '生成字幕时间轴与预览画布' },
+  { id: 'CONFIRM_EDIT', label: '确认字幕', hint: '人工确认关卡：调字幕位置、字号与时间' },
   { id: 'COMPOSE', label: '合成成片', hint: 'ffmpeg 拼接 + 烧录字幕' },
   { id: 'BUILD_PUBLISH_META', label: '发布元数据', hint: 'Agent4 标题 / 标签 / 发布时段' },
   { id: 'CONFIRM_META', label: '确认发布', hint: '人工确认关卡 ③' },
@@ -601,8 +627,8 @@ export const STAGE_LABELS: Record<string, string> = {
   BUILD_PROMPT: '提示词',
   CONFIRM_PROMPT: '确认提示词',
   RENDER_VIDEO: '生成视频',
-  BUILD_EDIT: '剪辑生成',
-  CONFIRM_EDIT: '剪辑与字幕',
+  BUILD_EDIT: '生成字幕',
+  CONFIRM_EDIT: '确认字幕',
   COMPOSE: '合成成片',
   BUILD_PUBLISH_META: '发布元数据',
   CONFIRM_META: '确认发布',

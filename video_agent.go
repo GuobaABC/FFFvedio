@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 )
@@ -1485,6 +1486,11 @@ func applyTemplatePromptExtras(visual string, shot VideoShot, caps VideoCapabili
 		if roleUsesUserImages(cfg, role) {
 			continue
 		}
+		// 单角色镜头里，若画面已经写成另一种动物，先把画面里的动物词改回
+		// cast 的物种，再追加外观锚点；否则提示词会自相矛盾。
+		if len(shot.Roles) == 1 {
+			visual = alignVisualSpecies(visual, profile)
+		}
 		name := firstNonEmpty(profile.Name, profile.RoleID, role)
 		extras = append(extras, fmt.Sprintf("角色外观（%s）：%s", name, profile.AppearanceBlock))
 	}
@@ -1492,6 +1498,33 @@ func applyTemplatePromptExtras(visual string, shot VideoShot, caps VideoCapabili
 		return visual
 	}
 	return visual + "；" + strings.Join(extras, "；")
+}
+
+// alignVisualSpecies 把单角色画面里写错的动物词改成 cast 的物种。
+// 只处理“名字/外观能推断出动物”的自动角色；用户图角色不走文字外观。
+func alignVisualSpecies(visual string, profile VideoCharacterRef) string {
+	var target animalFamily
+	found := false
+	for _, candidate := range []string{profile.Name, profile.Species, profile.AppearanceBlock} {
+		if family, ok := familyOfAnimalText(candidate); ok {
+			target, found = family, true
+			break
+		}
+	}
+	if !found {
+		return visual
+	}
+	current, ok := familyOfAnimalText(visual)
+	if !ok || current.canonical == target.canonical {
+		return visual
+	}
+	terms := append([]string{}, current.terms...)
+	sort.Slice(terms, func(i, j int) bool { return len(terms[i]) > len(terms[j]) })
+	pairs := make([]string, 0, len(terms)*2)
+	for _, term := range terms {
+		pairs = append(pairs, term, target.canonical)
+	}
+	return strings.NewReplacer(pairs...).Replace(visual)
 }
 
 func segmentPromptSuggestSystemPrompt(cfg VideoRunConfig, caps VideoCapabilities) string {

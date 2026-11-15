@@ -2,7 +2,7 @@
 
 > FFF = Fast Fast Fast。`Vedio` 是刻意保留的拼写彩蛋。
 
-**v0.1.3** · 基于 Wails v2 + Vue 3 + Go 的跨平台桌面应用（Windows / macOS），把「热点素材采集 → 分镜与提示词 → 多段 AI 视频渲染 → 字幕合成 → 发布元数据」串成一条带人工确认关卡的本地流水线。所有数据落在本地 SQLite，不依赖云端后端。
+**v0.1.4** · 基于 Wails v2 + Vue 3 + Go 的跨平台桌面应用（Windows / macOS），把「分镜与提示词 → 多段 AI 视频渲染 → 字幕确认与合成 → 发布元数据」串成一条带人工确认关卡的本地流水线。所有数据落在本地 SQLite，不依赖云端后端。
 
 ---
 
@@ -11,7 +11,7 @@
 | 模块 | 能力 |
 | --- | --- |
 | **首页大屏** | 今日 / 近 7 日用量、调用趋势、最近事件，模型调用与计费记录可追溯 |
-| **热点爬取** | 任务式采集：URL 归一化 → 抓取路由 → 抽取瀑布（规则 / LLM）→ 校验合并 → 入库；结果条目可一键带入视频生成 |
+| **项目视图** | 按项目与「集」整理任务，项目记忆沉淀历史角色 / 剧情 / 世界设定，供短剧续写检索 |
 | **视频生成** | 主题 → 企划（角色 / 故事节拍）→ 分镜（Agent1）→ 提示词与字幕（Agent2）→ 逐段渲染 → 合成烧录字幕 → 发布元数据，含多道人工确认关卡 |
 | **项目视图** | 按项目整理任务，尾帧资产库支持「用为下一条视频首帧」，实现跨任务画面延续 |
 | **模板库** | 用户自建 / 团队模板，分层覆盖（单次 > 模板 > 系统默认）并标注字段来源 |
@@ -26,7 +26,7 @@
 | `DRAFT_SCRIPT` → `CONFIRM_SCRIPT` | Agent1 先企划再分镜：无角色时自动创建拟人动物角色，每个角色绑定声音风格；也可切「手动分段」或粘贴完整剧本锁定台词，跳过/约束 Agent1 |
 | `BUILD_PROMPT` → `CONFIRM_PROMPT` | Agent2 产出每段的 i2v 提示词、台词与字幕文案 |
 | `RENDER_VIDEO` | 逐段调用视频模型；可开「逐段确认」，单段不满意可改提示词（或让 AI 重写）后仅重渲该段 |
-| `BUILD_EDIT` → `CONFIRM_EDIT` | 生成剪辑计划、预览画布与字幕时间轴；可调顺序、入出点、逐条字幕 |
+| `BUILD_EDIT` → `CONFIRM_EDIT` | 生成预览画布与字幕时间轴；只调字幕位置/字号/时间，保存落 ASS，确认后烧录 |
 | `COMPOSE` | ffmpeg 拼接、冻帧裁剪、字幕声学对齐后烧录，输出成片 |
 | `BUILD_PUBLISH_META` → `CONFIRM_META` → `DONE` | 生成标题 / 标签 / 简介等发布元数据 |
 
@@ -73,9 +73,9 @@ FFFVedio/
 ├─ main.go / app.go                 # 入口与生命周期、任务执行互斥
 ├─ db.go                            # SQLite 打开、PRAGMA、建表与迁移
 ├─ provider*.go / llm_client.go     # 提供商 CRUD、/models、文本模型调用
-├─ crawl_*.go                       # 爬取流水线：URL、抓取、抽取、选择器、LLM、存储
-├─ video_models.go / video_pipeline.go / video_agent.go
-│                                   # 任务模型、阶段状态机、Agent1/2/4
+├─ video_models.go / video_treatment.go / video_pipeline.go / video_agent.go
+│                                   # 任务模型、两阶段企划→分镜、阶段状态机、Agent1/2/4
+├─ project_memory.go / embedding.go # 项目记忆、FTS5 关键词 + embedding 混合检索
 ├─ video_adapter.go                 # 各厂商视频适配器与能力声明
 ├─ video_compose.go / video_media.go# ffmpeg 合成、字幕对齐、冻帧裁剪
 ├─ video_retry.go / video_publish.go / video_assets.go / video_project.go
@@ -87,8 +87,8 @@ FFFVedio/
 ├─ .github/workflows/release.yml    # 推送 v* 标签自动出 Release
 └─ frontend/src/
    ├─ App.vue                      # 主布局与四个主选项卡
-   ├─ components/                  # Dashboard / Crawl* / Video* / Template* / ProviderSettings
-   ├─ composables/                 # 跨页面交接（爬取条目→新建任务、模板→任务、尾帧→首帧）
+   ├─ components/                  # Dashboard / Video* / Subtitle* / Template* / ProviderSettings
+   ├─ composables/                 # 跨页面交接（模板→任务、尾帧→首帧）
    ├─ services/backend.ts          # Wails 运行时桥接
    └─ types/                       # 各模块 TS 类型
 ```
@@ -136,7 +136,7 @@ wails build                                       # → build/bin/FFFVedioAgent.
 wails build -nsis                                  # Windows 安装包
 ```
 
-`go test ./...` 覆盖提供商 CRUD 与 `/models` 解析、爬取流水线、分镜与手动分段、字幕对齐与冻帧裁剪、逐段确认与单段重渲、项目 / 模板 / 用量存储等；部分用例会用本机 ffmpeg 构造素材做集成测试。
+`go test ./...` 覆盖提供商 CRUD 与 `/models` 解析、分镜与手动分段、两阶段企划、项目记忆检索、字幕对齐与冻帧裁剪、逐段确认与单段重渲、项目 / 模板 / 用量存储等；部分用例会用本机 ffmpeg 构造素材做集成测试。
 
 ### 一键打包（不依赖 wails CLI）
 
@@ -155,7 +155,7 @@ ARCH=x86_64 ./scripts/build-macos.sh  # Intel
 ## 数据与配置
 
 - 数据库位置：Windows `%AppData%\FFFVedioAgent\FFFVedioAgent.db`；macOS `~/Library/Application Support/FFFVedioAgent/FFFVedioAgent.db`。
-- 表包含 `providers`（服务商配置）、视频任务与运行记录、爬取任务与条目、模板、项目、尾帧资产、`usage_events`（用量）等。
+- 表包含 `providers`（服务商配置）、视频任务与运行记录、模板、项目与项目记忆、尾帧资产、`usage_events`（用量）等。
 - 视频任务的产物（分段视频、字幕、成片、`subtitle-timing.json`）写在各任务的工作目录下，通过 `/media/` 在界面内预览。
 - 删除项目只解除归属，不删除任务、尾帧与磁盘文件；卸载安装包只删程序目录，保留 `%AppData%\FFFVedioAgent` 数据。
 
@@ -169,4 +169,4 @@ ARCH=x86_64 ./scripts/build-macos.sh  # Intel
 
 ## 版本
 
-当前 **v0.1.3**（2026-11-14）。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
+当前 **v0.1.4**（2026-11-14）。完整变更见 [CHANGELOG.md](CHANGELOG.md)。

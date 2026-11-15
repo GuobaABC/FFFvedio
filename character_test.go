@@ -182,9 +182,9 @@ func TestLegacyTaskWithoutCharacterProfileLoads(t *testing.T) {
 
 	const configJSON = `{"topic":"旧任务","durationS":6,"characterRefs":[{"roleId":"host","name":"主理人","images":["https://example.com/host.png"],"imageSource":"user","voiceHint":"低沉男声"}]}`
 	if _, err := app.db.Exec(
-		`INSERT INTO video_tasks (`+videoTaskColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO video_tasks (`+videoTaskColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		"vt-legacy-character", "旧任务", VideoStageDraftScript, VideoStatusDraft, "",
-		configJSON, `{"adapter":"mock","gates":{}}`, "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "", "",
+		configJSON, `{"adapter":"mock","gates":{}}`, "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z", "", "", 0,
 	); err != nil {
 		t.Fatalf("构造旧任务失败: %v", err)
 	}

@@ -333,6 +333,43 @@ func TestMergeTreatmentCastStopsAtOneExtraWhenUserCastExists(t *testing.T) {
 	}
 }
 
+func TestNormalizeAutoCastIdentityUsesNameOverSpecies(t *testing.T) {
+	cfg := treatmentTestConfig("动物面馆")
+	pig := VideoCastMember{Name: "猪老板", Species: "橘猫", Appearance: "中年家猪，灰白围裙、圆框老花镜", VoiceHint: "中年沙哑男声，语速偏快"}
+	warnings := normalizeAutoCastIdentity(cfg, &pig)
+	if pig.Species != "小猪" {
+		t.Fatalf("名字里的猪应优先于错误物种，实际 %q（warnings=%v）", pig.Species, warnings)
+	}
+	if !strings.Contains(pig.Appearance, "家猪") {
+		t.Fatalf("外观本来就与名字一致，不应被重写: %q", pig.Appearance)
+	}
+	dog := VideoCastMember{Name: "狗老板", Species: "布偶猫", Appearance: "黄白毛色田园犬，白色厨师服", VoiceHint: "清亮女声"}
+	normalizeAutoCastIdentity(cfg, &dog)
+	if dog.Species != "柴犬" {
+		t.Fatalf("名字里的狗应优先于错误物种，实际 %q", dog.Species)
+	}
+}
+
+func TestNormalizeAutoCastIdentityRewritesHumanAppearance(t *testing.T) {
+	cfg := treatmentTestConfig("动物面馆")
+	member := VideoCastMember{Name: "猫老板", Species: "人类", Appearance: "中年男人，穿着围裙", VoiceHint: "低沉男声"}
+	warnings := normalizeAutoCastIdentity(cfg, &member)
+	if member.Species != "橘猫" {
+		t.Fatalf("名字里的猫应把人类角色改成橘猫，实际 %q（warnings=%v）", member.Species, warnings)
+	}
+	if strings.Contains(member.Appearance, "男人") || strings.Contains(member.Appearance, "人类") {
+		t.Fatalf("人类外观描述应被重写: %q", member.Appearance)
+	}
+}
+
+func TestAlignVisualSpeciesFixesSingleRolePrompt(t *testing.T) {
+	profile := VideoCharacterRef{Name: "猪老板", Species: "小猪", AppearanceBlock: "中年家猪，灰白围裙"}
+	got := alignVisualSpecies("圆框老花镜橘猫侧脸开口，手扶窗框", profile)
+	if strings.Contains(got, "橘猫") || !strings.Contains(got, "小猪") {
+		t.Fatalf("单角色画面应改成 cast 物种: %q", got)
+	}
+}
+
 func TestValidateLockedLinesRejectsRewrite(t *testing.T) {
 	locked := []VideoLockedLine{{ID: "L1", Speaker: "auto_1", Text: "你倒是拆啊。"}}
 	script := VideoScript{Shots: []VideoShot{{ID: "s1", DialogueLines: []VideoDialogueLine{{Speaker: "auto_1", Text: "你拆开看看。"}}}}}

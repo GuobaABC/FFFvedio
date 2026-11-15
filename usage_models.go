@@ -19,8 +19,6 @@ const (
 	UsagePurposePrompt      = "画面提示词"   // Agent2
 	UsagePurposeSegmentFix  = "片段提示词优化" // 逐段返工时的 AI 建议
 	UsagePurposePublishMeta = "发布元数据"   // Agent4
-	UsagePurposeHotExtract  = "热点抽取"    // 爬取 L3
-	UsagePurposeSiteSelect  = "站点选择器"   // 爬取 L4
 	UsagePurposeVideoRender = "视频渲染"    // Agent3
 	UsagePurposeUnknown     = "未标注用途"
 )
@@ -190,9 +188,6 @@ type DashboardSnapshot struct {
 type dashboardBusinessCount struct {
 	VideoTasks         int `json:"videoTasks"`
 	VideoTasksThisWeek int `json:"videoTasksThisWeek"`
-	CrawlTasks         int `json:"crawlTasks"`
-	CrawlTasksThisWeek int `json:"crawlTasksThisWeek"`
-	CrawlItems         int `json:"crawlItems"`
 	TailFrameAssets    int `json:"tailFrameAssets"`
 	Templates          int `json:"templates"`
 	Providers          int `json:"providers"`

@@ -281,9 +281,9 @@ func TestAdapterInfoCarriesMaturityForCreatePage(t *testing.T) {
 func TestUsageContextTagsAreIndependent(t *testing.T) {
 	// 上游先带任务 ID，深处再补用途，两者不能互相覆盖
 	ctx := withUsageTask(context.Background(), "task-a")
-	ctx = withUsagePurpose(ctx, UsagePurposeHotExtract)
+	ctx = withUsagePurpose(ctx, UsagePurposeScript)
 	meta := usageMetaFrom(ctx)
-	if meta.taskID != "task-a" || meta.purpose != UsagePurposeHotExtract {
+	if meta.taskID != "task-a" || meta.purpose != UsagePurposeScript {
 		t.Fatalf("标注被覆盖: %+v", meta)
 	}
 	if got := usageMetaFrom(context.Background()); got.purpose != UsagePurposeUnknown {

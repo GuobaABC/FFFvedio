@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS video_tasks (
 	context_json TEXT NOT NULL,
 	created_at   TEXT NOT NULL,
 	updated_at   TEXT NOT NULL,
-	template_id  TEXT NOT NULL DEFAULT ''
+	template_id  TEXT NOT NULL DEFAULT '',
+	episode      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_video_tasks_created ON video_tasks (created_at);
 
@@ -106,67 +107,45 @@ CREATE TABLE IF NOT EXISTS video_characters (
 );
 CREATE INDEX IF NOT EXISTS idx_video_characters_updated ON video_characters (updated_at);
 
--- 热点爬取任务：config_json 存输入契约，context_json 存 URL 结果/条目/统计
-CREATE TABLE IF NOT EXISTS crawl_tasks (
+-- 项目记忆：短剧跨集复用的角色/剧情/世界设定；kind 区分 character/plot/event/relationship/world/summary
+CREATE TABLE IF NOT EXISTS project_memory (
 	id           TEXT PRIMARY KEY,
-	title        TEXT NOT NULL,
-	stage        TEXT NOT NULL,
-	status       TEXT NOT NULL,
-	error        TEXT NOT NULL DEFAULT '',
-	config_json  TEXT NOT NULL,
-	context_json TEXT NOT NULL,
+	project_id   TEXT NOT NULL,
+	episode      INTEGER NOT NULL DEFAULT 0,
+	kind         TEXT NOT NULL,
+	title        TEXT NOT NULL DEFAULT '',
+	content      TEXT NOT NULL DEFAULT '',
+	payload_json TEXT NOT NULL DEFAULT '{}',
+	source_task  TEXT NOT NULL DEFAULT '',
 	created_at   TEXT NOT NULL,
 	updated_at   TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_crawl_tasks_created ON crawl_tasks (created_at);
+CREATE INDEX IF NOT EXISTS idx_project_memory_project ON project_memory (project_id, kind, episode);
 
--- video_item 条目库：主键 = sha1(canonical_url) 前缀，天然幂等
-CREATE TABLE IF NOT EXISTS crawl_items (
-	id            TEXT PRIMARY KEY,
-	site_key      TEXT NOT NULL,
-	canonical_url TEXT NOT NULL,
-	original_url  TEXT NOT NULL,
-	title         TEXT NOT NULL DEFAULT '',
-	description   TEXT NOT NULL DEFAULT '',
-	thumbnail_url TEXT NOT NULL DEFAULT '',
-	payload_json  TEXT NOT NULL,
-	created_at    TEXT NOT NULL,
-	updated_at    TEXT NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_crawl_items_canonical ON crawl_items (canonical_url);
-CREATE INDEX IF NOT EXISTS idx_crawl_items_updated ON crawl_items (updated_at);
-
--- site_profile 站点画像：抽取规则沉淀，加站点只加配置
-CREATE TABLE IF NOT EXISTS site_profiles (
-	site_key         TEXT PRIMARY KEY,
-	host_pattern     TEXT NOT NULL DEFAULT '',
-	requires_render  INTEGER NOT NULL DEFAULT 0,
-	selectors_json   TEXT NOT NULL DEFAULT '{}',
-	cleaners_json    TEXT NOT NULL DEFAULT '[]',
-	hit_success      INTEGER NOT NULL DEFAULT 0,
-	hit_fail         INTEGER NOT NULL DEFAULT 0,
-	last_verified_at TEXT NOT NULL DEFAULT '',
-	enabled          INTEGER NOT NULL DEFAULT 1,
-	auto_generated   INTEGER NOT NULL DEFAULT 0,
-	review_status    TEXT NOT NULL DEFAULT 'auto-approved',
-	updated_at       TEXT NOT NULL
+-- 关键词检索：trigram 对中文子串匹配比 unicode61 更友好；旧 SQLite 不支持时会退回 unicode61
+CREATE VIRTUAL TABLE IF NOT EXISTS project_memory_fts USING fts5(
+	title, content, kind, content='project_memory', content_rowid='rowid', tokenize='trigram'
 );
 
--- audit_log：每一步落审计，便于回归与排查
-CREATE TABLE IF NOT EXISTS crawl_audit (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	task_id    TEXT NOT NULL,
-	item_id    TEXT NOT NULL DEFAULT '',
-	url        TEXT NOT NULL,
-	step       TEXT NOT NULL,
-	tier       TEXT NOT NULL DEFAULT '',
-	latency_ms INTEGER NOT NULL DEFAULT 0,
-	status     TEXT NOT NULL DEFAULT '',
-	err_code   TEXT NOT NULL DEFAULT '',
-	note       TEXT NOT NULL DEFAULT '',
-	created_at TEXT NOT NULL
+-- 语义检索：复用文本提供商的 /embeddings 接口，向量以 float32 小端 BLOB 存储
+CREATE TABLE IF NOT EXISTS project_memory_embedding (
+	memory_id  TEXT PRIMARY KEY,
+	dim        INTEGER NOT NULL,
+	vector     BLOB NOT NULL,
+	model      TEXT NOT NULL DEFAULT '',
+	updated_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_crawl_audit_task ON crawl_audit (task_id, id);
+
+CREATE TRIGGER IF NOT EXISTS project_memory_ai AFTER INSERT ON project_memory BEGIN
+	INSERT INTO project_memory_fts(rowid, title, content, kind) VALUES (new.rowid, new.title, new.content, new.kind);
+END;
+CREATE TRIGGER IF NOT EXISTS project_memory_ad AFTER DELETE ON project_memory BEGIN
+	INSERT INTO project_memory_fts(project_memory_fts, rowid, title, content, kind) VALUES ('delete', old.rowid, old.title, old.content, old.kind);
+END;
+CREATE TRIGGER IF NOT EXISTS project_memory_au AFTER UPDATE ON project_memory BEGIN
+	INSERT INTO project_memory_fts(project_memory_fts, rowid, title, content, kind) VALUES ('delete', old.rowid, old.title, old.content, old.kind);
+	INSERT INTO project_memory_fts(rowid, title, content, kind) VALUES (new.rowid, new.title, new.content, new.kind);
+END;
 
 -- 尾帧资产：任务最后一段的尾帧图片，供其他任务选作首帧；每任务保留一条（重生成后覆盖）
 CREATE TABLE IF NOT EXISTS tail_frame_assets (
@@ -223,6 +202,12 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_purpose ON usage_events (purpose, cr
 		return fmt.Errorf("升级 video_tasks 表失败: %w", err)
 	}
 
+	// 老库升级：video_tasks 追加 episode（集数；0 = 未分集）
+	if _, err := db.Exec(`ALTER TABLE video_tasks ADD COLUMN episode INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return fmt.Errorf("升级 video_tasks 表失败: %w", err)
+	}
+
 	// 老库升级：providers 追加 dialect（请求方言，默认 auto 按域名推断）
 	if _, err := db.Exec(`ALTER TABLE providers ADD COLUMN dialect TEXT NOT NULL DEFAULT 'auto'`); err != nil &&
 		!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
@@ -236,6 +221,9 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_purpose ON usage_events (purpose, cr
 	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_video_tasks_project ON video_tasks (project_id)`); err != nil {
 		return fmt.Errorf("创建项目索引失败: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_video_tasks_episode ON video_tasks (project_id, episode)`); err != nil {
+		return fmt.Errorf("创建集数索引失败: %w", err)
 	}
 
 	// 默认模板已全部下线：只清理历史库里的内置行，不再写入任何示例模板。

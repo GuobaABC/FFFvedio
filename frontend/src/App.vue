@@ -3,17 +3,13 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 import ProviderSettings from './components/ProviderSettings.vue'
 import CharacterLibrary from './components/CharacterLibrary.vue'
-import CrawlResults from './components/CrawlResults.vue'
-import CrawlTaskCreate from './components/CrawlTaskCreate.vue'
 import Dashboard from './components/Dashboard.vue'
 import TemplateLibrary from './components/TemplateLibrary.vue'
 import VideoProjects from './components/VideoProjects.vue'
 import VideoResults from './components/VideoResults.vue'
 import VideoTaskCreate from './components/VideoTaskCreate.vue'
-import { focusCrawlTask, handoffCrawlItem } from './composables/crawlNav'
 import { useTemplateForTask } from './composables/templateNav'
 import { focusVideoTask } from './composables/videoNav'
-import type { CrawlItem } from './types/crawl'
 
 interface SubTab {
   id: string
@@ -31,20 +27,12 @@ const projectName = 'FFFVedioAgent'
 // 版本号由构建时从 package.json 注入，不再手写，免得界面版本与实际发版对不上
 const version = __APP_VERSION__
 
-/** 主选项卡：首页大屏 + 热点爬取（新建任务 → 执行 → 结果）+ 视频生成 + 系统设置 */
+/** 主选项卡：首页大屏 + 视频生成 + 系统设置 */
 const mainTabs: MainTab[] = [
   {
     id: 'overview',
     label: '首页大屏',
     children: [{ id: 'dashboard', label: '用量总览', description: '' }],
-  },
-  {
-    id: 'crawl',
-    label: '热点爬取',
-    children: [
-      { id: 'crawl-create', label: '新建任务', description: '' },
-      { id: 'crawl-results', label: '爬取结果', description: '' },
-    ],
   },
   {
     id: 'video',
@@ -98,26 +86,6 @@ function toggleMainTab(tab: MainTab) {
 function selectSubTab(mainTab: MainTab, subId: string) {
   activeMainTabId.value = mainTab.id
   activeSubTabId.value = subId
-}
-
-/** 新建爬取任务成功后：定位到该任务并切到「爬取结果」任务视图 */
-function handleCrawlCreated(taskId: string) {
-  focusCrawlTask(taskId)
-  activeMainTabId.value = 'crawl'
-  activeSubTabId.value = 'crawl-results'
-  if (!expandedMainTabIds.value.includes('crawl')) {
-    expandedMainTabIds.value = [...expandedMainTabIds.value, 'crawl']
-  }
-}
-
-/** 爬取条目带入视频生成：写入草稿后切到「视频生成 → 新建任务」 */
-function handleCrawlToVideo(item: CrawlItem) {
-  handoffCrawlItem(item)
-  activeMainTabId.value = 'video'
-  activeSubTabId.value = 'video-create'
-  if (!expandedMainTabIds.value.includes('video')) {
-    expandedMainTabIds.value = [...expandedMainTabIds.value, 'video']
-  }
 }
 
 /** 新建任务成功后：定位到该任务并切到「视频生成结果」任务视图 */
@@ -228,8 +196,6 @@ onUnmounted(() => {
 
       <section class="panel" role="tabpanel">
         <Dashboard v-if="activeSubTab.id === 'dashboard'" />
-        <CrawlTaskCreate v-else-if="activeSubTab.id === 'crawl-create'" @created="handleCrawlCreated" />
-        <CrawlResults v-else-if="activeSubTab.id === 'crawl-results'" @to-video="handleCrawlToVideo" />
         <VideoTaskCreate v-else-if="activeSubTab.id === 'video-create'" @created="handleTaskCreated" />
         <VideoResults v-else-if="activeSubTab.id === 'video-results'" />
         <VideoProjects v-else-if="activeSubTab.id === 'video-projects'" @to-create="handleProjectsToCreate" />

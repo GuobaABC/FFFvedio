@@ -1,13 +1,7 @@
 import type { Provider, ProviderDraft } from '../types/provider'
 import type { DashboardSnapshot } from '../types/dashboard'
 import type {
-  CrawlEnvironment,
-  CrawlItem,
-  CrawlTask,
-  CrawlTaskInput,
-  SiteProfile,
-} from '../types/crawl'
-import type {
+  ProjectMemory,
   TailFrameAsset,
   VideoCharacter,
   VideoEnvironment,
@@ -48,8 +42,6 @@ interface AppBindings {
   SaveVideoStageEdits(id: string, edits: VideoGateEdits): Promise<VideoTask>
   SaveVideoSubtitles(id: string, edit: VideoSubtitleEdit): Promise<VideoTask>
   ValidateVideoEdit(id: string, edit: VideoEditEdit): Promise<VideoSubtitleIssue[]>
-  SaveVideoEdit(id: string, edit: VideoEditEdit): Promise<VideoTask>
-  ApplyVideoEdit(id: string): Promise<void>
   RelayoutVideoSubtitles(id: string): Promise<void>
   SetVideoSubtitlesEnabled(id: string, enabled: boolean): Promise<VideoTask>
   GetVideoEnvironment(): Promise<VideoEnvironment>
@@ -68,6 +60,15 @@ interface AppBindings {
   RenameVideoProject(id: string, name: string): Promise<void>
   DeleteVideoProject(id: string): Promise<void>
   MoveVideoTaskToProject(taskId: string, projectId: string): Promise<void>
+  NextVideoEpisode(projectId: string): Promise<number>
+
+  /* 项目记忆：短剧角色/剧情/世界设定的混合检索 */
+  ListProjectMemory(projectId: string, limit: number): Promise<ProjectMemory[]>
+  SearchProjectMemory(projectId: string, query: string, limit: number): Promise<ProjectMemory[]>
+  RebuildProjectMemory(projectId: string): Promise<number>
+  EmbedProjectMemory(projectId: string): Promise<number>
+  UpsertProjectMemory(input: ProjectMemory): Promise<ProjectMemory>
+  DeleteProjectMemory(id: string): Promise<void>
 
   /* 视频模板（默认值来源，不绕过确认门） */
   ListVideoTemplates(): Promise<VideoTemplate[]>
@@ -85,18 +86,6 @@ interface AppBindings {
   RevealVideoOutput(id: string): Promise<void>
   PickImageFile(): Promise<string>
   PickImageFiles(): Promise<string[]>
-
-  /* 热点爬取任务 */
-  ListCrawlTasks(): Promise<CrawlTask[]>
-  GetCrawlTask(id: string): Promise<CrawlTask>
-  CreateCrawlTask(input: CrawlTaskInput): Promise<CrawlTask>
-  DeleteCrawlTask(id: string): Promise<void>
-  RunCrawlTask(id: string): Promise<void>
-  RecrawlCrawlTask(id: string): Promise<void>
-  ListCrawlItems(limit: number): Promise<CrawlItem[]>
-  ListSiteProfiles(): Promise<SiteProfile[]>
-  DeleteSiteProfile(siteKey: string): Promise<void>
-  GetCrawlEnvironment(): Promise<CrawlEnvironment>
 }
 
 type WailsWindow = Window & {
@@ -140,9 +129,6 @@ export const backend = {
     bindings().SaveVideoSubtitles(id, edit),
   validateVideoEdit: (id: string, edit: VideoEditEdit): Promise<VideoSubtitleIssue[]> =>
     bindings().ValidateVideoEdit(id, edit),
-  saveVideoEdit: (id: string, edit: VideoEditEdit): Promise<VideoTask> =>
-    bindings().SaveVideoEdit(id, edit),
-  applyVideoEdit: (id: string): Promise<void> => bindings().ApplyVideoEdit(id),
   relayoutVideoSubtitles: (id: string): Promise<void> => bindings().RelayoutVideoSubtitles(id),
   setVideoSubtitlesEnabled: (id: string, enabled: boolean): Promise<VideoTask> =>
     bindings().SetVideoSubtitlesEnabled(id, enabled),
@@ -164,6 +150,17 @@ export const backend = {
   deleteVideoProject: (id: string): Promise<void> => bindings().DeleteVideoProject(id),
   moveVideoTaskToProject: (taskId: string, projectId: string): Promise<void> =>
     bindings().MoveVideoTaskToProject(taskId, projectId),
+  nextVideoEpisode: (projectId: string): Promise<number> => bindings().NextVideoEpisode(projectId),
+
+  listProjectMemory: (projectId: string, limit = 200): Promise<ProjectMemory[]> =>
+    bindings().ListProjectMemory(projectId, limit),
+  searchProjectMemory: (projectId: string, query: string, limit = 8): Promise<ProjectMemory[]> =>
+    bindings().SearchProjectMemory(projectId, query, limit),
+  rebuildProjectMemory: (projectId: string): Promise<number> => bindings().RebuildProjectMemory(projectId),
+  embedProjectMemory: (projectId: string): Promise<number> => bindings().EmbedProjectMemory(projectId),
+  upsertProjectMemory: (input: ProjectMemory): Promise<ProjectMemory> =>
+    bindings().UpsertProjectMemory(input),
+  deleteProjectMemory: (id: string): Promise<void> => bindings().DeleteProjectMemory(id),
 
   listVideoTemplates: (): Promise<VideoTemplate[]> => bindings().ListVideoTemplates(),
   getVideoTemplate: (id: string): Promise<VideoTemplate> => bindings().GetVideoTemplate(id),
@@ -182,18 +179,6 @@ export const backend = {
   revealVideoOutput: (id: string): Promise<void> => bindings().RevealVideoOutput(id),
   pickImageFile: (): Promise<string> => bindings().PickImageFile(),
   pickImageFiles: (): Promise<string[]> => bindings().PickImageFiles(),
-
-  listCrawlTasks: (): Promise<CrawlTask[]> => bindings().ListCrawlTasks(),
-  getCrawlTask: (id: string): Promise<CrawlTask> => bindings().GetCrawlTask(id),
-  createCrawlTask: (input: CrawlTaskInput): Promise<CrawlTask> =>
-    bindings().CreateCrawlTask(input),
-  deleteCrawlTask: (id: string): Promise<void> => bindings().DeleteCrawlTask(id),
-  runCrawlTask: (id: string): Promise<void> => bindings().RunCrawlTask(id),
-  recrawlCrawlTask: (id: string): Promise<void> => bindings().RecrawlCrawlTask(id),
-  listCrawlItems: (limit = 200): Promise<CrawlItem[]> => bindings().ListCrawlItems(limit),
-  listSiteProfiles: (): Promise<SiteProfile[]> => bindings().ListSiteProfiles(),
-  deleteSiteProfile: (siteKey: string): Promise<void> => bindings().DeleteSiteProfile(siteKey),
-  getCrawlEnvironment: (): Promise<CrawlEnvironment> => bindings().GetCrawlEnvironment(),
 }
 
 /** 统一处理 Go 侧返回的字符串错误与普通 Error */
